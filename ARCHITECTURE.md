@@ -12,8 +12,9 @@ graph TB
     end
 
     subgraph "LLM Periphery 30%"
-        DG[Digestor<br/>gemma3:12b<br/>text → Intent JSON]
-        NR[Narrator<br/>gemma3:27b<br/>skeletons → prose]
+        DG[Digestor<br/>qwen2.5:7b<br/>text → Intent JSON]
+        NR[Narrator<br/>qwen3.5:35b (think off)<br/>skeletons → streamed prose]
+        DR[Director<br/>qwen2.5:7b<br/>unplanned scenes/items → typed JSON]
     end
 
     subgraph "Game Engine 70%"

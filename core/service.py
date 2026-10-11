@@ -358,8 +358,10 @@ class V4Service:
             beat_lines, _m = plot_tick(g, self.plot, self.plot_state)
             if beat_lines:
                 r.lines += beat_lines
-        # v3 lesson: every turn ends with a hook — append before posting
-        if r.accepted and r.lines:
+        # v6 0c (narration-first): the machine block (scene/HP/suggestions)
+        # only joins turns where the SITUATION changed — routine turns end
+        # on prose alone. The story is the body; the engine is punctuation.
+        if r.accepted and r.lines and self._context_noteworthy(idx0):
             from .templates import render_turn_context
             context = render_turn_context(g, it.actor or "")
             r.lines.append("")
@@ -391,6 +393,22 @@ class V4Service:
                 wants_help=bool(getattr(it, "wants_help", False)))
         self._save()
         return r.lines, narration
+
+    def _context_noteworthy(self, idx0: int) -> bool:
+        """0c: when does the machine block earn its place? Situation
+        changes (scene, combat, loot/deaths, level-ups, beats), a pending
+        check card, anyone downed — or every 3rd turn as a heartbeat."""
+        g = self.game
+        kinds = {e.kind for e in g.ledger.entries[idx0:]}
+        if kinds & {"scene", "combat", "loot", "xp", "beat",
+                    "director_scene", "reveal"}:
+            return True
+        if getattr(g, "_pending_check", None) is not None:
+            return True
+        if any(isinstance(e, dict) and int(e.get("hp_now", 1) or 0) <= 0
+               for e in g.party.values()):
+            return True
+        return g.ledger.turn % 3 == 0
 
     # ---------- narration (shared by turns and roll settles) ----------
 

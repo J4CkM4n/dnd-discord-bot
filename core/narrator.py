@@ -40,33 +40,44 @@ class Narrator:
     async def _stream(self, prompt: str, on_delta=None,
                       max_tokens: int = 400) -> str:
         """Streaming native /api/chat (ndjson) — on_delta receives the
-        growing text as tokens arrive (v3 word-by-word UX)."""
+        growing text as tokens arrive (v3 word-by-word UX).
+        v6 latency guard: per-chunk read timeout — a stalled generation
+        returns whatever arrived instead of hanging the player."""
         import json as _json
         text = ""
-        async with httpx.AsyncClient(timeout=180) as c:
-            async with c.stream(
-                    "POST", f"{self.url}/api/chat",
-                    json=self._body(prompt, max_tokens, True)) as resp:
-                resp.raise_for_status()
-                async for line in resp.aiter_lines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        chunk = _json.loads(line)
-                    except _json.JSONDecodeError:
-                        continue
-                    delta = (chunk.get("message", {})
-                             .get("content", ""))
-                    if delta:
-                        text += delta
-                        if on_delta:
-                            try:
-                                on_delta(text)
-                            except Exception:
-                                pass
-                    if chunk.get("done"):
-                        break
+        # generous total, but ANY single read taking >15s = stall
+        timeout = httpx.Timeout(180.0, connect=5.0, read=15.0)
+        async with httpx.AsyncClient(timeout=timeout) as c:
+            try:
+                async with c.stream(
+                        "POST", f"{self.url}/api/chat",
+                        json=self._body(prompt, max_tokens, True)) as resp:
+                    resp.raise_for_status()
+                    async for line in resp.aiter_lines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            chunk = _json.loads(line)
+                        except _json.JSONDecodeError:
+                            continue
+                        delta = (chunk.get("message", {})
+                                 .get("content", ""))
+                        if delta:
+                            text += delta
+                            if on_delta:
+                                try:
+                                    on_delta(text)
+                                except Exception:
+                                    pass
+                        if chunk.get("done"):
+                            break
+            except httpx.HTTPError as e:
+                # stall/timeout mid-stream: keep the partial prose
+                import logging
+                logging.getLogger("dnd-bot").warning(
+                    "narration stream interrupted (%s), %d chars so far",
+                    type(e).__name__, len(text))
         return text
 
     async def continue_text(self, partial: str, on_delta=None) -> str:

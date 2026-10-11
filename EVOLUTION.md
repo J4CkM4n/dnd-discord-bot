@@ -276,7 +276,7 @@ python bot.py  # Discord + Telegram adapters
 # Two processes
 sudo systemctl start dm-bot       # main bot (Ollama :11434)
 sudo systemctl start dnd-health   # health board (read-only DB)
-# LLM: Ollama (gemma3:27b-it-qat, 24k ctx)
+# LLM (v6): qwen3.5:35b narrator (think off) + qwen2.5:7b digestor/director
 # Embeddings: Ollama (mxbai-embed-large)
 ```
 

@@ -139,10 +139,14 @@ legacy/                 # v3 code (archived, not imported)
 
 | Role | Model | Purpose |
 |---|---|---|
-| Digestor | gemma3:12b-it-qat | Player text → Intent JSON |
-| Narrator | gemma3:27b-it-qat | Facts → prose (80–160 字) |
+| Digestor | qwen2.5:7b-instruct | Player text → Intent JSON (<1s; 9/9 Cantonese routing bench) |
+| Narrator | qwen3.5:35b (think **off**) | Facts → streamed prose (2.5s warm; ~13× faster than the old gemma3:27b) |
+| Director | qwen2.5:7b-instruct | Unplanned scenes/items as typed JSON — the engine canonizes |
 
-Both optional — game runs without them.
+All optional — the game runs with zero LLM (`python core/cli.py selftest`).
+Note: qwen3.x are REASONING models — narrator requires `V4_NARR_THINK=off`
+or thinking consumes the whole token budget (and the OpenAI-compat endpoint
+ignores the flag; we use Ollama's native `/api/chat`).
 
 ## License
 
