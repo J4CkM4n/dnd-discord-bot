@@ -10,11 +10,11 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from v4.intent import parse_command, Intent
-from v4.ledger import Ledger
-from v4.rules_core import resolve
-from v4.turn import Game
-from v4.world import World, Scene, Enemy
+from core.intent import parse_command, Intent
+from core.ledger import Ledger
+from core.rules_core import resolve
+from core.turn import Game
+from core.world import World, Scene, Enemy
 
 
 def build_demo_game(seed: int = None) -> Game:
@@ -136,7 +136,7 @@ def selftest() -> None:
     L.clear()
 
     # ---- the 18-skill system -------------------------------------------
-    from v4.rules_core import resolve_pending_check as _rpc
+    from core.rules_core import resolve_pending_check as _rpc
 
     # unknown skill is denied deterministically, with the valid list
     run("依思 技能 飛天")
@@ -196,7 +196,7 @@ def selftest() -> None:
     # either way a check lands in the ledger (effects apply in-engine)
     (await_turn("大力蕉") and run("大力蕉 搜索")) or run("依思 搜索")
     if getattr(g, "_pending_check", None):
-        from v4.rules_core import resolve_pending_check
+        from core.rules_core import resolve_pending_check
         resolve_pending_check(g, g.d20())
     assert any(e.kind == "check" for e in g.ledger.entries)
     L.clear()

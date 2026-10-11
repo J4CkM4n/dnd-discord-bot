@@ -32,7 +32,7 @@ def _split(text: str, limit: int = 1900):
     return chunks
 
 
-HELP_TEXT = """🎲 **v5 引擎指令 / Commands**（玩家 16 · 管理 10）
+HELP_TEXT = """🎲 **v6 引擎指令 / Commands**（玩家 16 · 管理 10）
 
 **玩家 / Player**
 `/pc <名字> <職業>` — 建立角色（屬性由系統公正擲骰）
@@ -126,7 +126,7 @@ class DiscordBot(discord.Client):
         """Per-channel V4Service — each table gets its own game state."""
         cid = str(channel_id) if channel_id else "default"
         if cid not in self._v4_games:
-            from v4.service import V4Service
+            from core.service import V4Service
             data_dir = os.environ.get("DATA_DIR", "data")
             # V4_NARR_THINK / V4_DIGEST_THINK: "off"/"on" forces the
             # Ollama think toggle (required for qwen3.x reasoning
@@ -382,15 +382,15 @@ class DiscordBot(discord.Client):
             v4svc.pending = None
             p.args["confirmed"] = True
             await interaction.response.defer(thinking=True)
-            from v4.rules_core import resolve as v4_resolve
+            from core.rules_core import resolve as v4_resolve
             r = v4_resolve(v4svc.game, p)
             body = "\n".join(r.lines)
             if body:
                 await interaction.followup.send(_clip(body))
             # narrate
             if r.accepted and r.lines:
-                from v4.templates import render_hint
-                from v4.guards import (make_placeholder_map, map_out,
+                from core.templates import render_hint
+                from core.guards import (make_placeholder_map, map_out,
                                        map_in, make_restore_map,
                                        scrub_narration, is_chinese)
                 g = v4svc.game

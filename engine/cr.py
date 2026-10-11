@@ -43,6 +43,6 @@ CR_STATS = {
 
 def make_by_cr(name: str, cr: str):
     """Enemy from a CR band (plot spawns may cite CR instead of stats)."""
-    from v4.world import Enemy
+    from core.world import Enemy
     hp, ac, bonus, dmg = CR_STATS.get(str(cr), CR_STATS["1"])
     return Enemy.make(name, hp, ac, bonus, dmg)

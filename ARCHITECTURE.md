@@ -1,14 +1,14 @@
-# v4 Architecture Diagram
+# D&D DM Bot — Architecture (v6)
 
 ```mermaid
 graph TB
     subgraph "Discord Channel"
-        P[Player<br/>/explore /combat /roll]
+        P[Player<br/>/explore /attack /use /skill<br/>/defend /flee /observe /roll /rules]
         TP[Table Talk<br/>plain text - ignored]
     end
 
     subgraph "Adapter Layer"
-        AD[discord_bot.py<br/>13 commands<br/>channel routing]
+        AD[discord_bot.py<br/>26 commands<br/>typed combat family + admin]
     end
 
     subgraph "LLM Periphery 30%"
@@ -47,7 +47,7 @@ graph TB
     P -->|slash command| AD
     TP -->|plain text| AD
     AD -->|freeform text| DG
-    AD -->|structured<br/>from /combat| RC
+    AD -->|typed family<br/>structured intent| RC
     DG -->|Intent JSON| RC
 
     RC --> TU
@@ -119,7 +119,7 @@ sequenceDiagram
 ```mermaid
 graph LR
     subgraph "State"
-        V4S[v4_state.json<br/>party · world · inventory<br/>combat · ledger]
+        V4S[v4_state_<channel>.json<br/>party · world · inventory<br/>combat+slots · ledger · plot state]
         RDB[rules.db<br/>2918 SRD chunks]
     end
 
@@ -150,5 +150,7 @@ graph LR
 | Help detection = digestor field (`wants_help`) | Intent reading by meaning is the LLM's job; keyword regex only backstops the no-LLM fallback |
 | Narrator voices the engine's pick | A `reveal` fact must be spoken verbatim in dialogue — information flow stays engine-owned |
 | Plain text = table talk | No accidental DM triggers from chatter |
-| Structured /combat skips digestor | Zero ambiguity = zero confirmation |
+| Typed combat family (structured intent) | Zero ambiguity, per-action autocomplete |
+| Per-round action slots | Discord is not a table — nobody waits |
+| Director LLM proposes, engine canonizes | Unplanned places/finds without breaking state ownership |
 | Selftest with seed | Byte-identical replays for regression |

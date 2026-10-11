@@ -29,17 +29,18 @@ Player text ──→ [Digestor LLM 12b] ──→ Intent JSON
 ```bash
 # GB10 (or any box with Ollama)
 pip install -r requirements.txt
-cp .env.example .env        # fill DISCORD_TOKEN, LLM_URL, V4_CHANNEL_ID
+cp .env.example .env        # fill DISCORD_TOKEN, LLM_URL, V4_CHANNEL_IDS
+                            # (V4_* names kept for config stability)
 python bot.py
 
 # no-LLM test (proves the engine works standalone)
-python v4/cli.py selftest
+python core/cli.py selftest
 
 # interactive CLI (zero LLM)
-python v4/cli.py
+python core/cli.py
 ```
 
-## Commands (24: 15 player + 9 admin)
+## Commands (26: 16 player + 10 admin)
 
 | Player | Admin |
 |---|---|
@@ -54,6 +55,8 @@ python v4/cli.py
 | `/roll [expr]` — dice (settles checks, auto-continues) | |
 | `/give item [to]` — transfer; no recipient = set down | |
 | `/status` — party + scene + disclosed intel | |
+| `/rules <query>` — SRD lookup (zh aliases, no LLM) | |
+| | `/inspire-admin [char]` — grant inspiration |
 | `/continue` — finish unfinished narration, else unstuck | |
 | `/help` | |
 
@@ -96,7 +99,7 @@ gamerules.json          # single source of truth: world tone + canon +
                         # narrative constraints (injected into the
                         # narrator prompt; edit here to change the world)
 
-v4/                     # game engine (the core)
+core/                   # the game engine (v6)
 ├── intent.py           # Intent dataclass + deterministic parser
 ├── world.py            # Scene graph, NPCs (with knows), encounters
 ├── turn.py             # Game state: party, combat, inventory, slots
@@ -105,8 +108,12 @@ v4/                     # game engine (the core)
 ├── digestor.py         # 12b: freeform text → Intent JSON
 ├── narrator.py         # 27b: facts + skeletons → prose
 ├── templates.py        # deterministic prose skeletons
-├── guards.py           # v3 defenses (placeholders, scrubbing, etc.)
+├── guards.py           # output defenses (placeholders, scrubbing, s2t)
+├── ledger.py           # append-only event log (replayable)
 ├── service.py          # orchestration + persistence
+├── director.py         # engine gate: prop/scene canonization
+├── director_llm.py     # generative Director (unplanned places/finds)
+├── plot.py             # plot spine: clocks + trigger-fired beats
 └── cli.py              # no-LLM REPL + selftest
 
 engine/                 # shared pure math (no LLM, no Discord)

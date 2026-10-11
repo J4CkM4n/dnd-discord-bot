@@ -9,8 +9,8 @@ import httpx
 
 
 class Narrator:
-    def __init__(self, llm_url: str, model: str = "gemma3:27b-it-qat",
-                 think: bool | None = None):
+    def __init__(self, llm_url: str, model: str = "qwen3.5:35b",
+                 think: bool | None = False):
         self.url = llm_url.rstrip("/")
         self.model = model
         # None = omit (model default); False/True forces Ollama's native
