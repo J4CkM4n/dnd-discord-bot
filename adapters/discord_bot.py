@@ -45,6 +45,7 @@ HELP_TEXT = """🎲 **v6 引擎指令 / Commands**（玩家 16 · 管理 10）
 `/use [物品] [隊友]` — 使用物品／餵隊友（**可救倒地隊友**）
 `/skill [技能] [對象]` — 技能（18 項，★＝熟練；對象含敵人/NPC/隊友）
 `/defend` — 防禦（敵人攻擊你有劣勢）
+　· 戰鬥中判定訊息附一排快捷按鈕：🛡防禦 👁觀察 🏃撤退 ⏭讓路
 `/flee` — 撤退（全隊嘗試脫離戰鬥）
 `/observe [敵人]` — 找破綻（下一擊有優勢）
 
@@ -78,6 +79,69 @@ HELP_TEXT = """🎲 **v6 引擎指令 / Commands**（玩家 16 · 管理 10）
 **NPC 對話**：NPC 只會透露其已知的事實（問過的在 `/status` 已知情報）"""
 
 
+
+
+class CombatPanel(discord.ui.View):
+    """v6: one-tap combat basics, attached to the verdict message while a
+    battle lasts. Zero-arg actions only — arg-ed actions stay typed
+    commands（buttons cannot collect input）. Persistent: survives restarts
+    via custom_ids; stale panels answer gracefully when combat is over."""
+
+    def __init__(self, bot):
+        super().__init__(timeout=None)
+        self.bot = bot
+
+    async def _act(self, interaction: discord.Interaction, text: str):
+        v4svc = self.bot._v4_service(str(interaction.channel_id))
+        g = v4svc.game
+        if not g.combat.active:
+            await interaction.response.send_message(
+                "🏁 戰鬥已結束——這排按鈕過期了。")
+            return
+        char = next((n for n, v in g.party.items()
+                     if isinstance(v, dict)
+                     and str(v.get("owner_id", ""))
+                     == str(interaction.user.id)), "")
+        if not char:
+            await interaction.response.send_message(
+                "❓ 找不到你的角色——先用 `/pc` 建立。")
+            return
+        if char in g.combat.acted:
+            waiting = [n for n in g.party
+                       if g.alive(n) and n not in g.combat.acted]
+            await interaction.response.send_message(
+                f"⏳ **{char}** 本回合已行動"
+                + (f"——等待 {'、'.join(waiting)}" if waiting else ""),
+                ephemeral=True)
+            return
+        await self.bot._v4_turn(interaction, f"{char} {text}",
+                                structured=True)
+
+    @discord.ui.button(label="🛡 防禦", custom_id="cp:defend",
+                       style=discord.ButtonStyle.secondary)
+    async def defend(self, interaction: discord.Interaction,
+                     button: discord.ui.Button):
+        await self._act(interaction, "防禦")
+
+    @discord.ui.button(label="👁 觀察", custom_id="cp:observe",
+                       style=discord.ButtonStyle.secondary)
+    async def observe(self, interaction: discord.Interaction,
+                      button: discord.ui.Button):
+        await self._act(interaction, "觀察")
+
+    @discord.ui.button(label="🏃 撤退", custom_id="cp:flee",
+                       style=discord.ButtonStyle.danger)
+    async def flee(self, interaction: discord.Interaction,
+                   button: discord.ui.Button):
+        await self._act(interaction, "撤退")
+
+    @discord.ui.button(label="⏭ 讓路", custom_id="cp:pass",
+                       style=discord.ButtonStyle.secondary)
+    async def skip(self, interaction: discord.Interaction,
+                   button: discord.ui.Button):
+        await self._act(interaction, "等待")
+
+
 class DiscordBot(discord.Client):
     def __init__(self, message_content: bool = True):
         intents = discord.Intents.default()
@@ -104,7 +168,7 @@ class DiscordBot(discord.Client):
         self._register_commands()
 
     async def setup_hook(self):
-        pass
+        self.add_view(CombatPanel(self))   # persistent combat buttons
 
     async def on_ready(self):
         log.info("logged in as %s (guilds=%d)", self.user, len(self.guilds))
@@ -368,7 +432,7 @@ class DiscordBot(discord.Client):
                            description="探索／對話／移動（非戰鬥行動）/ freeform action")
         @app_commands.describe(text="你要做什麼？")
         async def explore_cmd(interaction: discord.Interaction, text: str):
-            await _v4_turn(interaction, text)
+            await self._v4_turn(interaction, text)
 
         @self.tree.command(name="confirm",
                            description="確認待決行動 / confirm pending action")
@@ -511,7 +575,7 @@ class DiscordBot(discord.Client):
                 await interaction.response.send_message("❓ 找不到你的角色。")
                 return
             text = f"{char} 攻擊 {target}" + (f" {move}" if move else "")
-            await _v4_turn(interaction, text, structured=True)
+            await self._v4_turn(interaction, text, structured=True)
 
         @self.tree.command(name="use",
                            description="🎒 使用物品／餵隊友（可救倒地）/ use item")
@@ -525,7 +589,7 @@ class DiscordBot(discord.Client):
                 await interaction.response.send_message("❓ 找不到你的角色。")
                 return
             text = f"{char} 使用 {item}" + (f" {on}" if on else "")
-            await _v4_turn(interaction, text, structured=True)
+            await self._v4_turn(interaction, text, structured=True)
 
         @self.tree.command(name="skill",
                            description="✨ 技能（★＝熟練）/ use a skill")
@@ -539,7 +603,7 @@ class DiscordBot(discord.Client):
                 await interaction.response.send_message("❓ 找不到你的角色。")
                 return
             text = f"{char} 技能 {skill}" + (f" {on}" if on else "")
-            await _v4_turn(interaction, text, structured=True)
+            await self._v4_turn(interaction, text, structured=True)
 
         @self.tree.command(name="defend",
                            description="🛡 防禦（敵人攻擊你有劣勢）/ dodge")
@@ -548,7 +612,7 @@ class DiscordBot(discord.Client):
             if not char:
                 await interaction.response.send_message("❓ 找不到你的角色。")
                 return
-            await _v4_turn(interaction, f"{char} 防禦", structured=True)
+            await self._v4_turn(interaction, f"{char} 防禦", structured=True)
 
         @self.tree.command(name="flee",
                            description="🏃 撤退（全隊脫離戰鬥）/ escape")
@@ -557,7 +621,7 @@ class DiscordBot(discord.Client):
             if not char:
                 await interaction.response.send_message("❓ 找不到你的角色。")
                 return
-            await _v4_turn(interaction, f"{char} 撤退", structured=True)
+            await self._v4_turn(interaction, f"{char} 撤退", structured=True)
 
         @self.tree.command(name="observe",
                            description="👁 觀察敵人（下一擊有優勢）/ find a weak spot")
@@ -570,7 +634,7 @@ class DiscordBot(discord.Client):
                 await interaction.response.send_message("❓ 找不到你的角色。")
                 return
             text = f"{char} 觀察" + (f" {target}" if target else "")
-            await _v4_turn(interaction, text, structured=True)
+            await self._v4_turn(interaction, text, structured=True)
 
         # ---- /inventory ----
 
@@ -662,7 +726,7 @@ class DiscordBot(discord.Client):
             expr = (expr or "d20").strip() or "d20"
 
             # a d20 that settles a pending check auto-continues the story
-            if await _v4_settle(interaction, expr):
+            if await self._v4_settle(interaction, expr):
                 return
 
             try:
@@ -930,7 +994,7 @@ class DiscordBot(discord.Client):
             if not interaction.user.guild_permissions.manage_guild:
                 await interaction.response.send_message("🚫 僅管理員。")
                 return
-            await _v4_admin(interaction, character, text)
+            await self._v4_admin(interaction, character, text)
 
         # admin combat family — mirrors the player commands, acting as
         # any character (same typed autocompletes, character-aware)
@@ -950,7 +1014,7 @@ class DiscordBot(discord.Client):
                 await interaction.response.send_message("🚫 僅管理員。")
                 return
             text = f"{character} 攻擊 {target}" + (f" {move}" if move else "")
-            await _v4_admin(interaction, character, text, structured=True)
+            await self._v4_admin(interaction, character, text, structured=True)
 
         @self.tree.command(name="use-admin",
                            description="(Admin) 以任意角色使用物品／餵隊友")
@@ -964,7 +1028,7 @@ class DiscordBot(discord.Client):
                 await interaction.response.send_message("🚫 僅管理員。")
                 return
             text = f"{character} 使用 {item}" + (f" {on}" if on else "")
-            await _v4_admin(interaction, character, text, structured=True)
+            await self._v4_admin(interaction, character, text, structured=True)
 
         @self.tree.command(name="skill-admin",
                            description="(Admin) 以任意角色使用技能")
@@ -978,7 +1042,7 @@ class DiscordBot(discord.Client):
                 await interaction.response.send_message("🚫 僅管理員。")
                 return
             text = f"{character} 技能 {skill}" + (f" {on}" if on else "")
-            await _v4_admin(interaction, character, text, structured=True)
+            await self._v4_admin(interaction, character, text, structured=True)
 
         @self.tree.command(name="defend-admin",
                            description="(Admin) 以任意角色防禦")
@@ -989,7 +1053,7 @@ class DiscordBot(discord.Client):
             if not _admin_only(interaction):
                 await interaction.response.send_message("🚫 僅管理員。")
                 return
-            await _v4_admin(interaction, character, f"{character} 防禦",
+            await self._v4_admin(interaction, character, f"{character} 防禦",
                             structured=True)
 
         @self.tree.command(name="flee-admin",
@@ -1001,7 +1065,7 @@ class DiscordBot(discord.Client):
             if not _admin_only(interaction):
                 await interaction.response.send_message("🚫 僅管理員。")
                 return
-            await _v4_admin(interaction, character, f"{character} 撤退",
+            await self._v4_admin(interaction, character, f"{character} 撤退",
                             structured=True)
 
         @self.tree.command(name="observe-admin",
@@ -1014,7 +1078,7 @@ class DiscordBot(discord.Client):
                 await interaction.response.send_message("🚫 僅管理員。")
                 return
             text = f"{character} 觀察" + (f" {target}" if target else "")
-            await _v4_admin(interaction, character, text, structured=True)
+            await self._v4_admin(interaction, character, text, structured=True)
 
         @self.tree.command(name="inspire-admin",
                            description="(Admin) 給角色靈感（一次性攻擊/檢定優勢）/ grant inspiration")
@@ -1071,7 +1135,7 @@ class DiscordBot(discord.Client):
                 return
             expr = (expr or "d20").strip() or "d20"
             # an admin d20 settles a pending check and auto-continues too
-            if await _v4_settle(interaction, expr,
+            if await self._v4_settle(interaction, expr,
                                 echo=f"(admin) {character}".rstrip()):
                 return
             try:
@@ -1094,182 +1158,200 @@ class DiscordBot(discord.Client):
             out = svc._v4_service(str(interaction.channel_id)).admin_give(character, item, qty)
             await interaction.response.send_message(out)
 
-        # ------------------------------------------------------------------
-        #  shared v4 turn runners (defined last, used above)
-        # ------------------------------------------------------------------
-
-        async def _v4_turn(interaction, text, echo=None,
-                           structured=False):
-            """Player v4 turn — v3 word-by-word UX:
-            defer → echo (followup, resolves the thinking indicator) →
-            engine verdict (instant) → narration streams into its own
-            message and STAYS there (final edit completes it)."""
-            # defer FIRST: acknowledges the interaction (prevents 3s timeout)
-            await interaction.response.defer(thinking=True)
-            # echo as the interaction followup: resolves 「正在思考…」
-            # immediately — without any followup the ghost never clears
-            await interaction.followup.send(
-                f"🎭 **{interaction.user.display_name}** "
-                f"{_clip(text, 200)}")
-
-            narr_msg = [None]   # created once the verdict is posted
-            last_edit = [0.0]
-
-            async def on_resolved(lines):
-                # engine verdict: instant, its own message
-                await interaction.channel.send(_clip("\n".join(lines)))
-                # narration streams word-by-word into THIS message and
-                # keeps its streamed content (never replaced afterwards)
-                narr_msg[0] = await interaction.channel.send(
-                    "📖 DM 正在寫作…")
-
-            def on_delta(acc: str):
-                msg = narr_msg[0]
-                if msg is None:
-                    return
-                now = asyncio.get_event_loop().time()
-                if now - last_edit[0] >= 2.0 and len(acc) > 12:
-                    last_edit[0] = now
-                    asyncio.create_task(_edit_safe(msg, acc))
-
-            try:
-                lines, narration = await svc._v4_service(
-                    str(interaction.channel_id)).handle(
-                    text, interaction.user.display_name,
-                    user_id=str(interaction.user.id),
-                    structured=structured,
-                    on_delta=on_delta, on_resolved=on_resolved)
-            except Exception as e:
-                log.exception("v4 turn failed")
-                if narr_msg[0] is not None:
-                    await narr_msg[0].edit(content=f"⚠️ {e}")
-                else:
-                    await interaction.followup.send(f"⚠️ {e}")
-                return
-
-            # finalize the streamed message: guards may have scrubbed
-            # parts, so the last edit is authoritative; drop it entirely
-            # when the narrator produced nothing (degraded mode)
-            await _finalize_narr(narr_msg[0], narration)
-            if not narr_msg[0] and lines:
-                await interaction.channel.send(_clip("\n".join(lines)))
-
-        async def _edit_safe(msg, content):
-            try:
-                await msg.edit(content=_clip(content) + " ▍")
-            except discord.HTTPException:
-                pass
-
-        async def _finalize_narr(msg, narration: str):
-            """End state of the streamed narration message: the final
-            (guard-applied) text, or deleted when nothing was produced."""
-            if msg is None:
-                return
-            try:
-                if narration:
-                    await msg.edit(content=_clip("📖 " + narration))
-                else:
-                    await msg.delete()
-            except discord.HTTPException:
-                pass
-
-        async def _v4_settle(interaction, expr, echo=""):
-            """A d20 /roll that settles a pending check AUTO-CONTINUES the
-            story: die echo → engine verdict (instant) → narration streams
-            word-by-word into its own message and stays.
-            Returns True when it was a valid settle (command consumed)."""
-            v4svc = svc._v4_service(str(interaction.channel_id))
-            pend = getattr(v4svc.game, "_pending_check", None)
-            if not pend or expr.lower() not in ("d20", "1d20"):
-                return False
-            await interaction.response.defer(thinking=True)
-            die, _ = roll_expr("d20")
-            tag = f" {echo}" if echo else ""
-            # echo the raw die as the followup — resolves 「正在思考…」
-            await interaction.followup.send(
-                f"🎲{tag} **{interaction.user.display_name}** "
-                f"d20 → **{die}**")
-
-            narr_msg = [None]
-            last_edit = [0.0]
-
-            async def on_resolved(lines):
-                await interaction.channel.send(_clip("\n".join(lines)))
-                narr_msg[0] = await interaction.channel.send(
-                    "📖 DM 正在寫作…")
-
-            def on_delta(acc: str):
-                msg = narr_msg[0]
-                if msg is None:
-                    return
-                now = asyncio.get_event_loop().time()
-                if now - last_edit[0] >= 2.0 and len(acc) > 12:
-                    last_edit[0] = now
-                    asyncio.create_task(_edit_safe(msg, acc))
-
-            try:
-                lines, narration = await v4svc.settle_roll(
-                    die, on_delta=on_delta, on_resolved=on_resolved)
-            except Exception as e:
-                log.exception("v4 roll settle failed")
-                if narr_msg[0] is not None:
-                    await narr_msg[0].edit(content=f"⚠️ {e}")
-                else:
-                    await interaction.followup.send(f"⚠️ {e}")
-                return True
-            await _finalize_narr(narr_msg[0], narration)
-            if not narr_msg[0] and lines:
-                await interaction.channel.send(_clip("\n".join(lines)))
-            return True
-
-        async def _v4_admin(interaction, character, text,
-                            structured=False):
-            """Admin v4 turn for any character — SAME streaming UX as
-            player turns (the old admin path bypassed handle(): no
-            guards, no word-by-word, narration as one blob)."""
-            await interaction.response.defer(thinking=True)
-            # echo as the followup — resolves 「正在思考…」
-            await interaction.followup.send(
-                f"🎛 **{interaction.user.display_name}** (admin) — "
-                f"**{character}** {_clip(text, 200)}")
-
-            narr_msg = [None]
-            last_edit = [0.0]
-
-            async def on_resolved(lines):
-                await interaction.channel.send(_clip("\n".join(lines)))
-                narr_msg[0] = await interaction.channel.send(
-                    "📖 DM 正在寫作…")
-
-            def on_delta(acc: str):
-                msg = narr_msg[0]
-                if msg is None:
-                    return
-                now = asyncio.get_event_loop().time()
-                if now - last_edit[0] >= 2.0 and len(acc) > 12:
-                    last_edit[0] = now
-                    asyncio.create_task(_edit_safe(msg, acc))
-
-            try:
-                lines, narration = await svc._v4_service(
-                    str(interaction.channel_id)).handle(
-                    text, f"{interaction.user.display_name} (admin)",
-                    structured=structured, admin_actor=character,
-                    on_delta=on_delta, on_resolved=on_resolved)
-            except Exception as e:
-                log.exception("v4 admin turn failed")
-                if narr_msg[0] is not None:
-                    await narr_msg[0].edit(content=f"⚠️ {e}")
-                else:
-                    await interaction.followup.send(f"⚠️ {e}")
-                return
-            await _finalize_narr(narr_msg[0], narration)
-            if not narr_msg[0] and lines:
-                await interaction.channel.send(_clip("\n".join(lines)))
-
     # ------------------------------------------------------------------
     #  message handling: table talk only (no DM reply, no emoji)
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    #  shared v4 turn runners (defined last, used above)
+    # ------------------------------------------------------------------
+
+    async def _v4_turn(interaction, text, echo=None,
+                       structured=False):
+        """Player v4 turn — v3 word-by-word UX:
+        defer → echo (followup, resolves the thinking indicator) →
+        engine verdict (instant) → narration streams into its own
+        message and STAYS there (final edit completes it)."""
+        # defer FIRST: acknowledges the interaction (prevents 3s timeout)
+        await interaction.response.defer(thinking=True)
+        # echo as the interaction followup: resolves 「正在思考…」
+        # immediately — without any followup the ghost never clears
+        await interaction.followup.send(
+            f"🎭 **{interaction.user.display_name}** "
+            f"{_clip(text, 200)}")
+
+        narr_msg = [None]   # created once the verdict is posted
+        last_edit = [0.0]
+
+        async def on_resolved(lines):
+            # engine verdict: instant, its own message
+            g_ = self._v4_service(str(interaction.channel_id)).game
+            view = CombatPanel(self) if g_.combat.active else None
+            await interaction.channel.send(_clip("\n".join(lines)),
+                                           view=view)
+            # narration streams word-by-word into THIS message and
+            # keeps its streamed content (never replaced afterwards)
+            narr_msg[0] = await interaction.channel.send(
+                "📖 DM 正在寫作…")
+
+        def on_delta(acc: str):
+            msg = narr_msg[0]
+            if msg is None:
+                return
+            now = asyncio.get_event_loop().time()
+            if now - last_edit[0] >= 2.0 and len(acc) > 12:
+                last_edit[0] = now
+                asyncio.create_task(self._edit_safe(msg, acc))
+
+        try:
+            lines, narration = await self._v4_service(
+                str(interaction.channel_id)).handle(
+                text, interaction.user.display_name,
+                user_id=str(interaction.user.id),
+                structured=structured,
+                on_delta=on_delta, on_resolved=on_resolved)
+        except Exception as e:
+            log.exception("v4 turn failed")
+            if narr_msg[0] is not None:
+                await narr_msg[0].edit(content=f"⚠️ {e}")
+            else:
+                await interaction.followup.send(f"⚠️ {e}")
+            return
+
+        # finalize the streamed message: guards may have scrubbed
+        # parts, so the last edit is authoritative; drop it entirely
+        # when the narrator produced nothing (degraded mode)
+        await self._finalize_narr(narr_msg[0], narration)
+        if not narr_msg[0] and lines:
+            g_ = self._v4_service(str(interaction.channel_id)).game
+            view = CombatPanel(self) if g_.combat.active else None
+            await interaction.channel.send(_clip("\n".join(lines)),
+                                           view=view)
+
+    async def _edit_safe(msg, content):
+        try:
+            await msg.edit(content=_clip(content) + " ▍")
+        except discord.HTTPException:
+            pass
+
+    async def _finalize_narr(msg, narration: str):
+        """End state of the streamed narration message: the final
+        (guard-applied) text, or deleted when nothing was produced."""
+        if msg is None:
+            return
+        try:
+            if narration:
+                await msg.edit(content=_clip("📖 " + narration))
+            else:
+                await msg.delete()
+        except discord.HTTPException:
+            pass
+
+    async def _v4_settle(interaction, expr, echo=""):
+        """A d20 /roll that settles a pending check AUTO-CONTINUES the
+        story: die echo → engine verdict (instant) → narration streams
+        word-by-word into its own message and stays.
+        Returns True when it was a valid settle (command consumed)."""
+        v4svc = self._v4_service(str(interaction.channel_id))
+        pend = getattr(v4svc.game, "_pending_check", None)
+        if not pend or expr.lower() not in ("d20", "1d20"):
+            return False
+        await interaction.response.defer(thinking=True)
+        die, _ = roll_expr("d20")
+        tag = f" {echo}" if echo else ""
+        # echo the raw die as the followup — resolves 「正在思考…」
+        await interaction.followup.send(
+            f"🎲{tag} **{interaction.user.display_name}** "
+            f"d20 → **{die}**")
+
+        narr_msg = [None]
+        last_edit = [0.0]
+
+        async def on_resolved(lines):
+            g_ = self._v4_service(str(interaction.channel_id)).game
+            view = CombatPanel(self) if g_.combat.active else None
+            await interaction.channel.send(_clip("\n".join(lines)),
+                                           view=view)
+            narr_msg[0] = await interaction.channel.send(
+                "📖 DM 正在寫作…")
+
+        def on_delta(acc: str):
+            msg = narr_msg[0]
+            if msg is None:
+                return
+            now = asyncio.get_event_loop().time()
+            if now - last_edit[0] >= 2.0 and len(acc) > 12:
+                last_edit[0] = now
+                asyncio.create_task(self._edit_safe(msg, acc))
+
+        try:
+            lines, narration = await v4svc.settle_roll(
+                die, on_delta=on_delta, on_resolved=on_resolved)
+        except Exception as e:
+            log.exception("v4 roll settle failed")
+            if narr_msg[0] is not None:
+                await narr_msg[0].edit(content=f"⚠️ {e}")
+            else:
+                await interaction.followup.send(f"⚠️ {e}")
+            return True
+        await self._finalize_narr(narr_msg[0], narration)
+        if not narr_msg[0] and lines:
+            g_ = self._v4_service(str(interaction.channel_id)).game
+            view = CombatPanel(self) if g_.combat.active else None
+            await interaction.channel.send(_clip("\n".join(lines)),
+                                           view=view)
+        return True
+
+    async def _v4_admin(interaction, character, text,
+                        structured=False):
+        """Admin v4 turn for any character — SAME streaming UX as
+        player turns (the old admin path bypassed handle(): no
+        guards, no word-by-word, narration as one blob)."""
+        await interaction.response.defer(thinking=True)
+        # echo as the followup — resolves 「正在思考…」
+        await interaction.followup.send(
+            f"🎛 **{interaction.user.display_name}** (admin) — "
+            f"**{character}** {_clip(text, 200)}")
+
+        narr_msg = [None]
+        last_edit = [0.0]
+
+        async def on_resolved(lines):
+            g_ = self._v4_service(str(interaction.channel_id)).game
+            view = CombatPanel(self) if g_.combat.active else None
+            await interaction.channel.send(_clip("\n".join(lines)),
+                                           view=view)
+            narr_msg[0] = await interaction.channel.send(
+                "📖 DM 正在寫作…")
+
+        def on_delta(acc: str):
+            msg = narr_msg[0]
+            if msg is None:
+                return
+            now = asyncio.get_event_loop().time()
+            if now - last_edit[0] >= 2.0 and len(acc) > 12:
+                last_edit[0] = now
+                asyncio.create_task(self._edit_safe(msg, acc))
+
+        try:
+            lines, narration = await self._v4_service(
+                str(interaction.channel_id)).handle(
+                text, f"{interaction.user.display_name} (admin)",
+                structured=structured, admin_actor=character,
+                on_delta=on_delta, on_resolved=on_resolved)
+        except Exception as e:
+            log.exception("v4 admin turn failed")
+            if narr_msg[0] is not None:
+                await narr_msg[0].edit(content=f"⚠️ {e}")
+            else:
+                await interaction.followup.send(f"⚠️ {e}")
+            return
+        await self._finalize_narr(narr_msg[0], narration)
+        if not narr_msg[0] and lines:
+            g_ = self._v4_service(str(interaction.channel_id)).game
+            view = CombatPanel(self) if g_.combat.active else None
+            await interaction.channel.send(_clip("\n".join(lines)),
+                                           view=view)
 
     async def on_message(self, message: discord.Message):
         if message.author.bot or not self.user:

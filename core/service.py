@@ -112,6 +112,7 @@ class V4Service:
     def _save(self) -> None:
         g = self.game
         blob = {
+            "v": 6,   # state schema version (tolerant loader)
             "party": g.party,
             "world": {
                 "scenes": {sid: {

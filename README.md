@@ -62,7 +62,9 @@ python core/cli.py
 
 Every combat command has its own typed autocomplete (enemy HP,
 item quantities, ★-proficient skills, downed-ally markers) — one
-command per action instead of one polymorphic menu.
+command per action instead of one polymorphic menu. During combat,
+verdict messages carry one-tap buttons (🛡 defend · 👁 observe ·
+🏃 flee · ⏭ pass); arg-ed actions stay typed commands.
 
 **In-channel keywords** (instant, no LLM): `status` `inv` `moves` `scene`
 
