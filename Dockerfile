@@ -16,7 +16,7 @@ RUN groupadd --gid 10001 bot \
     && mkdir /app/data \
     && chown bot:bot /app/data
 
-COPY bot.py agents.toml gamerules.json plot.json ./
+COPY bot.py gamerules.json plot.json ./
 COPY core/ ./core/
 COPY engine/ ./engine/
 COPY adapters/ ./adapters/

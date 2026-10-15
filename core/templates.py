@@ -110,6 +110,11 @@ def render_hint(entry, game=None) -> str:
     if kind == "talk" and d.get("npc"):
         npc = d.get("npc")
         u = d.get("utterance") or "交談"
+        if d.get("information") in ("exhausted", "unavailable"):
+            detail = "已沒有新情報可補充" if d["information"] == "exhausted" else "暫時沒有可提供的情報"
+            return f"{npc} 願意交談，但{detail}。"
+        if d.get("information") == "pending":
+            return f"{npc} 聽完 {actor} 的話，尚未作出答覆。"
         if d.get("ok"):
             return _pick([
                 f"{actor} 向 {npc} 表明來意——{npc} 沉吟片刻，開口回應。",
@@ -161,6 +166,17 @@ def render_hint(entry, game=None) -> str:
 
 
 # ---- turn context: the v3 "every turn ends with a hook" guarantee ----
+
+def conversation_next_step(g) -> str:
+    """Public, deterministic guidance when an NPC has no new information."""
+    if getattr(g, "_pending_check", None):
+        return f"👉 等待 {g._pending_check['actor']} 用 `/roll d20` 完成待定檢定。"
+    if g.combat.active:
+        return "👉 可以用 `/attack`、`/defend` 或 `/skill` 處理眼前的戰鬥。"
+    exits = list(g.world.here.exits.values())[:2]
+    choices = [f"前往「{name}」" for name in exits] + ["搜索目前場景"]
+    return "👉 可以" + "，或".join(choices) + "（用 `/explore` 描述行動）。"
+
 
 def scene_header(g) -> str:
     """Context bar: where, description, NPCs, exits."""

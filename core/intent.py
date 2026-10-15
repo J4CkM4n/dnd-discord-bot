@@ -38,6 +38,16 @@ _VERBS = {
 # Cantonese aspect markers and particles to strip before verb matching
 _PARTICLES = "咗緊吓啦喎啩嘅囉咯嘛"
 
+# These verbs identify a method, so they are safe degraded-mode candidates.
+# Robbery alone does not: it could mean stealth, coercion, or violence.
+_SKILL_VERBS = {
+    "sleight of hand": ("偷偷扒竊", "偷偷扒窃", "扒竊", "扒窃", "偷竊", "偷窃"),
+    "intimidation": ("威嚇", "威吓", "恐嚇", "恐吓"),
+    "persuasion": ("說服", "说服", "遊說", "游说"),
+    "stealth": ("潛行", "潜行", "匿埋"),
+}
+_ROBBERY = re.compile(r"^(?:洗劫|搶劫|抢劫|打劫|掠奪|掠夺|rob\b|mug\b)\s*(.*)$", re.I)
+
 
 @dataclass
 class Intent:
@@ -79,22 +89,49 @@ def _starts_with_verb(text: str):
     return None
 
 
+def _action_text(text: str, party_names=()) -> tuple[str, str]:
+    t = (text or "").strip()
+    actor = ""
+    for name in sorted(party_names, key=len, reverse=True):
+        if t.startswith(name):
+            actor = name
+            t = t[len(name):].lstrip(" ：:,，,")
+            break
+    t = re.sub(r"^我(?:(?:想要|想|要|嘗試|尝试|試下|試吓)\s*)?用?", "", t).lstrip()
+    return actor, t
+
+
+def robbery_clarification(text: str, party_names=(), npc_names=()) -> str:
+    """Ask for a method for a bare robbery request; infer no roll or loot."""
+    _, t = _action_text(text, party_names)
+    hit = _ROBBERY.fullmatch(t.rstrip("。.!！?？"))
+    if not hit:
+        return ""
+    target = hit[1].strip()
+    matches = [name for name in npc_names if target and target in name]
+    if target and len(matches) != 1:
+        return ""  # Let the action operator interpret richer descriptions.
+    name = matches[0] if matches else "對方"
+    return (f"❓ 你想怎樣洗劫{name}：偷偷扒竊，還是威嚇對方？"
+            f"請描述方法，例如 `/explore 偷偷扒竊{name}` 或 `/explore 威嚇{name}`。"
+            "尚未擲骰，也未取得任何財物。")
+
+
 def parse_command(text: str, party_names=()) -> Intent | None:
     """Deterministic keyword parser (degraded mode). Grammar:
         [角色] 動詞 賓語...
     e.g.「大力蕉 攻擊 哥布林①」「依思 執起把劍」「go 酒窖」
     Handles Cantonese particles (咗/緊/吓) and mixed English."""
-    t = (text or "").strip()
+    actor, t = _action_text(text, party_names)
     if not t:
         return None
-    actor = ""
-    for name in party_names:
-        if t.startswith(name):
-            actor = name
-            t = t[len(name):].lstrip(" ：:,，,")
-            break
-    # strip 我用/我 prefix before the verb
-    t = re.sub(r"^我用?", "", t).lstrip()
+    if _ROBBERY.match(t):
+        return None  # In particular, 打劫 must never match the attack verb 打.
+    for skill, verbs in _SKILL_VERBS.items():
+        for verb in verbs:
+            if t.startswith(verb):
+                return Intent("skill", actor=actor, skill=skill,
+                              target=t[len(verb):].lstrip(" ：:,，,"), raw=text)
     hit = _starts_with_verb(t)
     if hit is None:
         return None

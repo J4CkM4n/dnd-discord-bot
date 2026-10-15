@@ -63,7 +63,7 @@ def world_block(rules: dict) -> str:
             "玩家因此撲空＝敘事的錯。")
     return "\n".join(bits)
 
-from .cli import META, build_demo_game
+from .cli import META, build_demo_game, seed_starter_knowledge
 from .digestor import Digestor
 from .director import (canonize_scene, DirectorProposal, DirectorDecision,
                        verify_proposal, scan_prop, MAX_DIRECTOR_SCENES)
@@ -157,7 +157,8 @@ class V4Service:
         self.plot = load_plot()
         self.plot_state = new_state(self.plot)
         self.game = self._load() or build_demo_game()
-        if self._revision == 0:
+        repaired_knowledge = seed_starter_knowledge(self.game)
+        if self._revision == 0 or repaired_knowledge:
             self._save()
 
     # ---------- persistence ----------
@@ -272,7 +273,7 @@ class V4Service:
         if t.lower().strip(" ！!。.") in ("確認", "确认", "confirm", "對", "对", "yes", "y", "好", "ok"):
             return await self._confirm(user_id, on_delta, on_resolved, bool(admin_actor))
         from .guards import scrub_input
-        from .intent import parse_command
+        from .intent import parse_command, robbery_clarification
         t, was_scrubbed = scrub_input(t)
         if was_scrubbed:
             g.ledger.add(author or "?", "deny", "已過濾可疑指令文字", reason="injection")
@@ -281,6 +282,11 @@ class V4Service:
         reason = self._authorize(probe, user_id, admin_actor)
         if reason:
             return self._deny(probe.actor, reason)
+        if not structured:
+            clarification = robbery_clarification(t, list(g.party),
+                [n["name"] for n in g.world.here.npcs])
+            if clarification:
+                return [clarification], ""
         if t.startswith(("((", "//")):
             it = Intent(action="chat", utterance=t.lstrip("(/ "), raw=t)
         else:
@@ -301,7 +307,7 @@ class V4Service:
             if structured and it is not None:
                 it.confidence = 1.0
         if it is None:
-            return ["❓ 未能理解行動，請再描述一次。"], ""
+            return [self._interpretation_help()], ""
         if it.action == "talk" and not it.utterance:
             it.utterance = (it.raw or "")[:120]
         if it.action == "move" and not it.destination:
@@ -316,6 +322,34 @@ class V4Service:
                 it.action, it.skill = "skill", skill
                 it.target = it.target or it.args.pop("to", "")
         return await self._execute(it, user_id, admin_actor, text, on_delta, on_resolved)
+
+    def _interpretation_help(self):
+        """Distinguish failed model requests from an ambiguous player action."""
+        turn = current_turn()
+        failures = [r for r in (turn.records if turn else [])
+                    if r.get("kind") == "model_call" and r["role"] in ("main", "action")
+                    and r["status"] in ("unavailable", "budget_exhausted")]
+        if not failures:
+            failures = [r for r in (turn.records if turn else [])
+                        if r.get("kind") == "report" and r["role"] in ("main", "action")
+                        and r["status"] in ("invalid", "fallback")]
+        if failures:
+            failure = failures[-1]
+            role = "主代理" if failure["role"] == "main" else "行動解析器"
+            if failure.get("http_status") in (401, 403):
+                detail = "模型服務拒絕認證，請管理員檢查 API key 與存取權限。"
+            elif failure.get("http_status") == 404:
+                detail = "找不到模型或 API 路徑，請管理員檢查模型名稱與服務網址。"
+            elif failure.get("error_code") == "invalid_response" or failure.get("kind") == "report":
+                detail = "模型回覆格式未通過驗證，請管理員查看 bot 日誌。"
+            elif failure.get("error_code") == "timeout":
+                detail = "模型服務逾時，請稍後重試。"
+            else:
+                detail = "模型服務未能完成請求，請管理員查看 bot 日誌與模型設定。"
+            return (f"⚠️ {role}暫時無法解析自由描述。{detail}"
+                    "行動未執行。可先用明確指令，例如 `/explore 搜索`、`/defend` 或 `/status`。")
+        return ("❓ 請說明要做甚麼、對誰，以及使用的方法；行動尚未執行。"
+                "例如 `/explore 搜索`，或用 `/skill` 選擇技能與對象。")
 
     def _main_agent(self):
         return MainAgent(self.gateway, self.digestor, self.director, self.narrator)
@@ -799,6 +833,12 @@ class V4Service:
                     if n["name"] == npc_name:
                         npc_knows = n.get("disclosed", [])
                         break
+        no_information = next((e for e in events if e.kind == "talk"
+            and e.data.get("npc") == npc_name
+            and e.data.get("information") in ("exhausted", "unavailable")), None)
+        if no_information:
+            from .templates import conversation_next_step
+            hints.append(conversation_next_step(g))
         # v3 guard: placeholder names — narrator never sees real names
         pmap = make_placeholder_map(list(g.party))
         rmap = make_restore_map(list(g.party))
@@ -829,6 +869,11 @@ class V4Service:
             help_bits.append(
                 f"這段敘事必須讓 {npc_name} 以對話形式說出「{fact}」"
                 "——這是引擎判定打聽到的新情報，逐字融入對白。")
+        elif no_information:
+            help_bits.append(
+                f"{npc_name} 這次交談沒有新情報。必須如實表明，不能聲稱發現新線索。"
+                "如需回顧，只能重述上述已公開的事實；由 DM 提出骨架句中的可行下一步，"
+                "不能把建議當成 NPC 的新知識。")
         elif npc_knows and npc_name:
             for e in events:
                 if e.kind == "talk" and e.data.get("npc") == npc_name \

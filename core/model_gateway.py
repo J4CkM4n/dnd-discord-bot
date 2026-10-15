@@ -132,8 +132,9 @@ class ModelGateway:
 
     def _finish(self, record, started):
         record["latency_ms"] = round((time.monotonic() - started) * 1000, 2)
-        log.info("model | role=%s provider=%s status=%s ms=%.1f calls=%s",
-                 record["role"], record["provider"], record["status"], record["latency_ms"],
+        log.info("model | role=%s provider=%s model=%s status=%s error=%s http=%s ms=%.1f calls=%s",
+                 record["role"], record["provider"], record["model"], record["status"],
+                 record.get("error_code", ""), record.get("http_status", ""), record["latency_ms"],
                  record.get("call_count", 1))
 
     def _redact(self, text, *, partial=False):
@@ -171,8 +172,17 @@ class ModelGateway:
         except asyncio.CancelledError:
             record["status"] = "cancelled"
             raise
-        except Exception:
+        except Exception as exc:
             record["status"] = "unavailable"
+            if isinstance(exc, httpx.HTTPStatusError):
+                record["error_code"] = "http_error"
+                record["http_status"] = exc.response.status_code
+            elif isinstance(exc, (TimeoutError, httpx.TimeoutException)):
+                record["error_code"] = "timeout"
+            elif isinstance(exc, httpx.RequestError):
+                record["error_code"] = "connection"
+            else:
+                record["error_code"] = "invalid_response"
             # Never expose response bodies, request headers, or provider errors.
             raise ModelError(f"Model request failed for role {role}") from None
         finally:

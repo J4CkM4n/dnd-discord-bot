@@ -63,7 +63,9 @@ The bot runs as UID/GID `10001:10001` and needs no published ports. Credentials
 are read from `.env` at runtime and excluded from the image. Any variable named
 by `api_key_env` in `agents.toml` must also be present in `.env`.
 
-Compose mounts `agents.toml`, `gamerules.json`, and `plot.json` read-only. An
+`agents.toml` is excluded from the build context and image; supply it as a
+runtime mount when running the image directly. Compose mounts `agents.toml`,
+`gamerules.json`, and `plot.json` read-only. An
 `AGENT_CONFIG` path in `.env` selects an alternative host TOML file to mount;
 the container always reads it at `/app/agents.toml`. After changing mounted
 configuration, run `docker compose restart bot`. After changing `.env`, run
@@ -132,6 +134,28 @@ verdict messages carry one-tap buttons (🛡 defend · 👁 observe ·
 **In-channel keywords** (instant, no LLM): `status` `inv` `moves` `scene`
 
 **Plain text** = table talk (silently ignored, no reaction, no reply)
+
+At the starting dock, use `/explore 我想向老船長打聽附近的消息`.
+The captain shares one new fact per successful conversation: the route to the
+tavern, then a warning about its goblins. `/status` lists disclosed information.
+When no new information is available, the bot says so and suggests a next action.
+Existing saves missing the original captain's knowledge receive these starter
+facts automatically on load; custom knowledge and prior disclosures are preserved.
+
+For a request such as `/explore 洗劫船長`, the bot asks for a method before
+resolving anything. `/explore 偷偷扒竊老船長` selects a hand skill check;
+`/explore 威嚇老船長` selects intimidation. These and simple descriptions such
+as `/explore 我想搜索` have deterministic fallback parsing when models fail.
+Skill checks do not create NPC money or award unspecified items.
+
+If free-form actions keep failing, the reply now distinguishes a model failure
+from a request for clarification. Check `docker compose logs --tail=100 bot`
+(or the bot's console) for the failing `main` or `action` role. Model logs include
+the model name, a safe error category, and HTTP status. Check the corresponding
+role/provider in `agents.toml`: 401/403 indicates credentials or permissions;
+404 can mean an unavailable model or an incorrect API path; connection errors
+and timeouts indicate the model service needs attention. Restart after editing
+configuration. `/status` and typed engine commands remain available.
 
 ## The 18 Skills
 

@@ -17,6 +17,22 @@ from core.turn import Game
 from core.world import World, Scene, Enemy
 
 
+def seed_starter_knowledge(g: Game) -> bool:
+    """Repair missing starter data; preserve authored lists and disclosures."""
+    dock = g.world.scenes.get("dock")
+    if dock is None or dock.name != "霧錨鎮碼頭":
+        return False
+    for npc in dock.npcs:
+        if npc.get("name") == "老船長" and npc.get("desc") == "獨眼，正在補網" \
+                and "knows" not in npc:
+            npc["knows"] = [
+                "碼頭北邊的小路通往破舊酒館。",
+                "破舊酒館被哥布林佔據，前往時要小心。",
+            ]
+            return True
+    return False
+
+
 def build_demo_game(seed: int = None) -> Game:
     """seed pins the game's own RNG (initiative, dice, enemy targeting) —
     selftests pass a seed for byte-identical replays."""
@@ -57,6 +73,7 @@ def _build_demo_world_party() -> Game:
                                     Enemy.make("哥布林②", 5, 13, 2, "1d4")]})
     g.give_item("依思", "治療藥水", 2)
     g.give_item("大力蕉", "治療藥水", 2)
+    seed_starter_knowledge(g)
     return g
 
 

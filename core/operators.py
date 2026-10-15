@@ -6,6 +6,7 @@ No operator receives a service, writes game state, or invokes another operator.
 """
 
 import json
+import logging
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 
@@ -14,6 +15,8 @@ from .intent import Intent
 from .memory import build_memory
 from .model_gateway import ModelError, current_turn, reserve_calls
 from .rules_core import validate
+
+log = logging.getLogger("dnd-bot")
 
 
 def _json(value):
@@ -183,7 +186,9 @@ class MainAgent:
                     decision.reasons.append("main_rejected")
             report("main", revision, final, gateway=self.gateway)
             return ActionDecision(deepcopy(intent), revision, proposal, decision)
-        except (ModelError, ValueError, TypeError, KeyError):
+        except (ModelError, ValueError, TypeError, KeyError) as exc:
+            log.warning("operator | role=main status=fallback error=%s candidate=%s",
+                        type(exc).__name__, "parsed" if parsed else "none")
             report("main", revision, {"fallback": "parsed" if parsed else "clarify"},
                    status="fallback", gateway=self.gateway)
             # A failed supervisor cannot authorize a model-interpreted action.

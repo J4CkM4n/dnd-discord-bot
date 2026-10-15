@@ -98,7 +98,7 @@ def test_invalid_delegation_clarifies_without_mutation(tmp_path, plan):
     s = supervised(tmp_path, endpoint)
     before = encode_game(s.game)
     lines, _ = run(s.handle("請幫我處理一下那個", user_id="u1"))
-    assert "❓" in lines[0] and roles(endpoint) == ["main"]
+    assert "格式未通過驗證" in lines[0] and roles(endpoint) == ["main"]
     assert encode_game(s.game) == before
     assert any(r["status"] == "fallback" for r in audits(s))
 

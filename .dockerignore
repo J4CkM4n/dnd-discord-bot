@@ -5,6 +5,8 @@
 .env.*
 **/.env
 **/.env.*
+agents.toml
+**/agents.toml
 keys
 data
 deploy

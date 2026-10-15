@@ -123,6 +123,22 @@ def _reveal_fact(g: Game, actor: str, npc: dict) -> str | None:
     return fact
 
 
+def _npc_information(g: Game, actor: str, npc: dict, lines: list[str]) -> str:
+    """A willing exchange can succeed without yielding any new information."""
+    fact = _reveal_fact(g, actor, npc)
+    if fact:
+        lines.append(f"📜 打聽到：**{fact}**")
+        return "revealed"
+    information = "exhausted" if npc.get("knows") else "unavailable"
+    if information == "exhausted":
+        lines.append(f"📜 {npc['name']} 已把知道的都說了，這次沒有新情報。")
+    else:
+        lines.append(f"📜 {npc['name']} 暫時沒有可提供的情報。")
+    from .templates import conversation_next_step
+    lines.append(conversation_next_step(g))
+    return information
+
+
 def _apply_check_effect(g: Game, actor: str, effect: dict | None,
                         ok: bool, lines: list[str]) -> None:
     """Mechanical outcome of a settled check. Runs whether the die came
@@ -211,14 +227,11 @@ def _apply_check_effect(g: Game, actor: str, effect: dict | None,
                 if skill == "intimidation":
                     note += "——但眼神裡有一絲畏懼"
             lines.append(f"🤝 {note}")
+            information = _npc_information(g, actor, npc, lines)
             g.ledger.add(actor, "talk",
                          f"{actor} 的{skill}奏效：{note}",
                          npc=npc["name"], skill=skill, ok=True,
-                         disposition=npc["disposition"])
-            # a won exchange yields one NEW fact (engine-owned drip)
-            fact = _reveal_fact(g, actor, npc)
-            lines.append(f"📜 打聽到：**{fact}**" if fact
-                         else f"📜 {npc['name']} 沒有更多可透露的了")
+                         disposition=npc["disposition"], information=information)
 
 
 # ---------- validation ----------
@@ -959,23 +972,29 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
                 dc = 12 if skill == "persuasion" else 11
             else:  # friendly/allied: no gate, the NPC engages willingly
                 dc = 0
+            information = "pending"
             if dc:
+                exchange_start = len(g.ledger.entries)
                 ok, line = ability_check(g, actor, "CHA", dc, skill,
                                          auto=False,
                                          effect={"kind": "social",
                                                  "target": npc["name"],
                                                  "skill": skill})
                 lines.append(line)
+                if ok is False:
+                    information = "failed"
+                elif ok is True:
+                    information = next((e.data.get("information", "revealed")
+                        for e in reversed(g.ledger.entries[exchange_start:])
+                        if e.kind == "talk" and e.data.get("npc") == npc["name"]), "unavailable")
             else:
                 ok = True
                 lines.append(f"🤝 {npc['name']} 樂意回應")
-                fact = _reveal_fact(g, actor, npc)
-                lines.append(f"📜 打聽到：**{fact}**" if fact
-                             else f"（{npc['name']} 已把知道的都說了）")
+                information = _npc_information(g, actor, npc, lines)
             g.ledger.add(actor, "talk",
                          f"{actor} 向 {npc['name']}：{it.utterance}",
                          utterance=it.utterance, npc=npc["name"], ok=ok,
-                         disposition=disp, skill=skill)
+                         disposition=disp, skill=skill, information=information)
             return ResolveResult(lines)
         g.ledger.add(actor, "talk", f"{actor}：「{it.utterance}」",
                      utterance=it.utterance)
