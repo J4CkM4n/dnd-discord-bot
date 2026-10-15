@@ -130,7 +130,9 @@ This also imports an existing `rules.db` for `/rules` and legacy JSON saves.
 Keep one running bot per campaign database. `docker compose down` preserves
 the volume; `docker compose down -v` deletes its campaign data.
 
-Run the engine self-test inside the image without logging in to Discord:
+Run the engine self-test inside the image without logging in to Discord.
+Compose still requires `.env` and `agents.toml`; on a fresh checkout, copy both
+example files as shown above. CI uses these examples without real credentials:
 
 ```bash
 docker compose run --rm --no-deps bot python core/cli.py selftest
