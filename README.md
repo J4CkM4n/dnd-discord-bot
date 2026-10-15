@@ -190,6 +190,16 @@ When no new information is available, the bot says so and suggests a next action
 Existing saves missing the original captain's knowledge receive these starter
 facts automatically on load; custom knowledge and prior disclosures are preserved.
 
+For follow-up remarks, the action operator and main agent receive the same
+character's recent NPC exchange from the current scene (up to three turns old).
+This helps resolve references without exposing private NPC knowledge. Movement
+or the NPC leaving ends that reference. Specify the NPC when the target is
+unclear, for example `/explore 我向老船長說：死老嘢，講啲唔講啲`.
+Untargeted character speech is displayed once; it does not create a second
+narration bubble. Narration that only echoes the player's dialogue is rejected.
+The initial 🎭 echo uses the Discord display name; engine dialogue uses the
+player's selected, owned character name.
+
 For a request such as `/explore 洗劫船長`, the bot asks for a method before
 resolving anything. `/explore 偷偷扒竊老船長` selects a hand skill check;
 `/explore 威嚇老船長` selects intimidation. These and simple descriptions such

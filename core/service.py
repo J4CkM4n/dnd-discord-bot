@@ -75,7 +75,7 @@ from .rules_core import resolve, validate
 from .turn import Game
 from .state import encode_game, decode_game, clone_game
 from .persistence import CampaignRepository, StorageError
-from .memory import build_memory
+from .memory import build_memory, recent_conversation
 from .agent_config import legacy_config
 from .model_gateway import ModelGateway, current_turn, turn_context
 from .operators import MainAgent
@@ -329,7 +329,8 @@ class V4Service:
             elif it is None and not structured:
                 it = await self.digestor.digest(
                     t, list(g.party), g.world.here.name, list(g.world.here.exits.values()),
-                    known_targets=list(g.enemies) + [n["name"] for n in g.world.here.npcs] + list(g.party))
+                    known_targets=list(g.enemies) + [n["name"] for n in g.world.here.npcs] + list(g.party),
+                    conversation=recent_conversation(g, probe.actor))
             if structured and it is not None:
                 it.confidence = 1.0
         if it is None:
@@ -509,7 +510,12 @@ class V4Service:
         rotation_only = any(e.kind == "deny" and ("輪到" in str(e.data.get("reason", ""))
                             or "已行動" in str(e.data.get("reason", ""))) for e in g.ledger.entries[idx0:])
         player_input = it.raw or it.utterance or text[:120]
+        # Speech without an addressed NPC has already been rendered by the
+        # engine. It needs no second dialogue bubble or narration retry job.
+        speech_only = all(e.kind == "talk" and not e.data.get("npc")
+                          for e in g.ledger.entries[idx0:])
         narrate = bool(r.lines and self.pending is None and not rotation_only
+                       and not speech_only
                        and len(g.ledger.entries) > idx0)
         if r.lines:
             self._unfinished = self._narration_job(idx0, player_input, it.wants_help) if narrate else None
@@ -908,7 +914,7 @@ class V4Service:
         from .templates import render_hint
         from .guards import (make_placeholder_map, make_restore_map,
                              map_out, map_in, scrub_narration,
-                             is_repetition, is_chinese)
+                             is_repetition, is_chinese, is_dialogue_echo)
         end_id = (self._unfinished or {}).get("end_event_id", 2**63)
         events = [e for e in g.ledger.entries[idx0:] if e.event_id <= end_id
                   and e.kind not in ("table", "narration", "guard")
@@ -1047,6 +1053,12 @@ class V4Service:
         # v3 guard: language check — if still not Chinese, degrade
         if narration and not is_chinese(narration):
             narration = ""  # reject non-Chinese output
+        statements = [map_out(text, pmap) for e in events if e.kind == "talk"
+                      and (u := e.data.get("utterance"))
+                      for text in (u, e.text, f"{e.actor}：{u}")]
+        if narration and is_dialogue_echo(narration, statements):
+            log.info("narration rejected | trace=%s reason=dialogue_echo", turn.trace_id if turn else "-")
+            narration = ""
         # /continue bookkeeping on the SAFE (placeholder) text the LLM
         # actually produced: empty = it never spoke; no terminal
         # punctuation = the prose was cut mid-sentence (max_tokens /

@@ -97,6 +97,15 @@ def is_repetition(new_text: str, recent_texts: list,
     return False
 
 
+def is_dialogue_echo(text: str, statements: list[str]) -> bool:
+    """Reject a whole reply that only repeats dialogue, ignoring formatting."""
+    def normalize(value):
+        return re.sub(r"[\W_]+", "", value).casefold()
+
+    normalized = normalize(text)
+    return bool(normalized and any(normalized == normalize(s) for s in statements))
+
+
 # ---- language check (v3: 三層語言防禦) ----
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 _LATIN_RE = re.compile(r"[A-Za-z]")

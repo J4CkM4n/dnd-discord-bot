@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass
 
 from .director import DirectorProposal, DirectorDecision, verify_proposal, scan_prop, MAX_DIRECTOR_SCENES
 from .intent import Intent
-from .memory import build_memory, retired_demo_event
+from .memory import build_memory, retired_demo_event, recent_conversation
 from .model_gateway import ModelError, current_turn, reserve_calls
 from .rules_core import validate
 
@@ -145,6 +145,8 @@ class MainAgent:
         candidates = {"parsed": deepcopy(parsed)} if parsed else {}
         reports = {}
         decision, proposal, proposed_intent = None, None, None
+        actor = review_candidate(g, parsed or Intent("talk"), user_id, admin_actor)["actor"]
+        conversation = recent_conversation(g, actor)
         try:
             with reserve_calls(2):
                 plan = await self._main(
@@ -155,7 +157,7 @@ class MainAgent:
                     '操作員不能互相呼叫。進度在引擎提交後審查；你不能改寫規則或創造遊戲結果。',
                     {"player_input": text, "parsed": asdict(parsed) if parsed else None,
                      "current": json.loads(build_memory(g).current), "remaining_calls": current_turn().remaining,
-                     "locked_intent": locked_intent,
+                     "locked_intent": locked_intent, "recent_conversation": conversation,
                      "constraint": "locked_intent 時不允許 action 操作員，只能採用 parsed"})
             log.debug("operator response | trace=%s stage=plan data=%s",
                       current_turn().trace_id, self.gateway.diagnostic(plan))
@@ -176,7 +178,8 @@ class MainAgent:
                 if "action" in requested:
                     it = await self.digestor.digest(text, list(g.party), g.world.here.name,
                         list(g.world.here.exits.values()), known_targets=list(g.enemies)
-                        + [n["name"] for n in g.world.here.npcs] + list(g.party), strict=True)
+                        + [n["name"] for n in g.world.here.npcs] + list(g.party), strict=True,
+                        conversation=conversation)
                     reports["action"] = report("action", revision, asdict(it) if it else None,
                                                status="ok" if it else "invalid", gateway=self.gateway)
                     if it:
@@ -202,9 +205,12 @@ class MainAgent:
                     '明確指定場上目標的決鬥／單挑是 attack；普通攻擊有預設招式，'
                     '不必追問武器或方法。意圖清楚時選 execute，讓引擎處理規則與結果。'
                     'action 報告無效時，可選擇清楚且通過預檢的 parsed 意圖。'
+                    'recent_conversation 只供理解代稱和話題；不能把抱怨當成成功說服或已獲情報。'
+                    '沒有可靠交談對象時，不要替玩家任選 NPC。'
                     '否定、假設、非致命或其他明確限制必須保留；有真實語意衝突才 clarify。',
                     {"candidates": {k: asdict(v) for k, v in candidates.items()},
                      "current": json.loads(build_memory(g).current), "enemies": list(g.enemies),
+                     "recent_conversation": conversation,
                      "checks": {k: review_candidate(g, v, user_id, admin_actor) for k, v in candidates.items()},
                      "reports": {k: v.read(revision, ids) for k, v in reports.items()}})
             log.debug("operator response | trace=%s stage=decision data=%s",

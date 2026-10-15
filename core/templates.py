@@ -125,7 +125,7 @@ def render_hint(entry, game=None) -> str:
             f"{npc} 搖了搖頭，似乎不想多談。"], actor + npc)
 
     if kind == "talk":
-        return entry.text
+        return ""  # the engine already displayed untargeted character speech
 
     if kind == "reveal":
         npc = d.get("npc", "對方")

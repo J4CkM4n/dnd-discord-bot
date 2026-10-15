@@ -19,6 +19,28 @@ def retired_demo_event(g, event) -> bool:
                for name in getattr(g, "retired_demo_names", []))
 
 
+def recent_conversation(g, actor: str) -> dict | None:
+    """A short public dialogue reference for this actor, bounded by scene/age.
+
+    A prior exchange helps interpret pronouns; it never authorizes an action
+    or supplies undisclosed NPC knowledge. Movement breaks the reference.
+    """
+    if actor not in g.party:
+        return None
+    present = {n["name"] for n in g.world.here.npcs}
+    for event in reversed(g.ledger.entries):
+        if g.ledger.turn - event.turn > 3 or event.kind == "scene":
+            break
+        if event.actor != actor or event.kind != "talk" or retired_demo_event(g, event):
+            continue
+        npc = event.data.get("npc")
+        if npc in present and event.data.get("scene") == g.world.current:
+            return {"actor": actor, "npc": npc, "scene": g.world.current,
+                    "event_id": event.event_id, "utterance": event.data.get("utterance", ""),
+                    "information": event.data.get("information", "unavailable")}
+    return None
+
+
 @dataclass(frozen=True)
 class MemoryContext:
     current: str
