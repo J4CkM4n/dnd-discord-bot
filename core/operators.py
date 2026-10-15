@@ -25,7 +25,8 @@ def _json(value):
 
 def _shape(data, fields):
     if type(data) is not dict or set(data) != set(fields):
-        raise ModelError("Invalid operator response fields")
+        received = list(data) if isinstance(data, dict) else type(data).__name__
+        raise ModelError(f"Invalid operator response fields: expected={list(fields)} received={received}")
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,19 @@ def report(role, revision, payload, event_ids=(), *, status="ok", gateway=None):
                     event_ids=list(event_ids), payload=payload,
                     provider=spec.provider if spec else "deterministic",
                     model=spec.model if spec else "", latency_ms=0)
+        if gateway and role == "main":
+            fields = {k: payload[k] for k in ("consult", "decision", "intent", "director", "fallback")
+                      if k in payload}
+            log.info("operator | trace=%s role=main status=%s result=%s",
+                     turn.trace_id, status, gateway.diagnostic(fields))
+        elif gateway and role == "action":
+            fields = {k: payload[k] for k in ("action", "actor", "target", "skill", "confidence")
+                      if isinstance(payload, dict) and k in payload}
+            log.debug("operator | trace=%s role=action status=%s result=%s",
+                      turn.trace_id, status, gateway.diagnostic(fields))
+        else:
+            log.debug("operator | trace=%s role=%s status=%s events=%d",
+                      turn.trace_id, role, status, len(event_ids))
     return result
 
 
@@ -72,6 +86,21 @@ def public_options(g):
     options += [f"考慮前往「{name}」。" for name in g.world.here.exits.values()]
     options += ["搜索當前場景。", "檢查隊伍狀態與背包，再決定下一步。"]
     return options[:8]
+
+
+def review_candidate(g, intent, user_id="", admin_actor=""):
+    """Read-only preflight for main review; the service still rechecks on execution."""
+    checked = deepcopy(intent)
+    actor = admin_actor or checked.actor or next((n for n, p in g.party.items()
+        if not user_id or str(p.get("owner_id", "")) == str(user_id)), "")
+    checked.actor = actor
+    authorized = actor in g.party and bool(admin_actor or not user_id
+        or str(g.party[actor].get("owner_id", "")) == str(user_id))
+    reason = validate(g, checked, allow_unplanned_move=True) if authorized else "角色未獲授權"
+    if not reason and getattr(g, "_pending_check", None) and checked.action not in ("help", "meta", "chat"):
+        reason = "尚有待定檢定，請先用 /roll d20 結算"
+    return {"actor": actor, "authorized": authorized, "reason": reason,
+            "needs_confirmation": checked.confidence < .7 and not checked.args.get("confirmed", False)}
 
 
 def progress_input(g, plot, query, npc_name=""):
@@ -128,6 +157,8 @@ class MainAgent:
                      "current": json.loads(build_memory(g).current), "remaining_calls": current_turn().remaining,
                      "locked_intent": locked_intent,
                      "constraint": "locked_intent 時不允許 action 操作員，只能採用 parsed"})
+            log.debug("operator response | trace=%s stage=plan data=%s",
+                      current_turn().trace_id, self.gateway.diagnostic(plan))
             _shape(plan, ("consult",))
             requested = plan["consult"]
             if type(requested) is not list or any(type(r) is not str for r in requested) \
@@ -153,15 +184,11 @@ class MainAgent:
                 selected = candidates.get("action", candidates.get("parsed"))
                 if "director" in requested and selected:
                     # Authorize/validate before spending any generation calls.
-                    actor = admin_actor or selected.actor or next((n for n, p in g.party.items()
-                        if not user_id or str(p.get("owner_id", "")) == str(user_id)), "")
-                    allowed = actor in g.party and (admin_actor or not user_id
-                                or str(g.party[actor].get("owner_id", "")) == str(user_id))
+                    preflight = review_candidate(g, selected, user_id, admin_actor)
                     checked = deepcopy(selected)
-                    checked.actor = actor
-                    if allowed and (checked.confidence >= .7 or checked.args.get("confirmed")) \
-                            and not getattr(g, "_pending_check", None) \
-                            and not validate(g, checked, allow_unplanned_move=True):
+                    checked.actor = preflight["actor"]
+                    if preflight["authorized"] and not preflight["needs_confirmation"] \
+                            and not preflight["reason"] and not getattr(g, "_pending_check", None):
                         proposal, decision = await self.propose(g, checked, rules or {}, plot_state or {})
                         proposed_intent = selected
                         reports["director"] = report("director", revision, asdict(decision) if decision else None,
@@ -170,9 +197,18 @@ class MainAgent:
                 final = await self._main(
                     '審核操作員報告並決定。只輸出 {"decision":"execute"或"clarify",'
                     '"intent":"parsed"或"action","director":false}。只能選已提供的意圖。'
-                    'director=true 表示批准已通過驗證的提案。衝突或不確定時 clarify；不能自行改寫意圖。',
+                    'director=true 表示批准已通過驗證的提案。衝突或不確定時 clarify；不能自行改寫意圖。'
+                    'current 與 checks 是引擎提供的當前場景與預檢，不代表行動已成功。'
+                    '明確指定場上目標的決鬥／單挑是 attack；普通攻擊有預設招式，'
+                    '不必追問武器或方法。意圖清楚時選 execute，讓引擎處理規則與結果。'
+                    'action 報告無效時，可選擇清楚且通過預檢的 parsed 意圖。'
+                    '否定、假設、非致命或其他明確限制必須保留；有真實語意衝突才 clarify。',
                     {"candidates": {k: asdict(v) for k, v in candidates.items()},
+                     "current": json.loads(build_memory(g).current), "enemies": list(g.enemies),
+                     "checks": {k: review_candidate(g, v, user_id, admin_actor) for k, v in candidates.items()},
                      "reports": {k: v.read(revision, ids) for k, v in reports.items()}})
+            log.debug("operator response | trace=%s stage=decision data=%s",
+                      current_turn().trace_id, self.gateway.diagnostic(final))
             _shape(final, ("decision", "intent", "director"))
             if final["decision"] not in ("execute", "clarify") or type(final["director"]) is not bool \
                     or type(final["intent"]) is not str:
@@ -187,8 +223,10 @@ class MainAgent:
             report("main", revision, final, gateway=self.gateway)
             return ActionDecision(deepcopy(intent), revision, proposal, decision)
         except (ModelError, ValueError, TypeError, KeyError) as exc:
-            log.warning("operator | role=main status=fallback error=%s candidate=%s",
-                        type(exc).__name__, "parsed" if parsed else "none")
+            turn = current_turn()
+            log.warning("operator | trace=%s role=main status=fallback error=%s reason=%s candidate=%s",
+                        turn.trace_id if turn else "-", type(exc).__name__,
+                        self.gateway.diagnostic(str(exc)), "parsed" if parsed else "none")
             report("main", revision, {"fallback": "parsed" if parsed else "clarify"},
                    status="fallback", gateway=self.gateway)
             # A failed supervisor cannot authorize a model-interpreted action.

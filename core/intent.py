@@ -47,6 +47,16 @@ _SKILL_VERBS = {
     "stealth": ("潛行", "潜行", "匿埋"),
 }
 _ROBBERY = re.compile(r"^(?:洗劫|搶劫|抢劫|打劫|掠奪|掠夺|rob\b|mug\b)\s*(.*)$", re.I)
+_DUEL_VERB = r"(?:決鬥|决斗|單挑|单挑|交戰|交战|戰鬥|战斗|duel\b)"
+_DUEL_PATTERNS = (
+    re.compile(r"^(?:與|与|和|跟|同|向|對|对)\s*(?P<target>[^，。！？,;；]+?)\s*"
+               r"(?:(?:發起|发起|進行|进行)\s*)?" + _DUEL_VERB + r"[。！!]*$", re.I),
+    re.compile(r"^" + _DUEL_VERB + r"\s*(?P<target>[^，。！？,;；]+?)[。！!]*$", re.I),
+)
+# A request for practice or a hypothetical fight must not become a damaging attack.
+_DUEL_QUALIFIER = re.compile(
+    r"不|沒|没|唔|別|别|拒絕|拒绝|如果|假如|是否|[?？]|"
+    r"練習|练习|切磋|模擬|模拟|友誼|友谊|非致命|點到為止|点到为止")
 
 
 @dataclass
@@ -127,6 +137,11 @@ def parse_command(text: str, party_names=()) -> Intent | None:
         return None
     if _ROBBERY.match(t):
         return None  # In particular, 打劫 must never match the attack verb 打.
+    if not _DUEL_QUALIFIER.search(t):
+        for pattern in _DUEL_PATTERNS:
+            duel = pattern.fullmatch(t)
+            if duel:
+                return Intent("attack", actor=actor, target=duel["target"].strip(), raw=text)
     for skill, verbs in _SKILL_VERBS.items():
         for verb in verbs:
             if t.startswith(verb):

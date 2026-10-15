@@ -5,10 +5,9 @@ import logging
 import os
 import sys
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+from core.logging_config import configure_logging
+
+configure_logging()
 log = logging.getLogger("dnd-bot")
 
 

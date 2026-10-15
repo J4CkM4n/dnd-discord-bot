@@ -71,6 +71,28 @@ the container always reads it at `/app/agents.toml`. After changing mounted
 configuration, run `docker compose restart bot`. After changing `.env`, run
 `docker compose up -d --force-recreate bot` to reload the environment.
 
+Set `LOG_LEVEL=DEBUG` in `.env` for detailed application diagnostics:
+
+```bash
+docker compose up -d --build --force-recreate bot
+docker compose logs -f --tail=200 bot
+```
+
+Startup logs show each role's provider, endpoint, model, timeout, token budget,
+and thinking setting. Command logs share a `trace` ID across routing, model
+requests, operator plans, final decisions, and execution. `mode=supervised`
+selects the main-agent route; model entries show which calls actually ran.
+`mode=typed` uses typed engine commands;
+`mode=legacy` means supervision is disabled. A main `decision: clarify` is an
+LLM decision, while `status=fallback` identifies a failed request or invalid
+operator response and records its reason and available deterministic candidate.
+HTTP status, JSON validation location, completion reason, output length, and
+thinking length help diagnose authentication, missing models, and truncation.
+DEBUG also includes bounded input and structured decision previews. Configured
+API keys and the Discord token are redacted; HTTP headers, full prompts, raw
+error response bodies, and library wire dumps are omitted. Set `LOG_LEVEL=INFO`
+and recreate the container to return to normal logging.
+
 For local Ollama, Compose defaults to `http://host.docker.internal:11434`,
 including a host-gateway mapping for Linux. The host's model server must listen
 on an interface reachable from containers; Linux Ollama installations may need
@@ -147,6 +169,12 @@ resolving anything. `/explore 偷偷扒竊老船長` selects a hand skill check;
 `/explore 威嚇老船長` selects intimidation. These and simple descriptions such
 as `/explore 我想搜索` have deterministic fallback parsing when models fail.
 Skill checks do not create NPC money or award unspecified items.
+
+`/explore 與船長決鬥` and `/explore 跟船長單挑` identify the captain as an
+attack target and use ordinary combat rules, including damage and NPC hostility.
+The engine supplies a default attack when no weapon or move is specified.
+Negated, hypothetical, or explicitly nonlethal practice requests require further
+interpretation. `/attack` with target `老船長` also works directly.
 
 If free-form actions keep failing, the reply now distinguishes a model failure
 from a request for clarification. Check `docker compose logs --tail=100 bot`

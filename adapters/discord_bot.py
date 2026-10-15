@@ -148,6 +148,7 @@ class DiscordBot(discord.Client):
         from core.model_gateway import ModelGateway
         self.agent_config = agent_config or (gateway.config if gateway else load_agent_config())
         self.model_gateway = gateway or ModelGateway(self.agent_config)
+        self.model_gateway.log_configuration()
         intents = discord.Intents.default()
         intents.message_content = message_content
         super().__init__(intents=intents)

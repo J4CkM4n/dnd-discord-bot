@@ -11,6 +11,7 @@ services:
     environment:
       DATA_DIR: /app/data
       AGENT_CONFIG: /app/agents.toml
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
       # Container loopback is not the host. Override for a remote model server.
       LLM_URL: ${DOCKER_LLM_URL:-http://host.docker.internal:11434}
     extra_hosts:

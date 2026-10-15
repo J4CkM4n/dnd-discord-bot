@@ -105,10 +105,16 @@ def serialized(result="turn"):
                 stage._committed = False
                 try:
                     with turn_context(self.agent_config.max_calls, self._revision) as turn:
+                        log.info("command start | trace=%s channel=%s method=%s revision=%d supervision=%s budget=%d",
+                                 turn.trace_id, self.channel_id, fn.__name__, self._revision,
+                                 self.agent_config.enabled, turn.limit)
                         outcome = await fn(stage, *args, **kwargs)
                         # Also retain failures/clarifications that produce no game turn.
                         if len(turn.records) > stage._audit_cursor:
                             stage._save(narration_only=True)
+                        log.info("command end | trace=%s channel=%s method=%s revision=%d calls=%d/%d",
+                                 turn.trace_id, self.channel_id, fn.__name__, stage._revision,
+                                 turn.calls, turn.limit)
                         return outcome
                 except StorageError:
                     log.exception("campaign save failed | channel=%s", self.channel_id)
@@ -279,6 +285,12 @@ class V4Service:
             g.ledger.add(author or "?", "deny", "已過濾可疑指令文字", reason="injection")
         probe = parse_command(t, party_names=list(g.party)) or Intent("meta", actor=next(
             (n for n in g.party if t.startswith(n)), ""))
+        turn = current_turn()
+        log.debug("action input | trace=%s text=%s", turn.trace_id if turn else "-", self.gateway.diagnostic(t))
+        log.info("action route | trace=%s mode=%s parsed=%s",
+                 turn.trace_id if turn else "-",
+                 "typed" if structured else "supervised" if self.agent_config.enabled else "legacy",
+                 probe.action if probe.raw else "none")
         reason = self._authorize(probe, user_id, admin_actor)
         if reason:
             return self._deny(probe.actor, reason)
@@ -286,6 +298,7 @@ class V4Service:
             clarification = robbery_clarification(t, list(g.party),
                 [n["name"] for n in g.world.here.npcs])
             if clarification:
+                log.info("action stopped | trace=%s reason=robbery_method_required", turn.trace_id if turn else "-")
                 return [clarification], ""
         if t.startswith(("((", "//")):
             it = Intent(action="chat", utterance=t.lstrip("(/ "), raw=t)
@@ -307,7 +320,7 @@ class V4Service:
             if structured and it is not None:
                 it.confidence = 1.0
         if it is None:
-            return [self._interpretation_help()], ""
+            return [self._interpretation_help(probe)], ""
         if it.action == "talk" and not it.utterance:
             it.utterance = (it.raw or "")[:120]
         if it.action == "move" and not it.destination:
@@ -323,7 +336,7 @@ class V4Service:
                 it.target = it.target or it.args.pop("to", "")
         return await self._execute(it, user_id, admin_actor, text, on_delta, on_resolved)
 
-    def _interpretation_help(self):
+    def _interpretation_help(self, parsed=None):
         """Distinguish failed model requests from an ambiguous player action."""
         turn = current_turn()
         failures = [r for r in (turn.records if turn else [])
@@ -335,6 +348,9 @@ class V4Service:
                         and r["status"] in ("invalid", "fallback")]
         if failures:
             failure = failures[-1]
+            log.warning("action stopped | trace=%s reason=model_failure role=%s status=%s error=%s http=%s",
+                        turn.trace_id, failure["role"], failure["status"],
+                        failure.get("error_code", "schema_validation"), failure.get("http_status", ""))
             role = "主代理" if failure["role"] == "main" else "行動解析器"
             if failure.get("http_status") in (401, 403):
                 detail = "模型服務拒絕認證，請管理員檢查 API key 與存取權限。"
@@ -348,6 +364,12 @@ class V4Service:
                 detail = "模型服務未能完成請求，請管理員查看 bot 日誌與模型設定。"
             return (f"⚠️ {role}暫時無法解析自由描述。{detail}"
                     "行動未執行。可先用明確指令，例如 `/explore 搜索`、`/defend` 或 `/status`。")
+        log.info("action stopped | trace=%s reason=clarification_required candidate=%s",
+                 turn.trace_id if turn else "-", parsed.action if parsed else "none")
+        if parsed and parsed.action == "attack" and parsed.target:
+            return (f"❓ 已識別你想與「{parsed.target}」戰鬥，但主代理要求澄清，行動尚未執行。"
+                    "如確定要按一般戰鬥規則攻擊，可用 `/attack` 並填入目標名稱；"
+                    "如果只是切磋，請說明規則。")
         return ("❓ 請說明要做甚麼、對誰，以及使用的方法；行動尚未執行。"
                 "例如 `/explore 搜索`，或用 `/skill` 選擇技能與對象。")
 
@@ -373,6 +395,9 @@ class V4Service:
         return None
 
     def _deny(self, actor, reason):
+        turn = current_turn()
+        log.info("action denied | trace=%s reason=%s",
+                 turn.trace_id if turn else "-", self.gateway.diagnostic(reason))
         self.game.ledger.add(actor or "?", "deny", f"拒絕：{reason}", reason=reason)
         self._save()
         return [f"🚫 {reason}"], ""
@@ -404,6 +429,12 @@ class V4Service:
 
     async def _execute(self, it, user_id, admin_actor, text, on_delta, on_resolved):
         g = self.game
+        turn = current_turn()
+        log.info("action selected | trace=%s action=%s confidence=%.2f",
+                 turn.trace_id if turn else "-", it.action, it.confidence)
+        log.debug("action candidate | trace=%s details=%s", turn.trace_id if turn else "-",
+                  self.gateway.diagnostic({"actor": it.actor, "target": it.target, "skill": it.skill,
+                                           "destination": it.destination}))
         reason = self._authorize(it, user_id, admin_actor)
         if reason:
             return self._deny(it.actor, reason)
@@ -917,9 +948,10 @@ class V4Service:
             world=map_out(world_block(self.rules), pmap),
             memory=map_out(build_memory(g, player_input, npc_name=npc_name).render(), pmap))
         # review trail: log the pair so output quality is auditable
-        log.info("narrate | in=%.60s | hints=%d | out=%.200s",
-                 player_input.replace("\n", " "), len(hints),
-                 narration.replace("\n", " "))
+        turn = current_turn()
+        log.debug("narrate | trace=%s in=%s hints=%d out=%s",
+                  turn.trace_id if turn else "-", self.gateway.diagnostic(player_input, 100),
+                  len(hints), self.gateway.diagnostic(narration, 250))
         # force Traditional Chinese (models skew Simplified)
         try:
             from opencc import OpenCC
@@ -939,9 +971,9 @@ class V4Service:
                 scene_items.append(fi)
         # observability: narrator-invented props (the phantom 木雕
         # class of bug) — the DM sees what the guard let through
-        log.info("item guard | scene=%s known=%d found=%s",
-                 g.world.here.name, len(all_known),
-                 found_items or "—")
+        log.debug("item guard | scene=%s known=%d found=%s",
+                  self.gateway.diagnostic(g.world.here.name), len(all_known),
+                  self.gateway.diagnostic(found_items))
         if was_scrubbed_n:
             g.ledger.add("engine", "guard",
                          "已從敘事中清除假骰/判定文字")

@@ -5,9 +5,13 @@ callers retain the deterministic parser / low-confidence talk fallback.
 """
 
 from .agent_config import legacy_config
-from .model_gateway import ModelGateway, json_object
+import logging
+
+from .model_gateway import ModelGateway, ModelError, current_turn, json_object
 
 from .intent import ACTIONS, Intent, parse_command
+
+log = logging.getLogger("dnd-bot")
 
 
 class Digestor:
@@ -28,6 +32,10 @@ class Digestor:
             "attack ＝企圖傷害或制服場上某人／生物（武器、拳腳、法術、擒拿）。\n"
             "         擋、閃、恐嚇、大叫、追趕都唔算。撞門、劈鎖係對物件，"
             "用 creative。\n"
+            "與／跟／同某人決鬥、單挑或交戰＝attack，target 填對方名字。"
+            "例如「與船長決鬥」填 action=attack、target=船長；不要創造 duel action。"
+            "普通攻擊可用引擎預設招式，不需要追問武器。"
+            "否定、假設或要求非致命切磋不代表立即攻擊，不能忽略這些限制。\n"
             "take   ＝拾起／拿走場景中嘅物件（執、撿、攞、pick up）。\n"
             "move   ＝去另一個地方（去、前往、go to）。\n"
             "talk   ＝同 NPC 說話或提問（傾計、問、ask）。想呃佢填 skill="
@@ -158,11 +166,18 @@ class Digestor:
                 confidence=float(confidence),
                 wants_help=str(data.get("wants_help", "")).strip().lower()
                 in ("true", "1", "yes", "係", "是"))
-        except Exception:
+        except Exception as exc:
+            turn = current_turn()
+            log.warning("action interpretation | trace=%s status=invalid strict=%s error=%s reason=%s",
+                        turn.trace_id if turn else "-", strict, type(exc).__name__,
+                        self.gateway.diagnostic(str(exc) if isinstance(exc, (ModelError, ValueError))
+                                                else type(exc).__name__))
             if strict:
                 return None
             it = parse_command(text, party_names)
             if it is None:
                 it = Intent(action="talk", utterance=text, raw=text,
                             confidence=0.3)
+            log.info("action interpretation | trace=%s status=fallback candidate=%s",
+                     turn.trace_id if turn else "-", it.action)
             return it
