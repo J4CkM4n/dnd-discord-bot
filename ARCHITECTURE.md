@@ -21,7 +21,7 @@ graph TB
         RC[rules_core.py<br/>validate + resolve<br/>ONLY write path]
         TU[turn.py<br/>Game state<br/>party · combat · inventory]
         WO[world.py<br/>Scene graph<br/>NPCs + knows + encounters]
-        LD[Ledger<br/>append-only facts<br/>replayable]
+        LD[Ledger<br/>append-only facts<br/>stable event IDs]
     end
 
     subgraph "Shared Math no LLM"
@@ -120,7 +120,7 @@ sequenceDiagram
 ```mermaid
 graph LR
     subgraph "State"
-        V4S[v4_state_<channel>.json<br/>party · world · inventory<br/>combat+slots · ledger · plot state]
+        V4S[campaigns.db<br/>per-channel snapshots · events<br/>director decisions · narration status]
         RDB[rules.db<br/>2918 SRD chunks]
     end
 
@@ -128,7 +128,7 @@ graph LR
         GAME[Game object<br/>in-memory]
     end
 
-    GAME -->|save after each turn| V4S
+    GAME -->|atomic commit before verdict and narration| V4S
     V4S -->|load on restart| GAME
     RDB -->|SRD lookup| GAME
 
@@ -145,7 +145,7 @@ graph LR
 | Decision | Why |
 |---|---|
 | Engine has the only write path | LLM cannot cheat — no attack surface |
-| Ledger is append-only | Full audit trail, replayable |
+| Ledger is append-only | Full audit trail; complete snapshots provide recovery |
 | Narrator gets skeletons | Fewer tokens to generate, smaller hallucination surface |
 | NPC `knows` + `disclosed` lists | Narrator cannot invent quest content; the engine drips one NEW fact per successful exchange and players see their intel progress (`/status`, 已問出 x/y) |
 | Help detection = digestor field (`wants_help`) | Intent reading by meaning is the LLM's job; keyword regex only backstops the no-LLM fallback |

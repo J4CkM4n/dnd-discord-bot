@@ -80,10 +80,11 @@ class Narrator:
                     type(e).__name__, len(text))
         return text
 
-    async def continue_text(self, partial: str, on_delta=None) -> str:
+    async def continue_text(self, partial: str, on_delta=None, context: str = "") -> str:
         """Resume narration that was cut off mid-output: continue the
         prose from the breakpoint (no re-intro, no repetition)."""
         prompt = (
+            f"{context}\n"
             "你正在為 D&D 遊戲擔任 DM，用繁體中文寫敘事。"
             "先前的輸出被中斷了，已寫出的部分如下"
             "（可能停在某句中間）：\n"
@@ -109,7 +110,7 @@ class Narrator:
                       player_input: str = "",
                       scene_items: list = None,
                       party_inventory: dict = None,
-                      world: str = "") -> str:
+                      world: str = "", memory: str = "") -> str:
         """hints = engine prose skeletons; npc_knows = facts an NPC may
         reveal; extra_directive = turn-level hard rule; on_delta = streaming
         callback; player_input = the player's own words — the first sentence
@@ -190,6 +191,7 @@ class Narrator:
             tail += f"· {extra_directive}\n"
         prompt = (
             f"{world_head}"
+            f"{memory}\n"
             f"場景：{scene}\n隊伍現況：{party_brief}{hint_block}\n"
             "（引擎事實，僅供核對：\n"
             + "\n".join(f"- {f}" for f in facts) + "）\n"

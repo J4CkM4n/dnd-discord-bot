@@ -88,7 +88,7 @@ find hidden items · social skills → move NPC disposition up the ladder.
 2. **Predict the narration** — the engine renders prose skeletons from its
    own data; the narrator only adds atmosphere
 3. **NPC knowledge is data** — each NPC has a `knows` list; the narrator
-   can only reveal those facts
+   receives only the facts the engine has disclosed
 4. **No LLM required** — the CLI proves the full game (combat, items,
    scenes, checks) works with zero model calls
 5. **v3 lessons ported** — placeholder names, fake-dice scrubbing,
@@ -106,13 +106,15 @@ core/                   # the game engine (v6)
 ├── world.py            # Scene graph, NPCs (with knows), encounters
 ├── turn.py             # Game state: party, combat, inventory, slots
 ├── rules_core.py       # validate + resolve (the only write path)
-├── ledger.py           # append-only event log (replayable)
+├── ledger.py           # append-only facts with stable per-channel event IDs
 ├── digestor.py         # 12b: freeform text → Intent JSON
 ├── narrator.py         # 27b: facts + skeletons → prose
 ├── templates.py        # deterministic prose skeletons
 ├── guards.py           # output defenses (placeholders, scrubbing, s2t)
-├── ledger.py           # append-only event log (replayable)
-├── service.py          # orchestration + persistence
+├── service.py          # serialized commands, staged turns, commit before output
+├── persistence.py      # SQLite snapshots, event appends, decision audit, narration
+├── state.py            # complete state codec + legacy JSON import support
+├── memory.py           # bounded factual recall for director and narrator
 ├── director.py         # engine gate: prop/scene canonization
 ├── director_llm.py     # generative Director (unplanned places/finds)
 ├── plot.py             # plot spine: clocks + trigger-fired beats
@@ -149,6 +151,71 @@ All optional — the game runs with zero LLM (`python core/cli.py selftest`).
 Note: qwen3.x are REASONING models — narrator requires `V4_NARR_THINK=off`
 or thinking consumes the whole token budget (and the OpenAI-compat endpoint
 ignores the flag; we use Ollama's native `/api/chat`).
+
+## Director decisions and campaign memory
+
+The director uses **Judge–Evaluate–Verify (JEV)**. Ownership, action eligibility,
+existing exits/discoveries, and scene limits are checked before generation.
+The model proposes one scene or inert item; the engine validates its types,
+limits, uniqueness, and item restrictions before staging it with the action.
+Rejected actions leave no generated world objects behind.
+
+Set `V4_DIRECTOR_EVALUATE=on` to add one advisory model call checking relevance
+and consistency against canon, current state, and campaign history. It uses the
+digestor model and its thinking setting. Default: `off`. Invalid, unavailable,
+or negative evaluations reject the proposal; no retries occur. Existing
+deterministic gameplay remains available. This is a decision workflow, not a
+trained new model; narrative consistency judgments remain fallible.
+
+The director and narrator recall up to **12 historical engine facts / 3,000
+characters**, ranked by scene, referenced characters, plot relevance, and
+recency. Current state takes precedence over history. Narration, table talk,
+and rejected proposals never become factual memory. Hidden items and
+undisclosed NPC knowledge stay out of narrator recall. Authored `world.canon`
+continues to be shared background in prompts.
+
+## Persistence and migration
+
+`DATA_DIR/campaigns.db` (default `data/campaigns.db`) is the authoritative store.
+It contains isolated channel snapshots, append-only events, director decision
+records, and narration status. Saves use SQLite transactions with WAL and full
+synchronization. Each command stages its changes, commits the snapshot and new
+events, then sends the verdict and starts narration. Narration completion is
+saved separately, without rewriting the gameplay snapshot or past events.
+
+Snapshots include pending checks, player-bound confirmations, combat effects,
+plot progress, RNG state, and continuation references. `/confirm` and `/roll`
+enforce ownership. A failed write leaves committed state intact; a failed
+callback or narrator leaves a resumable `/continue`. Commands serialize within
+each channel, including narration, while other channels can progress. Run one
+bot process per database; revision checks reject stale writers.
+
+On first access to a channel, v4–v6 `v4_state_<channel>.json` saves (or
+`v4_state.json` for an unnamed channel) import once in a transaction. Originals
+are preserved and never updated; subsequent starts use SQLite. Corrupt or
+unsupported saves produce an explicit error instead of a fresh campaign.
+The health board reads SQLite first and still handles unimported JSON channels.
+
+Back up the live database with SQLite's backup API or the `sqlite3` CLI:
+
+```bash
+sqlite3 data/campaigns.db '.backup /path/to/campaigns-backup.db'
+```
+
+Use that backup for recovery. Copying just the live `.db` file can omit changes
+still in its WAL. Preserved JSON files are pre-migration checkpoints, not live
+backups. The ledger is an audit trail; complete snapshots are required to
+restore gameplay. Existing history is loaded into memory on startup, though
+only new events are written on subsequent saves.
+
+Logs report decision reasons, model latency, commit latency, appended event
+counts, and recall sizes. Offline verification:
+
+```bash
+pip install -r requirements.txt pytest
+python -m pytest tests/ -q
+python core/cli.py selftest
+```
 
 ## License
 

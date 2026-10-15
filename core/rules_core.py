@@ -11,7 +11,6 @@ from engine.charlib import (SKILL_ABILITY, caster_kind, normalize_skill,
                             slots_for)
 from engine.checks import parse_check_ability, total_mod
 from engine.moves import compute_attack_moves, move_spell_level
-from engine.dice import roll_expr
 
 MOVE_SPELL_LEVEL = move_spell_level
 
@@ -224,14 +223,18 @@ def _apply_check_effect(g: Game, actor: str, effect: dict | None,
 
 # ---------- validation ----------
 
-def validate(g: Game, it: Intent) -> str | None:
+def validate(g: Game, it: Intent, *, allow_unplanned_move: bool = False) -> str | None:
     """Return a denial reason, or None if legal."""
     actor = it.actor
     if actor and actor not in g.party:
         return f"沒有角色「{actor}」"
     if actor and not g.alive(actor):
         return f"{actor} 已倒地（HP 0），無法行動"
-    if it.action == "move":
+    if g.combat.active and any(not f.dead and f.hp > 0 for f in g.enemies.values()) \
+            and it.action not in ("pass", "chat") and actor in g.combat.acted:
+        waiting = [n for n in g.party if g.alive(n) and n not in g.combat.acted]
+        return (f"{actor} 本回合已行動" + (f"——等待 {'、'.join(waiting)}" if waiting else ""))
+    if it.action == "move" and not allow_unplanned_move:
         if not g.world.find_exit(it.destination):
             here = g.world.here
             return (f"沒有通往「{it.destination}」的路。"
@@ -301,6 +304,9 @@ def ability_check(g: Game, actor: str, ability: str, dc: int,
                 + f" 檢定 vs DC {dc}（需骰 ≥ {need}）"
                 + ("　🤝有人幫忙：你的骰與系統加骰取高" if helped else "")
                 + f"\n👉 用 `/roll d20` 擲骰（修正值 {mod:+d} 自動套用）")
+        event = g.ledger.add(actor, "check_pending", f"{actor} 正等待檢定擲骰",
+                             ability=ability, skill=skill, dc=dc, scene=g.world.current)
+        g._pending_check["event_id"] = event.event_id
         return None, line
     # v5 seed 3: inspiration also covers engine-rolled checks
     inspired = g.drop_cond(actor, "inspired")
@@ -350,7 +356,7 @@ def resolve_pending_check(g: Game, die: int) -> tuple[bool, str]:
 def _on_foe_death(g: Game, foe, lines: list):
     """Loot into the scene + party XP (v2 mechanics back)."""
     from engine.loot import drop_for, grant_xp
-    drops = drop_for(foe)
+    drops = drop_for(foe, rng=g._random)
     if drops:
         for name, qty in drops:
             g.world.here.ground_items.append((name, qty))
@@ -432,9 +438,9 @@ def _attack(g: Game, actor: str, target: str, move: str = "") -> ResolveResult:
                  crit=crit, target=tname)
     if not hit:
         return ResolveResult(lines)
-    dmg_total, dmg_detail = roll_expr(dmg_expr)
+    dmg_total, dmg_detail = g.roll(dmg_expr)
     if crit:
-        t2, d2 = roll_expr(dmg_expr)
+        t2, d2 = g.roll(dmg_expr)
         dmg_total += t2
         dmg_detail += f"＋{d2}（暴擊骰池×2）"
     lines.append(f"💥 傷害 {dmg_expr}{mv_txt}：{dmg_detail} = **{dmg_total}**")
@@ -481,7 +487,7 @@ def _enemy_turn(g: Game, foe) -> list[str]:
                  + dodge_note)
     g.ledger.add(foe.name, "attack", lines[-1], target=tgt, hit=hit)
     if hit:
-        dmg, det = roll_expr(foe.dmg)
+        dmg, det = g.roll(foe.dmg)
         e = g.party[tgt]
         e["hp_now"] = max(0, int(e["hp_now"]) - dmg)
         lines.append(f"💥 {foe.name} 對 {tgt} 造成 {dmg} 傷害"
@@ -531,7 +537,7 @@ def _throw(g: Game, actor: str, it: Intent, utter: str) -> ResolveResult | None:
                  f"{'✅ 命中' if hit else '❌ 未命中'}"]
         g.ledger.add(actor, "attack", lines[0], target=tname, hit=hit)
         if hit:
-            dmg, det = roll_expr("1d4")
+            dmg, det = g.roll("1d4")
             lines.append(f"💥 傷害 1d4：{det} = **{dmg}**")
             g.ledger.add(actor, "damage", f"{tname} 受到 {dmg} 傷害",
                          target=tname, dmg=dmg)
@@ -753,7 +759,7 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
                 return ResolveResult(
                     [f"🪦 {heal_who} 已經死了——藥水救不回來。"],
                     accepted=False)
-            dmg, det = roll_expr("2d4+2")
+            dmg, det = g.roll("2d4+2")
             e = g.party[heal_who]
             before = int(e["hp_now"])
             e["hp_now"] = min(int(e["hp_max"]), before + dmg)
@@ -864,7 +870,7 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
                 lines.append(f"🌙 {name}：HP {e['hp_now']}/{e['hp_max']}，"
                              "法術格全滿")
             elif g.alive(name):
-                dmg, _ = roll_expr("1d8+2")
+                dmg, _ = g.roll("1d8+2")
                 e["hp_now"] = min(int(e["hp_max"]), int(e["hp_now"]) + dmg)
                 line = f"🌿 {name}：HP → {e['hp_now']}/{e['hp_max']}"
                 # pact magic (Warlock): ALL slots return on a SHORT rest

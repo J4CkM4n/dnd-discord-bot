@@ -1,11 +1,13 @@
-"""v4 service: digestor → engine → narrator, with full state persistence.
+"""Per-channel orchestration: authorize → JEV → engine → commit → narrate.
 
-Hosted inside the dm-bot process (one Discord token = one gateway); the
-V4_CHANNEL_ID env routes a dedicated playground channel to this flow
-while every other channel keeps the v3 DM.
+Commands are serialized and staged. SQLite commits publish game state before
+Discord callbacks or narration; narration failures leave a durable continuation.
 """
 
+import asyncio
 import json
+from copy import copy, deepcopy
+from functools import wraps
 import logging
 import os
 import re
@@ -63,19 +65,51 @@ def world_block(rules: dict) -> str:
 
 from .cli import META, build_demo_game
 from .digestor import Digestor
-from .director import canonize_scene, classify
+from .director import (canonize_scene, DirectorProposal, DirectorDecision,
+                       verify_proposal, scan_prop, MAX_DIRECTOR_SCENES)
 from .director_llm import DirectorLLM
 from .intent import Intent
-from .ledger import Ledger, Entry
 from .narrator import Narrator
 from .plot import load_plot, new_state, tick as plot_tick
-from .rules_core import resolve
+from .rules_core import resolve, validate
 from .turn import Game
-from .world import Enemy, Scene, World
+from .state import encode_game, decode_game, clone_game
+from .persistence import CampaignRepository, StorageError
+from .memory import build_memory
 
 # a narration that ends WITHOUT one of these was cut mid-sentence
 # (max_tokens cutoff / stream drop) -> /continue must finish it
 _END_PUNCT = "。．.!！?？…」』）)\"'"
+
+
+def serialized(result="turn"):
+    """A command owns a private stage; only successful commits publish it."""
+    def decorate(fn):
+        @wraps(fn)
+        async def call(self, *args, **kwargs):
+            async with self._lock:
+                stage = copy(self)
+                stage._owner = self
+                stage.game = clone_game(self.game)
+                stage.plot_state = deepcopy(self.plot_state)
+                stage.pending = deepcopy(self.pending)
+                stage._unfinished = deepcopy(self._unfinished)
+                stage._recent_narrations = self._recent_narrations.copy()
+                stage._decisions = []
+                stage._committed = False
+                try:
+                    return await fn(stage, *args, **kwargs)
+                except StorageError:
+                    log.exception("campaign save failed | channel=%s", self.channel_id)
+                    msg = ("⚠️ 行動已儲存；敘事尚未儲存，請用 `/continue`。"
+                           if stage._committed else "⚠️ 未能儲存，行動未執行；請稍後重試。")
+                    if result == "text":
+                        return msg
+                    if result == "continue":
+                        return True, msg
+                    return [msg], ""
+        return call
+    return decorate
 
 
 class V4Service:
@@ -84,316 +118,503 @@ class V4Service:
                  narr_model: str = "qwen3.5:35b",
                  channel_id: str = "",
                  narr_think: bool | None = False,
-                 digest_think: bool | None = None):
-        # per-channel state: each Discord table gets its own game
+                 digest_think: bool | None = None,
+                 director_evaluate: bool = False):
         fname = f"v4_state_{channel_id}.json" if channel_id else "v4_state.json"
-        self.path = os.path.join(data_dir, fname)
+        self.path = os.path.join(data_dir, fname)  # read-only legacy import source
         self.channel_id = channel_id
+        self._lock = asyncio.Lock()
+        self.repository = CampaignRepository(os.path.join(data_dir, "campaigns.db"))
+        self._revision = self._saved_count = 0
+        self._decisions = []
         self.digestor = Digestor(llm_url, digest_model, think=digest_think)
         self.narrator = Narrator(llm_url, narr_model, think=narr_think)
-        # the generative Director (same small fast model as digestor)
-        self.director = DirectorLLM(llm_url, digest_model)
-        # narration that never finished (narrator silent, or prose cut
-        # mid-sentence): /continue resumes it before anything else.
-        # (init BEFORE _load — the saved blob may restore it)
+        self.director = DirectorLLM(llm_url, digest_model, think=digest_think)
+        self.director_evaluate = director_evaluate
         self._unfinished = None
-        # game rules — per-channel override (data/gamerules_<cid>.json)
-        # over the repo-root default; world tone + canon for the narrator
+        self.pending = None
+        self.pending_user_id = ""
+        self.pending_admin = False
+        self._recent_narrations = []
         self.rules = load_gamerules(channel_id, data_dir)
-        # plot spine (plot.json) — clocks + trigger-fired beats
         self.plot = load_plot()
-        self.game: Game = self._load() or build_demo_game()
-        self.plot_state = self._plot_state()
-        self.pending = None  # Intent awaiting the player's /confirm
-        self._recent_narrations: list[str] = []  # v3: repetition guard
+        self.plot_state = new_state(self.plot)
+        self.game = self._load() or build_demo_game()
+        if self._revision == 0:
+            self._save()
 
     # ---------- persistence ----------
 
-    def _save(self) -> None:
-        g = self.game
-        blob = {
-            "v": 6,   # state schema version (tolerant loader)
-            "party": g.party,
-            "world": {
-                "scenes": {sid: {
-                    "name": s.name, "description": s.description,
-                    "exits": s.exits, "npcs": s.npcs,
-                    "ground_items": [list(x) for x in s.ground_items],
-                    "search_dc": s.search_dc,
-                    "hidden_items": [list(x) for x in s.hidden_items],
-                    "fire": s.fire}
-                    for sid, s in g.world.scenes.items()},
-                "current": g.world.current},
-            "encounters": {sid: [asdict(f) for f in foes]
-                           for sid, foes in g.encounters.items()},
-            "enemies": {n: asdict(f) for n, f in g.enemies.items()},
-            "combat": {"order": g.combat.order, "idx": g.combat.idx,
-                       "round": g.combat.round, "acted": g.combat.acted},
-            "inventory": g.inventory,
-            "turn": g.ledger.turn,
-            "entries": [asdict(e) for e in g.ledger.entries],
-            "unfinished": self._unfinished,
-            "plot": self.plot_state,
-        }
-        with open(self.path, "w", encoding="utf-8") as f:
-            json.dump(blob, f, ensure_ascii=False, indent=1)
+    def _snapshot(self) -> dict:
+        blob = encode_game(self.game)
+        blob.update(plot=self.plot_state,
+                    pending=asdict(self.pending) if self.pending else None,
+                    pending_user_id=self.pending_user_id,
+                    pending_admin=self.pending_admin)
+        return blob
 
-    def _load(self) -> Game | None:
-        if not os.path.exists(self.path):
+    def _save(self, *, narration_only: bool = False, imported_from=None) -> None:
+        # Historical entries are immutable; stamp only the newly staged events.
+        for e in self.game.ledger.entries[self._saved_count:]:
+            e.data.setdefault("scene", self.game.world.current)
+            if e.kind in ("materialize", "director_scene"):
+                e.data.setdefault("visibility", "private")
+        # Prepare publication before committing, so a failed write never leaks
+        # staged state through public .game, pending, or continuation properties.
+        published_game = clone_game(self.game)
+        published_plot = deepcopy(self.plot_state)
+        published_pending = deepcopy(self.pending)
+        published_unfinished = deepcopy(self._unfinished)
+        revision = self.repository.commit(
+            self.channel_id, self._revision,
+            None if narration_only else self._snapshot(),
+            [asdict(e) for e in self.game.ledger.entries[self._saved_count:]],
+            self._unfinished, self._decisions, imported_from=imported_from)
+        self._revision = revision
+        self._saved_count = len(self.game.ledger.entries)
+        self._decisions = []
+        self._committed = True
+        owner = getattr(self, "_owner", self)
+        owner.game = published_game
+        owner.plot_state = published_plot
+        owner.pending = published_pending
+        owner.pending_user_id = self.pending_user_id
+        owner.pending_admin = self.pending_admin
+        owner._unfinished = published_unfinished
+        owner._revision = revision
+        owner._saved_count = self._saved_count
+        owner._recent_narrations = self._recent_narrations.copy()
+
+    def _load(self):
+        record = self.repository.load(self.channel_id)
+        importing = record is None and os.path.exists(self.path)
+        if record is None and not importing:
             return None
-        with open(self.path, encoding="utf-8") as f:
-            blob = json.load(f)
-        world = World()
-        for sid, s in blob["world"]["scenes"].items():
-            world.scenes[sid] = Scene(
-                sid, s["name"], s["description"], exits=s["exits"],
-                npcs=s.get("npcs", []),
-                ground_items=[tuple(x) for x in s.get("ground_items", [])],
-                search_dc=s.get("search_dc", 12),
-                hidden_items=[tuple(x) for x in s.get("hidden_items", [])],
-                fire=s.get("fire", False))
-        world.current = blob["world"]["current"]
-        g = Game(blob["party"], world)
-        for sid, foes in blob.get("encounters", {}).items():
-            g.encounters[sid] = [Enemy(**f) for f in foes]
-        for n, f in blob.get("enemies", {}).items():
-            g.enemies[n] = Enemy(**f)
-        c = blob.get("combat") or {}
-        g.combat.order = c.get("order", [])
-        g.combat.idx = c.get("idx", 0)
-        g.combat.round = c.get("round", 1)
-        g.combat.acted = c.get("acted", [])
-        g.inventory = blob.get("inventory") or {n: [] for n in g.party}
-        g.ledger.turn = blob.get("turn", 0)
-        for e in blob.get("entries", []):
-            g.ledger.entries.append(Entry(**e))
-        self._unfinished = blob.get("unfinished")
-        self._loaded_plot = blob.get("plot")
-        return g
-
-    def _plot_state(self) -> dict:
-        st = getattr(self, "_loaded_plot", None)
-        if isinstance(st, dict) and "clocks" in st and "fired" in st:
-            return st
-        return new_state(self.plot)
-
-    # ---------- admin helpers ----------
-
-    def admin_give(self, char: str, item: str, qty: int = 1) -> str:
-        """Admin grants items directly (ledgered). Returns the render."""
-        g = self.game
-        if char not in g.party:
-            return f"❓ 沒有角色「{char}」"
-        g.give_item(char, item, max(1, int(qty or 1)))
-        g.ledger.add("admin", "item", f"管理員給了 {char} {item}×{qty}")
-        self._save()
-        inv = "、".join(f"{n}×{q}" for n, q in g.inventory.get(char, []))
-        return f"🎒 {char} 現在攜帶：{inv or '（空）'}"
-
-    def table_talk(self, text: str, author: str = "") -> None:
-        """Plain channel chatter: ignore completely. No ledger, no save."""
-        pass
+        try:
+            if importing:
+                with open(self.path, encoding="utf-8") as f:
+                    blob = json.load(f)
+                entries = blob.get("entries", [])
+                unfinished = blob.get("unfinished")
+            else:
+                blob, entries = record["snapshot"], record["entries"]
+                unfinished = record["unfinished"]
+            g = decode_game(blob, entries)
+            self.plot_state = blob.get("plot") or new_state(self.plot)
+            self.pending = Intent(**blob["pending"]) if blob.get("pending") else None
+            self.pending_user_id = str(blob.get("pending_user_id", ""))
+            self.pending_admin = bool(blob.get("pending_admin", False))
+            if unfinished and "idx0" in unfinished:
+                unfinished = dict(unfinished)
+                idx = unfinished.pop("idx0")
+                if not 0 <= idx < len(g.ledger.entries):
+                    unfinished = None
+                else:
+                    unfinished["start_event_id"] = g.ledger.entries[idx].event_id
+                    unfinished["end_event_id"] = g.ledger.entries[-1].event_id
+            self._unfinished = unfinished
+            self._recent_narrations = [e.text for e in g.ledger.entries
+                                       if e.kind == "narration"][-5:]
+            if importing:
+                self.game = g
+                self._save(imported_from=self.path)
+                log.info("imported JSON campaign | channel=%s source=%s", self.channel_id, self.path)
+            else:
+                self._revision = record["revision"]
+                self._saved_count = len(entries)
+            return g
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            raise StorageError(f"Invalid campaign save for {self.channel_id!r}: {exc}") from exc
 
     # ---------- one turn ----------
 
-    async def handle(self, text: str, author: str = "",
-                     user_id: str = "",
-                     structured: bool = False,
-                     on_delta=None,
-                     on_resolved=None,
+    def table_talk(self, text: str, author: str = "") -> None:
+        """Plain channel chatter is not campaign memory."""
+
+    @serialized()
+    async def handle(self, text: str, author: str = "", user_id: str = "",
+                     structured: bool = False, on_delta=None, on_resolved=None,
                      admin_actor: str = "") -> tuple[list, str]:
-        """Free-form text in → (engine lines, narration). Never raises.
-        user_id: Discord uid — the engine enforces that only the character's
-        owner can act as that character.
-        structured: True = the text came from /combat (dropdown selections
-        are already unambiguous) — skip the digestor entirely, construct
-        the Intent deterministically, confidence=1.0, no confirmation.
-        admin_actor: admin commands act as ANY character — overrides the
-        parsed actor and skips the ownership check.
-        on_resolved: async callback(lines) fired the moment the engine
-        verdict exists — BEFORE narration starts, so the adapter can post
-        the verdict instantly and stream the prose into its own message
-        (v3 word-by-word UX)."""
         g = self.game
         t = (text or "").strip()
         if not t:
             return [], ""
-        if t in META:  # deterministic queries skip the LLM entirely
+        if t in META:
             return META[t](g), ""
         if admin_actor and admin_actor not in g.party:
-            return ([f"❓ 沒有角色「{admin_actor}」"], "")
-        it = None
-        if self.pending is not None:
-            low = t.lower().strip(" ！!。.")
-            if low in ("確認", "确认", "confirm", "對", "对", "yes", "y",
-                       "好", "ok"):
-                it = self.pending
-                it.args["confirmed"] = True
-            self.pending = None  # anything else = changed their mind
-        # scrub input BEFORE the digestor sees it (fix: was after)
+            return [f"❓ 沒有角色「{admin_actor}」"], ""
+        if t.lower().strip(" ！!。.") in ("確認", "确认", "confirm", "對", "对", "yes", "y", "好", "ok"):
+            return await self._confirm(user_id, on_delta, on_resolved, bool(admin_actor))
         from .guards import scrub_input
-        clean_t, was_scrubbed = scrub_input(t)
+        from .intent import parse_command
+        t, was_scrubbed = scrub_input(t)
         if was_scrubbed:
-            g.ledger.add(author or "?", "deny",
-                         "已過濾可疑指令文字", reason="injection")
-        t = clean_t
-        if t.startswith(("((", "//")):  # explicit out-of-character
-            from .intent import Intent
+            g.ledger.add(author or "?", "deny", "已過濾可疑指令文字", reason="injection")
+        if t.startswith(("((", "//")):
             it = Intent(action="chat", utterance=t.lstrip("(/ "), raw=t)
-        elif structured:
-            # /combat selections: deterministic parse, confidence=1.0
-            from .intent import parse_command
-            it = parse_command(t, party_names=list(g.party))
-            if it is not None:
-                it.confidence = 1.0
-            else:
-                it = await self.digestor.digest(
-                    t, list(g.party), g.world.here.name,
-                    list(g.world.here.exits.values()),
-                    known_targets=list(g.enemies) +
-                    [n["name"] for n in g.world.here.npcs] + list(g.party))
-                it.confidence = 1.0  # structured origin — trust it
         else:
-            it = await self.digestor.digest(
-                    t, list(g.party), g.world.here.name,
-                    list(g.world.here.exits.values()),
-                    known_targets=list(g.enemies) +
-                    [n["name"] for n in g.world.here.npcs] + list(g.party))
-        # digestor safety nets (live-game lessons):
-        # 1. talk with no words — the digestor found the NPC but dropped
-        #    WHAT was asked; keep the player's own words (the narrator
-        #    answers them and the ledger fact stays meaningful)
-        if it is not None and it.action == "talk" and not it.utterance:
+            it = parse_command(t, party_names=list(g.party)) if structured else None
+            if it is None:
+                it = await self.digestor.digest(
+                    t, list(g.party), g.world.here.name, list(g.world.here.exits.values()),
+                    known_targets=list(g.enemies) + [n["name"] for n in g.world.here.npcs] + list(g.party))
+            if structured and it is not None:
+                it.confidence = 1.0
+        if it is None:
+            return ["❓ 未能理解行動，請再描述一次。"], ""
+        if it.action == "talk" and not it.utterance:
             it.utterance = (it.raw or "")[:120]
-        # 2. a move to nowhere（「下一步去哪？」misread as move）is a help
-        #    question, not an illegal move — re-route to meta so the
-        #    engine answers with exits + suggestions instead of denying
-        if it is not None and it.action == "move" and not it.destination:
+        if it.action == "move" and not it.destination:
             it.action = "meta"
-        # 3. rest kind: the LLM path doesn't emit args — sniff the kind
-        #    from the player's words（長休/long rest）so a long rest is
-        #    never silently downgraded to a short one
-        if it is not None and it.action == "rest" \
-                and not it.args.get("kind"):
+        if it.action == "rest" and not it.args.get("kind"):
             raw = f"{it.raw or ''} {it.utterance or ''}"
-            it.args["kind"] = "long" if re.search(
-                r"長休|长休|long\s*rest|全休|過夜|过夜", raw, re.I) \
-                else "short"
-        # 4. 「使用 醫藥／醫術」 is a SKILL attempt, not an item use —
-        #    the 使用 verb pulls the digestor toward `use`; when the
-        #    "item" names a skill, reroute deterministically
-        if it is not None and it.action == "use":
+            it.args["kind"] = "long" if re.search(r"長休|长休|long\s*rest|全休|過夜|过夜", raw, re.I) else "short"
+        if it.action == "use":
             from engine.charlib import normalize_skill
-            _ab, _sk = normalize_skill(it.item or "")
-            if _sk:
-                it.action = "skill"
-                it.skill = _sk
+            _ab, skill = normalize_skill(it.item or "")
+            if skill:
+                it.action, it.skill = "skill", skill
                 it.target = it.target or it.args.pop("to", "")
-        # 5. UNPLANNED PLACES (v5 Director): walking somewhere that
-        #    isn't an exit asks the Director LLM to propose the scene —
-        #    the ENGINE gate canonizes it (typed, capped, exits back).
-        #    This is why a non-narrative LLM layer exists.
-        if it is not None and it.action == "move" and it.destination \
-                and not g.world.find_exit(it.destination):
-            tone = (self.rules or {}).get("tone", "奇幻")
-            canon = ((self.rules or {}).get("world") or {}).get("canon", [])
-            proposed = await self.director.gen_scene(
-                tone, g.world.here.name, g.world.here.description,
-                it.destination, gamerules_canon=canon)
-            if proposed and canonize_scene(g, proposed):
-                # point the move at the canonized name so find_exit hits
-                it.destination = proposed["name"]
-        # 6. UNPLANNED DISCOVERY: a search with nothing authored and no
-        #    named target may surface an LLM-proposed inert prop instead
-        #    of the static ambient table
-        if it is not None and it.action == "search" \
-                and not g.world.here.hidden_items:
-            from .director import scan_prop
-            text_blob = f"{it.raw or ''} {it.utterance or ''} {it.item or ''}"
-            if not scan_prop(text_blob) and g._random.random() < 0.35:
-                tone = (self.rules or {}).get("tone", "奇幻")
-                proposal = await self.director.gen_item(
-                    tone, g.world.here.name, g.world.here.description,
-                    it.utterance or it.raw or "搜索")
-                s = g.world.here
-                dup = any(proposal and (proposal["name"] in n
-                                        or n in proposal["name"])
-                          for n, _ in s.ground_items + s.hidden_items)
-                if proposal and not dup \
-                        and classify(proposal["name"]) == "prop":
-                    s.hidden_items.append((proposal["name"], 1))
-                    g.ledger.add("director", "materialize",
-                                 f"搜索途中世界浮現了 {proposal['name']}",
-                                 item=proposal["name"],
-                                 scene=g.world.current)
-        # admin commands act as a chosen character: force the actor and
-        # skip the ownership gate entirely (validity checked up top)
-        if admin_actor and it is not None:
+        return await self._execute(it, user_id, admin_actor, text, on_delta, on_resolved)
+
+    def _authorize(self, it, user_id, admin_actor=""):
+        g = self.game
+        if admin_actor:
             it.actor = admin_actor
-        # ownership: only the character's owner may act as that character
-        if user_id and not admin_actor and it:
-            # no actor specified → default to the CALLER's character
+        elif user_id and not it.actor:
+            it.actor = next((n for n, e in g.party.items()
+                             if str(e.get("owner_id", "")) == str(user_id)), "")
             if not it.actor:
-                it.actor = next(
-                    (n for n, v in g.party.items()
-                     if str(v.get("owner_id", "")) == str(user_id)),
-                    next(iter(g.party), None))
-                if it.actor is None:
-                    return (["❓ 還沒有角色——先用 `/pc name:名字 "
-                             "occupation:職業` 建立角色。"], "")
-            if it.actor and it.actor in g.party:
-                oid = str(g.party[it.actor].get("owner_id", ""))
-                if oid and oid != str(user_id):
-                    g.ledger.add(it.actor, "deny",
-                                 f"拒絕：{it.actor} 屬於其他玩家",
-                                 reason="ownership")
-                    return ([f"🚫 {it.actor} 屬於其他玩家——"
-                             "你不能控制這個角色。"], "")
-        idx0 = len(g.ledger.entries)  # this turn's slice of the ledger
+                return "找不到你的角色——先用 `/pc` 建立。"
+        if not it.actor:
+            it.actor = next((n for n in g.party if g.alive(n)), next(iter(g.party), ""))
+        if not it.actor or it.actor not in g.party:
+            return "沒有可用的角色——先用 `/pc` 建立。"
+        owner = str(g.party[it.actor].get("owner_id", ""))
+        if user_id and not admin_actor and owner != str(user_id):
+            return f"{it.actor} 屬於其他玩家——你不能控制這個角色。"
+        return None
+
+    def _deny(self, actor, reason):
+        self.game.ledger.add(actor or "?", "deny", f"拒絕：{reason}", reason=reason)
+        self._save()
+        return [f"🚫 {reason}"], ""
+
+    @serialized()
+    async def confirm(self, user_id: str = "", on_delta=None, on_resolved=None,
+                      admin: bool = False):
+        return await self._confirm(user_id, on_delta, on_resolved, admin)
+
+    async def _confirm(self, user_id, on_delta, on_resolved, admin=False):
+        if self.pending is None:
+            return ["（沒有待確認的行動）"], ""
+        if self.pending_user_id != str(user_id) or (self.pending_admin and not admin):
+            return self._deny("?", "只有提出行動的玩家可以確認。")
+        it = deepcopy(self.pending)
+        admin_actor = it.actor if self.pending_admin else ""
+        it.args["confirmed"] = True
+        return await self._execute(it, user_id, admin_actor, it.raw, on_delta, on_resolved)
+
+    async def _execute(self, it, user_id, admin_actor, text, on_delta, on_resolved):
+        g = self.game
+        reason = self._authorize(it, user_id, admin_actor)
+        if reason:
+            return self._deny(it.actor, reason)
+        if self.pending and self.pending_user_id != str(user_id):
+            return self._deny(it.actor, "請先等提出行動的玩家確認待決行動。")
+        # A new action by the same player cancels their prior confirmation.
+        self.pending = None
+        self.pending_user_id = ""
+        self.pending_admin = False
+        if getattr(g, "_pending_check", None) and it.action not in ("help", "meta", "chat"):
+            return self._deny(it.actor, "尚有待定檢定，請由該角色的玩家用 `/roll d20` 結算。")
+        reason = validate(g, it, allow_unplanned_move=True)
+        if reason and it.action in ("move", "search"):
+            return self._deny(it.actor, reason)
+        if it.action in ("attack", "move", "search") and it.confidence < 0.7 \
+                and not it.args.get("confirmed"):
+            self.pending = deepcopy(it)
+            self.pending_user_id = str(user_id)
+            self.pending_admin = bool(admin_actor)
+            g.ledger.add(it.actor, "confirm", "等待玩家確認行動")
+            self._save()
+            return [f"❓ 我理解你要：{it.actor} {it.action} {it.target or it.destination or it.item}——用 `/confirm` 執行。"], ""
+        baseline = clone_game(g)
+        idx0 = len(g.ledger.entries)
+        if not reason:
+            await self._direct(it)
         r = resolve(g, it)
-        if r.confirm is not None:
-            self.pending = r.confirm
-        # v5 Pillar B: clocks tick, triggers fire — beats become part of
-        # THIS turn's verdict and narration (the plot comes to them)
-        if self.plot:
-            beat_lines, _m = plot_tick(g, self.plot, self.plot_state)
-            if beat_lines:
-                r.lines += beat_lines
-        # v6 0c (narration-first): the machine block (scene/HP/suggestions)
-        # only joins turns where the SITUATION changed — routine turns end
-        # on prose alone. The story is the body; the engine is punctuation.
+        if not r.accepted or r.confirm is not None:
+            # No partially resolved mechanics or generated props may survive a denial.
+            rejected = [e for e in g.ledger.entries[idx0:] if e.kind == "deny"]
+            self.game = g = baseline
+            for e in rejected:
+                g.ledger.add(e.actor, e.kind, e.text, **e.data)
+            for decision in self._decisions:
+                if decision["accepted"]:
+                    decision["accepted"] = False
+                    decision["reasons"].append("action_rejected")
+            if r.confirm is not None:
+                self.pending = r.confirm
+                self.pending_user_id = str(user_id)
+                self.pending_admin = bool(admin_actor)
+        if r.accepted and r.confirm is None and g.ledger.turn > baseline.ledger.turn and self.plot:
+            beat_lines, _ = plot_tick(g, self.plot, self.plot_state)
+            r.lines += beat_lines
+        pend = getattr(g, "_pending_check", None)
+        if pend is not None and "user_id" not in pend:
+            pend["user_id"] = str(g.party[pend["actor"]].get("owner_id", "")) or str(user_id)
+            pend["scene"] = g.world.current
+            pend.setdefault("event_id", g.ledger.entries[-1].event_id)
+        # Director facts belong to the same turn as the action they support.
+        for e in g.ledger.entries[idx0:]:
+            e.turn = g.ledger.turn
         if r.accepted and r.lines and self._context_noteworthy(idx0):
             from .templates import render_turn_context
-            context = render_turn_context(g, it.actor or "")
-            r.lines.append("")
-            r.lines.append(context)
-        # engine verdict first: hand it to the adapter the moment it exists
-        # so the words-by-words narration can stream into its own message
-        if on_resolved and r.lines:
-            await on_resolved(r.lines)
-        narration = ""
+            r.lines += ["", render_turn_context(g, it.actor)]
+        rotation_only = any(e.kind == "deny" and ("輪到" in str(e.data.get("reason", ""))
+                            or "已行動" in str(e.data.get("reason", ""))) for e in g.ledger.entries[idx0:])
+        player_input = it.raw or it.utterance or text[:120]
+        narrate = bool(r.lines and self.pending is None and not rotation_only
+                       and len(g.ledger.entries) > idx0)
         if r.lines:
-            self._unfinished = None  # new output supersedes the old;
-            # _narrate below re-marks it if THIS turn's prose fails
-        # v5 0b: denials get narrated too — the narrator's 吐槽 answers
-        # the player instead of a dead-end 🚫. Rotation denials
-        # （現在輪到 X）stay engine-only: turn order is meta, prose
-        # there is noise.
-        rotation_only = any(
-            e.kind == "deny" and ("輪到" in str(e.data.get("reason", ""))
-                             or "已行動" in str(e.data.get("reason", "")))
-            for e in g.ledger.entries[idx0:])
-        if r.lines and self.pending is None and not rotation_only:
-            # v3 lesson: the narrator must answer the player's own words,
-            # especially when the engine denied something
-            player_input = it.raw or it.utterance or ""
-            if not player_input:
-                player_input = text[:120]
-            narration = await self._narrate(
-                idx0, player_input, on_delta,
-                wants_help=bool(getattr(it, "wants_help", False)))
+            self._unfinished = self._narration_job(idx0, player_input, it.wants_help) if narrate else None
         self._save()
-        return r.lines, narration
+        return await self._deliver(r.lines, idx0, player_input, on_delta, on_resolved,
+                                   narrate=narrate, wants_help=it.wants_help)
+
+    async def _direct(self, it):
+        g, s = self.game, self.game.world.here
+        kind = ""
+        if it.action == "move" and not g.world.find_exit(it.destination):
+            if g.director_scene_count >= MAX_DIRECTOR_SCENES:
+                self._decisions.append(asdict(DirectorDecision("scene", s.id, reasons=["scene_limit"])))
+                return
+            kind = "scene"
+        elif it.action == "search" and not s.hidden_items:
+            if not scan_prop(f"{it.raw} {it.utterance} {it.item}") and g._random.random() < 0.35:
+                kind = "item"
+        if not kind:
+            return
+        memory = build_memory(g, it.raw or it.utterance, audience="director",
+                              plot_state=self.plot_state).render()
+        tone = self.rules.get("tone", "奇幻")
+        decision = DirectorDecision(kind, s.id)
+        try:
+            if kind == "scene":
+                content = await self.director.gen_scene(tone, s.name, s.description, it.destination,
+                    gamerules_canon=(self.rules.get("world") or {}).get("canon", []), memory=memory)
+            else:
+                content = await self.director.gen_item(tone, s.name, s.description,
+                                                       it.utterance or it.raw or "搜索", memory=memory)
+            decision.proposal = content
+            proposal = DirectorProposal(kind, s.id, content)
+            reason = verify_proposal(g, proposal)
+            if reason:
+                decision.reasons.append(reason)
+            else:
+                approved = True
+                if self.director_evaluate:
+                    approved, explanation = await self.director.evaluate(
+                        asdict(proposal), world_block(self.rules) + "\n" + memory,
+                        it.raw or it.destination or it.utterance)
+                    decision.evaluation = "approved" if approved else "rejected"
+                    decision.reasons.append(explanation)
+                reason = verify_proposal(g, proposal) or validate(g, it, allow_unplanned_move=True)
+                if reason:
+                    decision.reasons.append(reason)
+                elif approved:
+                    if kind == "scene":
+                        decision.accepted = canonize_scene(g, content)
+                        if decision.accepted:
+                            # Select the exact generated ID; a short generated
+                            # name may also fuzzy-match an older exit's label.
+                            it.destination = next(sid for sid, scene in g.world.scenes.items()
+                                                  if scene.name == content["name"].strip())
+                    else:
+                        name = content["name"].strip()
+                        s.hidden_items.append((name, 1))
+                        g.ledger.add("director", "materialize", f"搜索途中世界浮現了 {name}",
+                                     item=name, scene=s.id, visibility="private")
+                        decision.accepted = True
+        except Exception as exc:
+            log.warning("director unavailable: %s", exc)
+            decision.reasons.append("model_unavailable")
+        self._decisions.append(asdict(decision))
+        log.info("director decision | kind=%s accepted=%s evaluation=%s reasons=%s",
+                 kind, decision.accepted, decision.evaluation, decision.reasons)
+
+    def _narration_job(self, idx0, player_input, wants_help=False):
+        entries = self.game.ledger.entries
+        npc_name = next((e.data["npc"] for e in entries[idx0:]
+                         if e.kind in ("talk", "insight", "reveal") and e.data.get("npc")), "")
+        return {"text": "", "start_event_id": entries[idx0].event_id,
+                "end_event_id": entries[-1].event_id, "player_input": player_input,
+                "wants_help": wants_help, "npc_name": npc_name}
+
+    async def _deliver(self, lines, idx0, player_input, on_delta, on_resolved,
+                       *, narrate=True, wants_help=False):
+        # This method is only called AFTER the engine transaction commits.
+        try:
+            if on_resolved and lines:
+                await on_resolved(lines)
+        except Exception:
+            log.exception("verdict delivery failed; campaign is committed")
+            return lines, ""
+        narration = ""
+        if narrate:
+            try:
+                narration = await self._narrate(idx0, player_input, on_delta, wants_help=wants_help)
+            except Exception:
+                log.exception("narrator failed; committed narration remains resumable")
+                return lines, ""
+            self._save(narration_only=True)
+        return lines, narration
+
+    # ---------- non-turn mutations: same lock and transaction boundary ----------
+
+    @serialized("text")
+    async def create_character(self, name: str, occupation: str, user_id: str, owner: str) -> str:
+        g = self.game
+        uid, uname = str(user_id), owner
+        if not name.strip() or len(name) > 80:
+            return "❓ 請使用 1 至 80 字的角色名。"
+        if name in g.party:
+            return f"❓ 「{name}」已存在（擁有者：{g.party[name].get('owner', '?')}）"
+        occ = occupation or "Fighter"
+        # fair stats: server-side 4d6kh3 ×6, assigned by class priority
+        from engine.charlib import default_ac, slots_for
+        PRIORITIES = {
+            "Barbarian": ["STR", "CON", "DEX", "WIS", "CHA", "INT"],
+            "Bard": ["CHA", "DEX", "CON", "WIS", "INT", "STR"],
+            "Cleric": ["WIS", "CON", "STR", "CHA", "DEX", "INT"],
+            "Druid": ["WIS", "CON", "DEX", "INT", "CHA", "STR"],
+            "Fighter": ["STR", "CON", "DEX", "WIS", "CHA", "INT"],
+            "Monk": ["DEX", "WIS", "CON", "STR", "CHA", "INT"],
+            "Paladin": ["STR", "CHA", "CON", "WIS", "DEX", "INT"],
+            "Ranger": ["DEX", "WIS", "CON", "STR", "INT", "CHA"],
+            "Rogue": ["DEX", "INT", "CON", "WIS", "CHA", "STR"],
+            "Sorcerer": ["CHA", "CON", "DEX", "WIS", "INT", "STR"],
+            "Warlock": ["CHA", "CON", "DEX", "WIS", "INT", "STR"],
+            "Wizard": ["INT", "CON", "DEX", "WIS", "CHA", "STR"],
+        }
+        prio = PRIORITIES.get(occ, ["STR", "DEX", "CON", "INT", "WIS", "CHA"])
+        rolls = sorted((g.roll("4d6kh3")[0] for _ in range(6)),
+                       reverse=True)
+        stats = dict(zip(prio, rolls))
+        # HP = hit die + CON mod
+        HIT_DICE = {"Barbarian": 12, "Fighter": 10, "Paladin": 10,
+                    "Ranger": 10, "Bard": 8, "Cleric": 8, "Druid": 8,
+                    "Monk": 8, "Rogue": 8, "Warlock": 8,
+                    "Sorcerer": 6, "Wizard": 6}
+        die = HIT_DICE.get(occ, 8)
+        con_mod = (stats["CON"] - 10) // 2
+        hp = die + con_mod
+        ac = default_ac(occ, stats)
+        slots = {str(k): v for k, v in slots_for(occ, 1).items()}
+
+        g.party[name] = {
+            "occupation": occ, "stats": stats,
+            "hp_now": hp, "hp_max": hp, "level": 1, "xp": 0,
+            "owner": uname, "owner_id": uid,
+            "ac": ac, "slots": slots, "hd_used": 0,
+        }
+        g.inventory.setdefault(name, [])
+        g.ledger.add(name, "meta",
+                     f"{uname} 建立了角色 {name}（{occ}）")
+        self._save()
+
+        stat_txt = " ".join(f"{k} {stats[k]}"
+                            for k in ["STR", "DEX", "CON", "INT", "WIS", "CHA"])
+        slot_txt = (" · 法術格 " + " ".join(f"L{k}×{v}"
+                    for k, v in slots.items())) if slots else ""
+        return (
+            f"🧙 **{name}** — {occ} Lv1 "
+            f"(玩家：{uname})\n"
+            f"🛡 AC {ac} · ❤️ {hp}/{hp}{slot_txt}\n"
+            f"📊 {stat_txt}\n"
+            f"🎲 屬性由系統擲骰（4d6 取高 3）")
+
+    @serialized("text")
+    async def remove_character(self, name: str, user_id: str, confirmation: str) -> str:
+        g = self.game
+        entry = g.party.get(name)
+        if not entry:
+            return f"❓ 沒有角色「{name}」"
+        if str(entry.get("owner_id", "")) != str(user_id):
+            return f"🚫 只有 {entry.get('owner', '?')} 可以刪除 {name}。"
+        if confirmation.strip().lower() != "remove confirm":
+            return f"⚠️ 確認刪除 {name}？填 `remove confirm`"
+        g.party.pop(name)
+        g.inventory.pop(name, None)
+        g.combat.order = [c for c in g.combat.order if c["name"] != name]
+        g.combat.acted = [n for n in g.combat.acted if n != name]
+        g.combat.idx = g.combat.idx % len(g.combat.order) if g.combat.order else 0
+        for attr in ("_aid", "_dodge", "_stealth", "_help_check"):
+            getattr(g, attr, {}).pop(name, None)
+        if (getattr(g, "_pending_check", None) or {}).get("actor") == name:
+            g._pending_check = None
+        if self.pending and self.pending.actor == name:
+            self.pending, self.pending_user_id, self.pending_admin = None, "", False
+        # Placeholder name mappings change when the party changes.
+        self._unfinished = None
+        g.ledger.add(name, "meta", f"刪除了角色 {name}")
+        self._save()
+        return f"🗑️ 已刪除 {name}。"
+
+    @serialized("text")
+    async def transfer_item(self, user_id: str, item: str, to: str = "") -> str:
+        g = self.game
+        giver = next((n for n, e in g.party.items() if str(e.get("owner_id", "")) == str(user_id)), "")
+        if not giver:
+            return "❓ 找不到你的角色。"
+        if to and to not in g.party:
+            return f"❓ 沒有角色「{to}」"
+        if not g.take_item(giver, item):
+            return f"🚫 {giver} 沒有「{item}」"
+        if to:
+            g.give_item(to, item)
+            text = f"🎒 {giver} → {to}：{item}×1"
+        else:
+            g.world.here.ground_items.append((item, 1))
+            text = f"🎒 {giver} 把 {item} 放在地上（{g.world.here.name}）——之後可以拾回"
+        g.ledger.add(giver, "item", text, item=item, target=to, scene=g.world.current)
+        self._save()
+        return text
+
+    @serialized("text")
+    async def admin_give(self, char: str, item: str, qty: int = 1) -> str:
+        g = self.game
+        if char not in g.party:
+            return f"❓ 沒有角色「{char}」"
+        qty = max(1, int(qty or 1))
+        g.give_item(char, item, qty)
+        g.ledger.add("admin", "item", f"管理員給了 {char} {item}×{qty}", item=item, target=char)
+        self._save()
+        inv = "、".join(f"{n}×{q}" for n, q in g.inventory[char])
+        return f"🎒 {char} 現在攜帶：{inv}"
+
+    @serialized("text")
+    async def admin_inspire(self, character: str = "") -> str:
+        if character and character not in self.game.party:
+            return f"❓ 沒有角色「{character}」"
+        names = [character] if character else list(self.game.party)
+        for name in names:
+            self.game.add_cond(name, "inspired", None)
+        self.game.ledger.add("admin", "cond", f"管理員給了 {'、'.join(names)} 靈感")
+        self._save()
+        return f"✨ {'、'.join(names)} 獲得**靈感**——下一次攻擊或引擎擲骰有優勢（用後即消耗）"
+
+    @serialized("text")
+    async def admin_xp(self, amount: int, character: str = "") -> str:
+        if character and character not in self.game.party:
+            return f"❓ 沒有角色「{character}」"
+        from engine.loot import add_xp
+        lines = []
+        add_xp(self.game, amount, lines, character)
+        self._save()
+        body = "\n".join(lines) or f"✅ XP {amount:+d} 已入帳（無升級）"
+        return f"⭐ {character or '全隊'} XP {amount:+d}\n" + body
 
     def _context_noteworthy(self, idx0: int) -> bool:
         """0c: when does the machine block earn its place? Situation
@@ -423,28 +644,27 @@ class V4Service:
         from .guards import (make_placeholder_map, make_restore_map,
                              map_out, map_in, scrub_narration,
                              is_repetition, is_chinese)
-        hints = [h for h in (render_hint(e, g)
-                             for e in g.ledger.entries[idx0:]) if h]
-        facts = [e.text for e in g.ledger.entries[idx0:]
-                 if e.kind != "table"]
+        end_id = (self._unfinished or {}).get("end_event_id", 2**63)
+        events = [e for e in g.ledger.entries[idx0:] if e.event_id <= end_id
+                  and e.kind not in ("table", "narration", "guard")
+                  and e.data.get("visibility") != "private"]
+        hints = [h for h in (render_hint(e, g) for e in events) if h]
+        facts = [e.text for e in events]
         brief = "；".join(f"{n} {e['hp_now']}/{e['hp_max']}HP"
                          for n, e in g.party.items())
         # pass NPC knowledge constraints if this was a talk/insight turn;
         # a reveal entry carries its own npc + the exact fact
         npc_knows, npc_name = None, ""
-        for e in g.ledger.entries[idx0:]:
+        for e in events:
             if e.kind in ("talk", "insight", "reveal") \
                     and e.data.get("npc"):
                 npc_name = e.data["npc"]
                 if e.kind == "reveal":
-                    break
-                if e.kind == "insight" and e.data.get("knows"):
-                    # the engine already picked what insight reveals
-                    npc_knows = e.data["knows"]
+                    npc_knows = [e.data["fact"]]
                     break
                 for n in g.world.here.npcs:
                     if n["name"] == npc_name:
-                        npc_knows = n.get("knows", [])
+                        npc_knows = n.get("disclosed", [])
                         break
         # v3 guard: placeholder names — narrator never sees real names
         pmap = make_placeholder_map(list(g.party))
@@ -465,7 +685,7 @@ class V4Service:
         # the DIGESTOR by meaning (wants_help); the regex only backstops
         # the deterministic no-LLM path
         help_bits = []
-        reveals = [e for e in g.ledger.entries[idx0:]
+        reveals = [e for e in events
                    if e.kind == "reveal"]
         if reveals and npc_name:
             # the engine already picked WHICH fact comes out this turn —
@@ -475,7 +695,7 @@ class V4Service:
                 f"這段敘事必須讓 {npc_name} 以對話形式說出「{fact}」"
                 "——這是引擎判定打聽到的新情報，逐字融入對白。")
         elif npc_knows and npc_name:
-            for e in g.ledger.entries[idx0:]:
+            for e in events:
                 if e.kind == "talk" and e.data.get("npc") == npc_name \
                         and e.data.get("ok"):
                     # a successful exchange must MOVE the story: the NPC
@@ -504,8 +724,7 @@ class V4Service:
         extra = "\n· ".join(directives) if directives else None
         # item inventory: what the narrator may mention
         s = g.world.here
-        scene_items = ([n for n, _ in s.ground_items]
-                       + [n for n, _ in s.hidden_items])
+        scene_items = [n for n, _ in s.ground_items]
         party_inv = {ch: [n for n, _ in stacks]
                      for ch, stacks in g.inventory.items()}
         narration = await self.narrator.narrate(
@@ -514,7 +733,8 @@ class V4Service:
             extra_directive=extra, on_delta=on_delta,
             player_input=map_out(player_input, pmap),
             scene_items=scene_items, party_inventory=party_inv,
-            world=world_block(self.rules))
+            world=map_out(world_block(self.rules), pmap),
+            memory=map_out(build_memory(g, player_input, npc_name=npc_name).render(), pmap))
         # review trail: log the pair so output quality is auditable
         log.info("narrate | in=%.60s | hints=%d | out=%.200s",
                  player_input.replace("\n", " "), len(hints),
@@ -553,8 +773,8 @@ class V4Service:
         # dropped stream) — both leave resumable state
         raw = narration.strip().rstrip("*").rstrip()
         if not raw or raw[-1] not in _END_PUNCT:
-            self._unfinished = {"text": narration, "idx0": idx0,
-                                "player_input": player_input}
+            job = self._unfinished or self._narration_job(idx0, player_input, wants_help)
+            self._unfinished = dict(job, text=narration)
         else:
             self._unfinished = None
         # v3 guard: restore real names before showing to players
@@ -567,105 +787,114 @@ class V4Service:
             self._recent_narrations = self._recent_narrations[-5:]
             # v5 seed 5: persist the narration into the ledger — replays
             # are complete and #dnd-health reviews full prose
-            g.ledger.add("narrator", "narration", narration[:400])
+            g.ledger.add("narrator", "narration", narration)
         return narration
 
-    async def settle_roll(self, die: int,
-                          on_delta=None,
-                          on_resolved=None) -> tuple[list[str], str]:
-        """Settle the pending check with the player's own die, then
-        AUTO-CONTINUE: the narrator immediately picks the story back up
-        from the settled outcome (v3 lesson: /roll must never leave the
-        story hanging). on_resolved fires with the verdict lines before
-        narration starts (instant verdict, streamed prose after).
-        Returns (engine lines, narration) — empty lines when no check
-        was pending (not a 'valid' settle)."""
+    @serialized()
+    async def settle_roll(self, die: int | None = None, on_delta=None,
+                          on_resolved=None, *, user_id: str = "", admin: bool = False,
+                          actor: str = "", expected_event_id: int | None = None):
+        """Only the check owner (or an authenticated adapter admin) may settle."""
         from .rules_core import resolve_pending_check
         g = self.game
         pend = getattr(g, "_pending_check", None)
         if not pend:
-            return [], ""
+            return ["（沒有待定檢定）"], ""
+        if expected_event_id is not None and pend.get("event_id") != expected_event_id:
+            return self._deny("?", "待定檢定已變更，請重新擲骰。")
+        owner = str(g.party.get(pend["actor"], {}).get("owner_id", ""))
+        if not admin and (str(user_id) != pend.get("user_id", owner)
+                          or (owner and str(user_id) != owner)):
+            return self._deny("?", "只有待定檢定的角色擁有者可以擲骰。")
+        if actor and actor != pend["actor"]:
+            return self._deny(actor, "待定檢定屬於另一個角色。")
+        if pend.get("scene", g.world.current) != g.world.current:
+            return self._deny(pend["actor"], "待定檢定的場景已變更。")
+        if die is not None and (type(die) is not int or not 1 <= die <= 20):
+            return self._deny(pend["actor"], "d20 必須是 1 至 20 的整數。")
+        if die is None:
+            die = g.d20()
         idx0 = len(g.ledger.entries)
-        actor = pend.get("actor", "")
-        skill = pend.get("skill", "")
-        ability = pend.get("ability", "")
-        from engine.charlib import SKILL_LABEL
-        sk_zh = SKILL_LABEL.get(skill, "") or ability
         ok, line = resolve_pending_check(g, die)
-        lines = [f"🎲 **{actor}** d20 → **{die}**"]
+        lines = [f"🎲 **{pend['actor']}** d20 → **{die}**"]
         if line:
             lines.append(line)
-        # v3 lesson: every turn ends with a hook
         from .templates import render_turn_context
-        lines.append("")
-        lines.append(render_turn_context(g, actor))
-        if on_resolved:
-            await on_resolved(lines)
-        self._unfinished = None  # this settle supersedes; _narrate re-marks
-        # auto-continue: the story reacts to the settled verdict now.
-        # The narrator answers the player's ORIGINAL /explore words (what
-        # created the check), with the die outcome appended — not a bare
-        # synthetic roll report (that produces flat re-quotes)
-        origin = pend.get("origin", "")
-        verdict = f"{actor} 擲骰 d20={die}：{'成功' if ok else '失敗'}"
-        player_input = f"{origin}（{verdict}）" if origin else \
-            f"{actor} 擲骰 d20={die}（{sk_zh}檢定{'成功' if ok else '失敗'}）"
-        narration = await self._narrate(
-            idx0, player_input, on_delta,
-            wants_help=bool(pend.get("help")))
+        lines += ["", render_turn_context(g, pend["actor"])]
+        verdict = f"{pend['actor']} 擲骰 d20={die}：{'成功' if ok else '失敗'}"
+        player_input = f"{pend.get('origin', '')}（{verdict}）"
+        self._unfinished = self._narration_job(idx0, player_input, bool(pend.get("help")))
         self._save()
-        return lines, narration
-
-    # ---------- /continue: finish an unfinished narration first ----------
+        return await self._deliver(lines, idx0, player_input, on_delta, on_resolved,
+                                   wants_help=bool(pend.get("help")))
 
     def has_unfinished(self) -> bool:
-        """True when the previous narration is resumable (and its ledger
-        slice still exists — a state reset invalidates it)."""
         u = self._unfinished
-        return bool(u) and 0 <= u.get("idx0", -1) < len(
-            self.game.ledger.entries)
+        if not u:
+            return False
+        ids = {e.event_id for e in self.game.ledger.entries}
+        return u.get("start_event_id") in ids and u.get("end_event_id") in ids
 
+    @serialized("continue")
     async def continue_narration(self, on_delta=None) -> tuple[bool, str]:
-        """Finish the previous unfinished narration, streaming word by
-        word. Truncated prose (cut mid-sentence) resumes from the exact
-        breakpoint via the narrator's continuation prompt; a silent
-        narrator re-narrates the same ledger slice. Returns
-        (continued, display_text) — (False, "") when there was nothing
-        to finish or the narrator is still down (caller falls back)."""
         u = self._unfinished
         if not u:
             return False, ""
-        if not (0 <= u["idx0"] < len(self.game.ledger.entries)):
-            self._unfinished = None  # stale — the state was reset
-            self._save()
+        if not self.has_unfinished():
+            self._unfinished = None
+            self._save(narration_only=True)
             return False, ""
-        from .guards import (make_restore_map, map_in, scrub_narration,
-                             is_chinese)
+        from .guards import (make_restore_map, make_placeholder_map, map_out,
+                             map_in, scrub_narration, is_chinese, validate_narration_items)
         if u["text"]:
-            # prose cut mid-sentence: continue from the breakpoint
-            cont = await self.narrator.continue_text(u["text"], on_delta)
+            pmap = make_placeholder_map(list(self.game.party))
+            npc_name = u.get("npc_name", "")
+            context = world_block(self.rules) + "\n" + build_memory(
+                self.game, npc_name=npc_name).render()
+            if npc_name:
+                context += f"\n{npc_name} 的對白只能引用當前狀態中該 NPC 的 facts，不能引用其他人的情報。"
+            try:
+                cont = await self.narrator.continue_text(
+                    u["text"], on_delta, context=map_out(context, pmap))
+            except Exception:
+                log.exception("continuation unavailable")
+                return False, ""
             try:
                 from opencc import OpenCC
                 cont = OpenCC("s2t").convert(cont)
             except ImportError:
                 pass
             cont, _ = scrub_narration(cont)
-            if cont and not is_chinese(cont):
-                cont = ""
-            if not cont:
-                return False, ""  # narrator still down
-            rmap = make_restore_map(list(self.game.party))
-            # if the continuation itself got cut, stay resumable
+            known = [n for n, _ in self.game.world.here.ground_items] + [
+                n for stacks in self.game.inventory.values() for n, _ in stacks]
+            cont, _ = validate_narration_items(cont, known)
+            if not cont or not is_chinese(cont):
+                return False, ""
             full = u["text"] + cont
             raw = full.strip().rstrip("*").rstrip()
-            self._unfinished = (
-                {"text": full, "idx0": u["idx0"],
-                 "player_input": u["player_input"]}
-                if not raw or raw[-1] not in _END_PUNCT else None)
-            self._save()
-            return True, map_in(cont, rmap)
-        # the narrator never spoke: re-narrate the same turn from facts
-        narration = await self._narrate(u["idx0"], u["player_input"],
-                                        on_delta)
-        self._save()
+            self._unfinished = dict(u, text=full) if not raw or raw[-1] not in _END_PUNCT else None
+            text = map_in(cont, make_restore_map(list(self.game.party)))
+            self.game.ledger.add("narrator", "narration", text)
+            self._recent_narrations = (self._recent_narrations + [text])[-5:]
+            self._save(narration_only=True)
+            return True, text
+        idx0 = next(i for i, e in enumerate(self.game.ledger.entries)
+                    if e.event_id == u["start_event_id"])
+        try:
+            narration = await self._narrate(idx0, u["player_input"], on_delta,
+                                            wants_help=u.get("wants_help", False))
+        except Exception:
+            log.exception("renarration unavailable")
+            return False, ""
+        self._save(narration_only=True)
         return bool(narration), narration
+
+    def nudge(self) -> str:
+        """Read-only guidance: never send unfiltered ledger text to a model."""
+        from .templates import render_turn_context
+        if self.pending:
+            p = self.pending
+            return f"❓ 待確認：{p.actor} {p.action} {p.target or p.destination}——用 `/confirm`。"
+        if getattr(self.game, "_pending_check", None):
+            return f"🎲 等待 {self.game._pending_check['actor']} 的 `/roll d20`。"
+        return render_turn_context(self.game, "") if self.game.party else "❓ 先用 `/pc` 建立角色。"

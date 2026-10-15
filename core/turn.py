@@ -52,6 +52,7 @@ class Game:
         # inventory[char] = [(name, qty)] — stacks
         self.ledger = Ledger()
         self._random = random.Random()
+        self.director_scene_count = 0
 
     # ---------- helpers ----------
 
@@ -201,7 +202,7 @@ class Game:
     # ---------- dice (engine-only write path) ----------
 
     def roll(self, expr: str):
-        return roll_expr(expr)
+        return roll_expr(expr, rng=self._random)
 
     def d20(self) -> int:
         return self._random.randint(1, 20)

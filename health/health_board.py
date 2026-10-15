@@ -24,6 +24,7 @@ import os
 import sqlite3
 import sys
 import time
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 
@@ -308,17 +309,52 @@ def read_new_events(db_path: str, last_id: int) -> tuple[int, list]:
     return (rows[-1][0] if rows else last_id), [r[1] for r in rows]
 
 
+def _campaign_id(path: str) -> str:
+    stem = Path(path).stem
+    return stem[len("v4_state_"):] if stem.startswith("v4_state_") else ""
+
+
+def _campaign_conn(data_dir: str):
+    uri = (Path(data_dir) / "campaigns.db").resolve().as_uri() + "?mode=ro"
+    return sqlite3.connect(uri, uri=True, timeout=1.0)
+
+
+def read_v4_state(path: str, cursor: int | None = None) -> dict:
+    """SQLite takes precedence over preserved JSON. Read only a page of events."""
+    db = Path(path).parent / "campaigns.db"
+    if db.exists():
+        with closing(_campaign_conn(str(db.parent))) as conn:
+            conn.execute("BEGIN")
+            row = conn.execute("SELECT snapshot,last_event_id FROM channels WHERE channel_id=?",
+                               (_campaign_id(path),)).fetchone()
+            if row:
+                blob = json.loads(row[0])
+                blob["last_event_id"] = row[1]
+                if cursor is not None:
+                    cursor = cursor if cursor <= row[1] else 0
+                    blob["entries"] = [json.loads(r[0]) for r in conn.execute(
+                        "SELECT payload FROM events WHERE channel_id=? AND event_id>? "
+                        "ORDER BY event_id LIMIT 15", (_campaign_id(path), cursor))]
+                return blob
+    with open(path, encoding="utf-8") as f:
+        blob = json.load(f)
+    entries = blob.get("entries", [])
+    blob["last_event_id"] = len(entries)
+    if cursor is not None:
+        cursor = cursor if cursor <= len(entries) else 0
+        blob["entries"] = [dict(e, event_id=i + 1)
+                           for i, e in enumerate(entries) if cursor <= i < cursor + 15]
+    return blob
+
+
 def read_new_v4_entries(path: str, cursor: int) -> tuple[int, list]:
     """(new_cursor, new lines) — v4 ledger entries since last push."""
     try:
-        with open(path, encoding="utf-8") as f:
-            entries = json.load(f).get("entries", [])
-    except (OSError, ValueError):
+        blob = read_v4_state(path, cursor)
+        new = blob.get("entries", [])
+    except (OSError, ValueError, sqlite3.Error):
         return cursor, []
-    if len(entries) < cursor:
-        cursor = 0  # this channel's state was reset
-    new = entries[cursor:cursor + 15]
-    return (cursor + len(new)), [
+    return (new[-1]["event_id"] if new else blob["last_event_id"]), [
         f"[t{e.get('turn', '?')}][{e.get('kind', '?')}] "
         f"{e.get('actor', '?')}: {e.get('text', '')}" for e in new
         if e.get("kind") not in ("table",)]  # table talk = not game log
@@ -327,9 +363,8 @@ def read_new_v4_entries(path: str, cursor: int) -> tuple[int, list]:
 def v4_summary(path: str, label: str = "") -> str:
     """One compact debug block per game for the board message."""
     try:
-        with open(path, encoding="utf-8") as f:
-            blob = json.load(f)
-    except (OSError, ValueError):
+        blob = read_v4_state(path)
+    except (OSError, ValueError, sqlite3.Error):
         return ""
     world = blob.get("world", {})
     cur = world.get("scenes", {}).get(world.get("current", ""), {})
@@ -441,26 +476,31 @@ class HealthBoardBot(discord.Client):
         self._task = None
         self.tree = app_commands.CommandTree(self)
         self._register_commands()
-        # v4 games are per-channel state files in the data dir
-        # (v4_state.json = legacy single-game playground)
+        # Campaigns share campaigns.db; preserved JSON remains an import source.
         self.data_dir = os.path.dirname(os.path.abspath(db_path))
         self.log_state = load_state()
 
     def _v4_state_files(self) -> list[str]:
-        """Every v4 state file, most recently modified first."""
+        """Logical per-channel paths (SQLite channels first), plus unimported JSON."""
         try:
             files = [os.path.join(self.data_dir, f)
                      for f in os.listdir(self.data_dir)
                      if f.startswith("v4_state") and f.endswith(".json")]
-            return sorted(files, key=lambda p: os.path.getmtime(p),
-                          reverse=True)
-        except OSError:
+            files.sort(key=os.path.getmtime, reverse=True)
+            if (Path(self.data_dir) / "campaigns.db").exists():
+                with closing(_campaign_conn(self.data_dir)) as conn:
+                    channels = [r[0] for r in conn.execute(
+                        "SELECT channel_id FROM channels ORDER BY revision DESC,channel_id")]
+                active = [os.path.join(self.data_dir, f"v4_state_{c}.json" if c else "v4_state.json")
+                          for c in channels]
+                files = active + [p for p in files if p not in active]
+            return files
+        except (OSError, sqlite3.Error):
             return []
 
     def _v4_label(self, path: str) -> str:
         """v4_state_<channel_id>.json -> '#channel' (resolved) or a mention."""
-        stem = os.path.splitext(os.path.basename(path))[0]
-        cid = stem[len("v4_state_"):] if stem.startswith("v4_state_") else ""
+        cid = _campaign_id(path)
         if cid.isdigit():
             ch = self.get_channel(int(cid))
             return f"#{ch.name}" if getattr(ch, "name", None) \
@@ -593,10 +633,8 @@ class HealthBoardBot(discord.Client):
             await self._push_logs()  # logs flow even between board refreshes
             return
         data = read_board(self.db_path)
-        if data is None:
-            return
         self._next_full = time.monotonic() + FULL_REFRESH
-        content = render(*data[:7], time.monotonic() - self.started)
+        content = render(*data[:7], time.monotonic() - self.started) if data else MARKER
         blocks = [v4_summary(p, self._v4_label(p))
                   for p in self._v4_state_files()[:3]]  # newest games
         blocks = [b for b in blocks if b]
@@ -635,10 +673,8 @@ class HealthBoardBot(discord.Client):
                     self.log_state[key] = self.log_state["last_v4_len"]
                 else:
                     try:
-                        with open(path, encoding="utf-8") as f:
-                            self.log_state[key] = len(
-                                json.load(f).get("entries", []))
-                    except (OSError, ValueError):
+                        self.log_state[key] = read_v4_state(path)["last_event_id"]
+                    except (OSError, ValueError, sqlite3.Error):
                         self.log_state[key] = 0
             cur_v4, v4_lines = read_new_v4_entries(
                 path, self.log_state[key])

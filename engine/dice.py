@@ -18,10 +18,12 @@ _EXPR = re.compile(r"(?i)([+-]?)\s*(\d*d\d{1,4}(?:kl\d{1,3}|kh\d{1,3}|kh|kl)?|\d
 _ADV_WORDS = {"adv": "d20kh2", "advantage": "d20kh2", "dis": "d20kl2", "disadvantage": "d20kl2"}
 
 
-def _roll_term(count: int, sides: int, keep: str | None, keepn: str | None) -> tuple[int, list[int]]:
+def _roll_term(count: int, sides: int, keep: str | None, keepn: str | None,
+               rng=None) -> tuple[int, list[int]]:
     count = max(1, count)
     sides = min(max(2, sides), 1000)
-    dice = [random.randint(1, sides) for _ in range(count)]
+    rng = rng or random
+    dice = [rng.randint(1, sides) for _ in range(count)]
     if keep:
         n = int(keepn) if keepn else 1
         if keep.lower() == "kh":
@@ -32,7 +34,7 @@ def _roll_term(count: int, sides: int, keep: str | None, keepn: str | None) -> t
     return sum(dice), dice
 
 
-def roll_expr(expr: str) -> tuple[int, str]:
+def roll_expr(expr: str, *, rng=None) -> tuple[int, str]:
     """Roll a dice expression like '2d6+3' or '4d6kh3'.
 
     Returns (total, breakdown) e.g. (9, "4 + 3 + 2").
@@ -77,7 +79,7 @@ def roll_expr(expr: str) -> tuple[int, str]:
             if count > 100:
                 raise ValueError("too many dice")
             value, dice = _roll_term(
-                count, int(tm.group("sides")), tm.group("keep"), tm.group("keepn")
+                count, int(tm.group("sides")), tm.group("keep"), tm.group("keepn"), rng
             )
             total += sign * value
             detail = ",".join(str(d) for d in dice)

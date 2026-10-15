@@ -12,7 +12,7 @@ import re
 import discord
 from discord import app_commands
 
-from engine.dice import quick_roll, roll_expr
+from engine.dice import quick_roll
 
 log = logging.getLogger("discord_adapter")
 
@@ -206,7 +206,8 @@ class DiscordBot(discord.Client):
                 os.environ.get("V4_NARR_MODEL", "qwen3.5:35b"),
                 channel_id=cid,
                 narr_think=_think_env("V4_NARR_THINK"),
-                digest_think=_think_env("V4_DIGEST_THINK"))
+                digest_think=_think_env("V4_DIGEST_THINK"),
+                director_evaluate=_think_env("V4_DIRECTOR_EVALUATE") is True)
         return self._v4_games[cid]
 
     def _in_v4(self, interaction_or_channel) -> bool:
@@ -244,93 +245,15 @@ class DiscordBot(discord.Client):
         async def pc_cmd(interaction: discord.Interaction, name: str,
                          occupation: app_commands.Choice[str],
                          remove: str = ""):
-            g = svc._v4_service(str(interaction.channel_id)).game
-            uid = str(interaction.user.id)
-            uname = interaction.user.display_name
-
-            # removal
+            await interaction.response.defer(thinking=True)
+            service = svc._v4_service(str(interaction.channel_id))
             if remove.strip().lower().startswith("remove"):
-                entry = g.party.get(name)
-                if not isinstance(entry, dict):
-                    await interaction.response.send_message(
-                        f"❓ 沒有角色「{name}」")
-                    return
-                if str(entry.get("owner_id", "")) != uid:
-                    await interaction.response.send_message(
-                        f"🚫 只有 {entry.get('owner', '?')} 可以刪除 {name}。")
-                    return
-                if remove.strip().lower() != "remove confirm":
-                    await interaction.response.send_message(
-                        f"⚠️ 確認刪除 {name}？填 `remove confirm`")
-                    return
-                g.party.pop(name, None)
-                g.inventory.pop(name, None)
-                g.ledger.add(name, "meta", f"{uname} 刪除了角色 {name}")
-                svc._v4_service(str(interaction.channel_id))._save()
-                await interaction.response.send_message(
-                    f"🗑️ 已刪除 {name}。")
-                return
-
-            # creation or update
-            if name in g.party:
-                await interaction.response.send_message(
-                    f"❓ 「{name}」已存在（擁有者：{g.party[name].get('owner', '?')}）")
-                return
-
-            occ = occupation.value if occupation else "Fighter"
-            # fair stats: server-side 4d6kh3 ×6, assigned by class priority
-            from engine.charlib import default_ac, slots_for
-            from engine.dice import roll_expr
-            PRIORITIES = {
-                "Barbarian": ["STR", "CON", "DEX", "WIS", "CHA", "INT"],
-                "Bard": ["CHA", "DEX", "CON", "WIS", "INT", "STR"],
-                "Cleric": ["WIS", "CON", "STR", "CHA", "DEX", "INT"],
-                "Druid": ["WIS", "CON", "DEX", "INT", "CHA", "STR"],
-                "Fighter": ["STR", "CON", "DEX", "WIS", "CHA", "INT"],
-                "Monk": ["DEX", "WIS", "CON", "STR", "CHA", "INT"],
-                "Paladin": ["STR", "CHA", "CON", "WIS", "DEX", "INT"],
-                "Ranger": ["DEX", "WIS", "CON", "STR", "INT", "CHA"],
-                "Rogue": ["DEX", "INT", "CON", "WIS", "CHA", "STR"],
-                "Sorcerer": ["CHA", "CON", "DEX", "WIS", "INT", "STR"],
-                "Warlock": ["CHA", "CON", "DEX", "WIS", "INT", "STR"],
-                "Wizard": ["INT", "CON", "DEX", "WIS", "CHA", "STR"],
-            }
-            prio = PRIORITIES.get(occ, ["STR", "DEX", "CON", "INT", "WIS", "CHA"])
-            rolls = sorted((roll_expr("4d6kh3")[0] for _ in range(6)),
-                           reverse=True)
-            stats = dict(zip(prio, rolls))
-            # HP = hit die + CON mod
-            HIT_DICE = {"Barbarian": 12, "Fighter": 10, "Paladin": 10,
-                        "Ranger": 10, "Bard": 8, "Cleric": 8, "Druid": 8,
-                        "Monk": 8, "Rogue": 8, "Warlock": 8,
-                        "Sorcerer": 6, "Wizard": 6}
-            die = HIT_DICE.get(occ, 8)
-            con_mod = (stats["CON"] - 10) // 2
-            hp = die + con_mod
-            ac = default_ac(occ, stats)
-            slots = {str(k): v for k, v in slots_for(occ, 1).items()}
-
-            g.party[name] = {
-                "occupation": occ, "stats": stats,
-                "hp_now": hp, "hp_max": hp, "level": 1, "xp": 0,
-                "owner": uname, "owner_id": uid,
-                "ac": ac, "slots": slots, "hd_used": 0,
-            }
-            g.inventory.setdefault(name, [])
-            g.ledger.add(name, "meta",
-                         f"{uname} 建立了角色 {name}（{occ}）")
-            svc._v4_service(str(interaction.channel_id))._save()
-
-            stat_txt = " ".join(f"{k} {stats[k]}"
-                                for k in ["STR", "DEX", "CON", "INT", "WIS", "CHA"])
-            slot_txt = (" · 法術格 " + " ".join(f"L{k}×{v}"
-                        for k, v in slots.items())) if slots else ""
-            await interaction.response.send_message(
-                f"🧙 **{name}** — {CLASS_ZH.get(occ, occ)} Lv1 "
-                f"(玩家：{uname})\n"
-                f"🛡 AC {ac} · ❤️ {hp}/{hp}{slot_txt}\n"
-                f"📊 {stat_txt}\n"
-                f"🎲 屬性由系統擲骰（4d6 取高 3）")
+                text = await service.remove_character(name, str(interaction.user.id), remove)
+            else:
+                text = await service.create_character(
+                    name, occupation.value if occupation else "Fighter",
+                    str(interaction.user.id), interaction.user.display_name)
+            await interaction.followup.send(_clip(text))
 
         # ---- autocomplete helpers ----
 
@@ -437,52 +360,7 @@ class DiscordBot(discord.Client):
         @self.tree.command(name="confirm",
                            description="確認待決行動 / confirm pending action")
         async def confirm_cmd(interaction: discord.Interaction):
-            v4svc = svc._v4_service(str(interaction.channel_id))
-            if v4svc.pending is None:
-                await interaction.response.send_message(
-                    "（沒有待確認的行動）")
-                return
-            p = v4svc.pending
-            v4svc.pending = None
-            p.args["confirmed"] = True
-            await interaction.response.defer(thinking=True)
-            from core.rules_core import resolve as v4_resolve
-            r = v4_resolve(v4svc.game, p)
-            body = "\n".join(r.lines)
-            if body:
-                await interaction.followup.send(_clip(body))
-            # narrate
-            if r.accepted and r.lines:
-                from core.templates import render_hint
-                from core.guards import (make_placeholder_map, map_out,
-                                       map_in, make_restore_map,
-                                       scrub_narration, is_chinese)
-                g = v4svc.game
-                recent = [e for e in g.ledger.entries
-                          if e.turn == g.ledger.turn][-6:]
-                hints = [h for h in (render_hint(e, g) for e in recent) if h]
-                facts = [e.text for e in recent]
-                brief = "；".join(f"{n} {e['hp_now']}/{e['hp_max']}HP"
-                                 for n, e in g.party.items())
-                pmap = make_placeholder_map(list(g.party))
-                rmap = make_restore_map(list(g.party))
-                narr = await v4svc.narrator.narrate(
-                    [map_out(f, pmap) for f in facts],
-                    g.world.here.name, map_out(brief, pmap),
-                    hints=[map_out(h, pmap) for h in hints])
-                try:
-                    from opencc import OpenCC
-                    narr = OpenCC("s2t").convert(narr)
-                except ImportError:
-                    pass
-                narr, _ = scrub_narration(narr)
-                narr = map_in(narr, rmap)
-                if narr and is_chinese(narr):
-                    await interaction.followup.send("📖 " + _clip(narr))
-                elif hints:
-                    await interaction.followup.send(
-                        "📖 " + _clip(map_in("\n".join(hints), rmap)))
-            v4svc._save()
+            await self._v4_turn(interaction, "confirm", confirmation=True)
 
         # ---- combat command family ----------------------------------------
         # One command per action, each with its OWN typed autocomplete —
@@ -745,36 +623,10 @@ class DiscordBot(discord.Client):
         @app_commands.autocomplete(item=item_ac)
         async def give_cmd(interaction: discord.Interaction,
                            item: str, to: str = ""):
-            g = svc._v4_service(str(interaction.channel_id)).game
-            giver = next((n for n, v in g.party.items()
-                          if str(v.get("owner_id", ""))
-                          == str(interaction.user.id)), "")
-            if not giver:
-                await interaction.response.send_message("❓ 找不到你的角色。")
-                return
-            if to and to not in g.party:
-                await interaction.response.send_message(
-                    f"❓ 沒有角色「{to}」")
-                return
-            if not g.take_item(giver, item, 1):
-                await interaction.response.send_message(
-                    f"🚫 {giver} 沒有「{item}」")
-                return
-            if to:
-                g.give_item(to, item, 1)
-                g.ledger.add(giver, "item", f"{giver} 把 {item} 給了 {to}")
-                await interaction.response.send_message(
-                    f"🎒 {giver} → {to}：{item}×1")
-            else:
-                # no recipient: set it down HERE — it stays in the world
-                # (pickable with take) instead of being destroyed
-                g.world.here.ground_items.append((item, 1))
-                g.ledger.add(giver, "item",
-                             f"{giver} 把 {item} 放在 {g.world.here.name}")
-                await interaction.response.send_message(
-                    f"🎒 {giver} 把 {item} 放在地上（{g.world.here.name}）"
-                    "——之後可以拾回")
-            svc._v4_service(str(interaction.channel_id))._save()
+            await interaction.response.defer(thinking=True)
+            text = await svc._v4_service(str(interaction.channel_id)).transfer_item(
+                str(interaction.user.id), item, to)
+            await interaction.followup.send(_clip(text))
 
         # ---- /rules (SRD retrieval, zero LLM) ----
 
@@ -921,7 +773,7 @@ class DiscordBot(discord.Client):
                     now = asyncio.get_event_loop().time()
                     if now - last_edit[0] >= 2.0 and len(acc) > 6:
                         last_edit[0] = now
-                        asyncio.create_task(_edit_safe(narr_msg, acc))
+                        asyncio.create_task(self._edit_safe(narr_msg, acc))
 
                 try:
                     cont, text = await v4svc.continue_narration(on_delta)
@@ -938,38 +790,7 @@ class DiscordBot(discord.Client):
                     await narr_msg.delete()
                 except discord.HTTPException:
                     pass
-            # 2. original behaviour: pending / combat / scene nudge
-            lines = []
-            if v4svc.pending is not None:
-                p = v4svc.pending
-                lines.append(f"❓ 待確認：**{p.actor or '?'} {p.action}"
-                             f" {p.target or p.destination or p.item or ''}**"
-                             "——回覆「確認」")
-            if g.combat.active:
-                waiting = [n for n in g.party
-                           if g.alive(n) and n not in g.combat.acted]
-                if waiting:
-                    lines.append("⚔️ 待行動：**" + "、".join(waiting)
-                                 + "**——用 `/attack` `/use` `/skill`")
-            if not lines:
-                lines.append(f"🔄 場景：{g.world.here.name}")
-                if not g.party:
-                    lines.append("❓ 還沒有角色——先用 `/pc` 建立角色。")
-                else:
-                    facts = [e.text for e in g.ledger.entries[-5:]]
-                    brief = "；".join(
-                        f"{n} {e['hp_now']}/{e['hp_max']}HP"
-                        for n, e in g.party.items()
-                        if isinstance(e, dict))
-                    narr = await v4svc.narrator.narrate(
-                        facts, g.world.here.name, brief,
-                        hints=[f"眾人在{g.world.here.name}。"
-                               f"{g.world.here.description}",
-                               "給玩家新的視角或鉤子。"])
-                    if narr:
-                        lines.append("📖 " + narr)
-            await interaction.followup.send(
-                "\n".join(lines)[:1900])
+            await interaction.followup.send(_clip(v4svc.nudge()))
 
         # ---- /help ----
 
@@ -1089,17 +910,9 @@ class DiscordBot(discord.Client):
             if not _admin_only(interaction):
                 await interaction.response.send_message("🚫 僅管理員。")
                 return
-            v4svc = svc._v4_service(str(interaction.channel_id))
-            g = v4svc.game
-            names = [character] if character in g.party else list(g.party)
-            for n in names:
-                g.add_cond(n, "inspired", None)
-            g.ledger.add("admin", "cond",
-                         f"管理員給了 {'、'.join(names)} 靈感")
-            v4svc._save()
-            await interaction.response.send_message(
-                f"✨ {'、'.join(names)} 獲得**靈感**——"
-                "下一次攻擊或引擎擲骰有優勢（用後即消耗）")
+            await interaction.response.defer(thinking=True)
+            text = await svc._v4_service(str(interaction.channel_id)).admin_inspire(character)
+            await interaction.followup.send(_clip(text))
 
         @self.tree.command(name="xp-admin",
                            description="(Admin) 給 XP（自動升級）/ grant XP with level-ups")
@@ -1110,19 +923,9 @@ class DiscordBot(discord.Client):
             if not _admin_only(interaction):
                 await interaction.response.send_message("🚫 僅管理員。")
                 return
-            v4svc = svc._v4_service(str(interaction.channel_id))
-            g = v4svc.game
-            if character and character not in g.party:
-                await interaction.response.send_message(
-                    f"❓ 沒有角色「{character}」")
-                return
-            from engine.loot import add_xp
-            lines = []
-            add_xp(g, amount, lines, character)
-            v4svc._save()
-            body = "\n".join(lines) or f"✅ XP {amount:+d} 已入帳（無升級）"
-            await interaction.response.send_message(
-                f"⭐ {character or '全隊'} XP {amount:+d}\n" + body)
+            await interaction.response.defer(thinking=True)
+            text = await svc._v4_service(str(interaction.channel_id)).admin_xp(amount, character)
+            await interaction.followup.send(_clip(text))
 
         @self.tree.command(name="roll-admin",
                            description="(Admin) 代擲 / roll for any character")
@@ -1136,7 +939,7 @@ class DiscordBot(discord.Client):
             expr = (expr or "d20").strip() or "d20"
             # an admin d20 settles a pending check and auto-continues too
             if await self._v4_settle(interaction, expr,
-                                echo=f"(admin) {character}".rstrip()):
+                                echo=f"(admin) {character}".rstrip(), admin=True, actor=character):
                 return
             try:
                 result = quick_roll(expr)
@@ -1155,8 +958,9 @@ class DiscordBot(discord.Client):
             if not interaction.user.guild_permissions.manage_guild:
                 await interaction.response.send_message("🚫 僅管理員。")
                 return
-            out = svc._v4_service(str(interaction.channel_id)).admin_give(character, item, qty)
-            await interaction.response.send_message(out)
+            await interaction.response.defer(thinking=True)
+            out = await svc._v4_service(str(interaction.channel_id)).admin_give(character, item, qty)
+            await interaction.followup.send(_clip(out))
 
     # ------------------------------------------------------------------
     #  message handling: table talk only (no DM reply, no emoji)
@@ -1166,8 +970,8 @@ class DiscordBot(discord.Client):
     #  shared v4 turn runners (defined last, used above)
     # ------------------------------------------------------------------
 
-    async def _v4_turn(interaction, text, echo=None,
-                       structured=False):
+    async def _v4_turn(self, interaction, text, echo=None,
+                       structured=False, confirmation=False):
         """Player v4 turn — v3 word-by-word UX:
         defer → echo (followup, resolves the thinking indicator) →
         engine verdict (instant) → narration streams into its own
@@ -1204,12 +1008,16 @@ class DiscordBot(discord.Client):
                 asyncio.create_task(self._edit_safe(msg, acc))
 
         try:
-            lines, narration = await self._v4_service(
-                str(interaction.channel_id)).handle(
-                text, interaction.user.display_name,
-                user_id=str(interaction.user.id),
-                structured=structured,
-                on_delta=on_delta, on_resolved=on_resolved)
+            service = self._v4_service(str(interaction.channel_id))
+            if confirmation:
+                lines, narration = await service.confirm(
+                    str(interaction.user.id), on_delta=on_delta, on_resolved=on_resolved,
+                    admin=interaction.user.guild_permissions.manage_guild)
+            else:
+                lines, narration = await service.handle(
+                    text, interaction.user.display_name,
+                    user_id=str(interaction.user.id), structured=structured,
+                    on_delta=on_delta, on_resolved=on_resolved)
         except Exception as e:
             log.exception("v4 turn failed")
             if narr_msg[0] is not None:
@@ -1228,13 +1036,13 @@ class DiscordBot(discord.Client):
             await interaction.channel.send(_clip("\n".join(lines)),
                                            view=view)
 
-    async def _edit_safe(msg, content):
+    async def _edit_safe(self, msg, content):
         try:
             await msg.edit(content=_clip(content) + " ▍")
         except discord.HTTPException:
             pass
 
-    async def _finalize_narr(msg, narration: str):
+    async def _finalize_narr(self, msg, narration: str):
         """End state of the streamed narration message: the final
         (guard-applied) text, or deleted when nothing was produced."""
         if msg is None:
@@ -1247,7 +1055,7 @@ class DiscordBot(discord.Client):
         except discord.HTTPException:
             pass
 
-    async def _v4_settle(interaction, expr, echo=""):
+    async def _v4_settle(self, interaction, expr, echo="", *, admin=False, actor=""):
         """A d20 /roll that settles a pending check AUTO-CONTINUES the
         story: die echo → engine verdict (instant) → narration streams
         word-by-word into its own message and stays.
@@ -1257,12 +1065,9 @@ class DiscordBot(discord.Client):
         if not pend or expr.lower() not in ("d20", "1d20"):
             return False
         await interaction.response.defer(thinking=True)
-        die, _ = roll_expr("d20")
-        tag = f" {echo}" if echo else ""
-        # echo the raw die as the followup — resolves 「正在思考…」
-        await interaction.followup.send(
-            f"🎲{tag} **{interaction.user.display_name}** "
-            f"d20 → **{die}**")
+        # The service rolls only after ownership checks, and posts after commit.
+        expected_event_id = pend.get("event_id")
+        await interaction.followup.send(f"🎲 **{interaction.user.display_name}** {echo} 請求結算檢定")
 
         narr_msg = [None]
         last_edit = [0.0]
@@ -1286,7 +1091,9 @@ class DiscordBot(discord.Client):
 
         try:
             lines, narration = await v4svc.settle_roll(
-                die, on_delta=on_delta, on_resolved=on_resolved)
+                on_delta=on_delta, on_resolved=on_resolved,
+                user_id=str(interaction.user.id), admin=admin, actor=actor,
+                expected_event_id=expected_event_id)
         except Exception as e:
             log.exception("v4 roll settle failed")
             if narr_msg[0] is not None:
@@ -1302,7 +1109,7 @@ class DiscordBot(discord.Client):
                                            view=view)
         return True
 
-    async def _v4_admin(interaction, character, text,
+    async def _v4_admin(self, interaction, character, text,
                         structured=False):
         """Admin v4 turn for any character — SAME streaming UX as
         player turns (the old admin path bypassed handle(): no
@@ -1338,6 +1145,7 @@ class DiscordBot(discord.Client):
                 str(interaction.channel_id)).handle(
                 text, f"{interaction.user.display_name} (admin)",
                 structured=structured, admin_actor=character,
+                user_id=str(interaction.user.id),
                 on_delta=on_delta, on_resolved=on_resolved)
         except Exception as e:
             log.exception("v4 admin turn failed")
@@ -1375,7 +1183,7 @@ class DiscordBot(discord.Client):
         admin_actor (guards + streaming). Kept only for external callers."""
         svc = self._v4_service(str(interaction.channel_id))
         lines, _ = await svc.handle(
-            text, "admin", admin_actor=character)
+            text, "admin", admin_actor=character, user_id=str(interaction.user.id))
         return lines
 
 

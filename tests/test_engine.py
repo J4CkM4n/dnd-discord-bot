@@ -163,15 +163,9 @@ def test_ignite_sets_scene_fire_persisted(tmp_path):
     r = resolve(g, Intent(action="creative", actor="依思", item="火把",
                           utterance="用火把點燃呢度"))
     assert any("陷入火海" in x for x in r.lines) and g.world.here.fire
-    svc = V4Service.__new__(V4Service)
-    svc.game = g
-    svc.path = str(tmp_path / "s.json")
-    svc._unfinished = None
-    svc.plot_state = {"clocks": {}, "fired": [], "last_turn": 0,
-                      "ended": None}
-    svc._save()
-    blob = json.load(open(svc.path, encoding="utf-8"))
-    assert blob["world"]["scenes"]["dock"]["fire"] is True
+    svc = _svc(g, tmp_path)
+    restored = V4Service(str(tmp_path), "http://unused", channel_id="t")
+    assert restored.game.world.scenes["dock"].fire is True
 
 
 # ---------- plot spine (Pillar B) ----------
@@ -233,18 +227,14 @@ class _FakeNarr:
 
 
 def _svc(g, tmp_path):
-    s = V4Service.__new__(V4Service)
+    s = V4Service(str(tmp_path), "http://unused", channel_id="t")
     s.game = g
     s.digestor = None
     s.narrator = _FakeNarr()
-    s.pending = None
-    s._recent_narrations = []
-    s._unfinished = None
     s.rules = {}
     s.plot = {}
     s.plot_state = {"clocks": {}, "fired": [], "last_turn": 0, "ended": None}
-    s.path = str(tmp_path / "s.json")
-    s.channel_id = "t"
+    s._save()
     return s
 
 
@@ -255,7 +245,7 @@ def test_narration_persisted_to_ledger(tmp_path):
         "依思 go 破舊酒館", "tester", structured=True))
     assert narr == "測試敘事。"
     assert any(e.kind == "narration" and e.actor == "narrator"
-               for e in g.ledger.entries)
+               for e in svc.game.ledger.entries)
 
 
 def test_per_channel_gamerules_override(tmp_path):

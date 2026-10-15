@@ -27,11 +27,11 @@ LOOT_TABLE = [
 _LOOT_ITEMS = [(n, w) for n, w in LOOT_TABLE]
 
 
-def drop_for(foe):
+def drop_for(foe, rng=None):
     """(name, qty) list this enemy leaves behind."""
     if getattr(foe, "loot", None):
         return [(n, 1) for n in foe.loot]        # authored = guaranteed
-    roll = random.choices([n for n, _ in _LOOT_ITEMS],
+    roll = (rng or random).choices([n for n, _ in _LOOT_ITEMS],
                           weights=[w for _, w in _LOOT_ITEMS], k=1)[0]
     return [(roll, 1)] if roll else []
 
@@ -58,7 +58,7 @@ def add_xp(g, xp: int, lines: list = None, char: str = "") -> None:
                 break
             e["xp"] -= need
             e["level"] = int(e.get("level", 1)) + 1
-            gain = 2 + random.randint(1, 6)     # hit-die-ish HP
+            gain = 2 + g._random.randint(1, 6)     # hit-die-ish HP
             e["hp_max"] = int(e.get("hp_max", 10)) + gain
             if int(e.get("hp_now", 0)) > 0:
                 e["hp_now"] = int(e["hp_now"]) + gain

@@ -14,6 +14,7 @@ attempt by describing the world.
 """
 
 import re
+from dataclasses import dataclass, field
 
 # mechanically meaningful / valuable / plot-bearing -> may NOT be
 # conjured from thin air (conservative by design)
@@ -84,10 +85,9 @@ def ambient_find(g) -> str | None:
     """~30% chance to hide one find in the current scene for the search
     to reveal: mostly flavour props, sometimes a genuinely useful item.
     Ledgered as a materialization."""
-    import random
-    if random.random() > 0.3:
+    if g._random.random() > 0.3:
         return None
-    if random.random() < 0.15:
+    if g._random.random() < 0.15:
         name = g._random.choice(_REAL_FINDS)
     else:
         name = g._random.choice(_AMBIENT_PROPS)
@@ -106,14 +106,13 @@ def named_find(g, name: str) -> bool:
     """A search that NAMES what it's looking for（「我搵下有冇魚鉤」）:
     ~50% the thing is actually there — intent beats blind RNG when the
     story needs a specific mundane item."""
-    import random
     if classify(name) != "prop":
         return False
     s = g.world.here
     if any(name in n or n in name for n, _ in
            s.ground_items + s.hidden_items):
         return True  # already here — the check below will reveal it
-    if random.random() > 0.5:
+    if g._random.random() > 0.5:
         return False
     s.hidden_items.append((name, 1))
     g.ledger.add("director", "materialize",
@@ -148,23 +147,73 @@ def scan_prop(text: str) -> str:
 MAX_DIRECTOR_SCENES = 12
 
 
+@dataclass(frozen=True)
+class DirectorProposal:
+    kind: str
+    origin_scene: str
+    content: dict
+
+
+@dataclass
+class DirectorDecision:
+    kind: str
+    origin_scene: str
+    proposal: dict | None = None
+    evaluation: str = "disabled"
+    accepted: bool = False
+    reasons: list[str] = field(default_factory=list)
+
+
+def verify_proposal(g, proposal: DirectorProposal) -> str | None:
+    """Final engine-owned gate; never coerces model values into strings."""
+    if proposal.origin_scene != g.world.current:
+        return "stale_scene"
+    d = proposal.content
+    if not isinstance(d, dict):
+        return "invalid_shape"
+    allowed = {"name", "description", "npc"} if proposal.kind == "scene" else {"name"}
+    if set(d) - allowed or any(type(v) is not str for v in d.values()):
+        return "invalid_fields"
+    name = d.get("name", "").strip()
+    if proposal.kind == "scene":
+        if not 1 < len(name) <= 8 or not 1 <= len(d.get("description", "").strip()) <= 120 \
+                or len(d.get("npc", "").strip()) > 8:
+            return "invalid_shape"
+        if getattr(g, "director_scene_count", 0) >= MAX_DIRECTOR_SCENES:
+            return "scene_limit"
+        if any(name == s.name for s in g.world.scenes.values()):
+            return "duplicate_scene"
+        npc = d.get("npc", "").strip()
+        if npc and (npc in g.party or any(npc == n["name"] for s in g.world.scenes.values()
+                                        for n in s.npcs)):
+            return "duplicate_npc"
+    elif proposal.kind == "item":
+        if not 1 < len(name) <= MAX_NAME or classify(name) != "prop":
+            return "blocked_item"
+        if any(name in n or n in name for n, _ in
+               g.world.here.ground_items + g.world.here.hidden_items):
+            return "duplicate_item"
+    else:
+        return "invalid_kind"
+    return None
+
+
 def canonize_scene(g, proposed: dict) -> bool:
     """ENGINE GATE for unplanned places: validate the Director LLM's
     typed proposal, build the scene node with bidirectional exits, and
     ledger the retcon. Returns False when the gate refuses."""
-    if not isinstance(proposed, dict):
+    if verify_proposal(g, DirectorProposal("scene", g.world.current, proposed)):
         return False
-    name = str(proposed.get("name", "")).strip()
-    desc = str(proposed.get("description", "")).strip()
-    npc = str(proposed.get("npc", "")).strip()
-    if not (1 < len(name) <= 8) or not desc or len(desc) > 120:
-        return False
-    made = sum(1 for e in g.ledger.entries
-               if e.kind == "director_scene")
-    if made >= MAX_DIRECTOR_SCENES:
-        return False
+    name = proposed["name"].strip()
+    desc = proposed["description"].strip()
+    npc = proposed.get("npc", "").strip()
+    made = getattr(g, "director_scene_count", 0)
     # engine-owned id; exits are ALWAYS bidirectional — nobody gets lost
-    sid = f"dir{made + 1}_{abs(hash(name)) % 10000}"
+    serial = made + 1
+    sid = f"dir{serial}"
+    while sid in g.world.scenes:
+        serial += 1
+        sid = f"dir{serial}"
     here = g.world.here
     from .world import Scene
     scene = Scene(sid, name, desc, exits={here.id: here.name})
@@ -173,6 +222,7 @@ def canonize_scene(g, proposed: dict) -> bool:
                            "disposition": "neutral", "knows": []})
     g.world.scenes[sid] = scene
     here.exits[sid] = name
+    g.director_scene_count = made + 1
     g.ledger.add("director", "director_scene",
                  f"世界展開了新角落：{name}（通往 {here.name} 的回頭路仍在）",
                  scene=sid, name=name)
