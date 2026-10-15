@@ -106,6 +106,113 @@ def interaction():
     )
 
 
+@pytest.mark.parametrize("path", ["turn", "confirm", "settle", "admin", "continue"])
+@pytest.mark.parametrize("outcome", ["complete", "empty", "error"])
+def test_discord_final_output_waits_for_delayed_stream_edit(path, outcome):
+    async def scenario():
+        started, release, produced = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        history, callbacks = [], []
+        partial = "依思翻找濕漉漉的木甲板，海霧湧入衣領"
+        final = partial + "。老船長低聲說：「霧裡的東西在等你。」"
+
+        async def edit(*, content):
+            if content.endswith("▍"):
+                started.set()
+                await release.wait()
+            history.append(content)
+
+        async def delete():
+            history.append("deleted")
+
+        msg = SimpleNamespace(edit=AsyncMock(side_effect=edit),
+                              delete=AsyncMock(side_effect=delete))
+
+        async def narrate(*args, on_delta=None, on_resolved=None, **kwargs):
+            callback = on_delta or args[0]
+            callbacks.append(callback)
+            if on_resolved:
+                await on_resolved(["檢定失敗"])
+            callback(partial)
+            await started.wait()
+            # A slow edit is still in flight when the service completes.
+            callback(partial + "，霧更濃了")
+            produced.set()
+            if outcome == "error":
+                raise RuntimeError("narration failed")
+            text = final if outcome == "complete" else ""
+            return (bool(text), text) if path == "continue" else ([], text)
+
+        bot = DiscordBot()
+        svc = SimpleNamespace(
+            game=SimpleNamespace(_pending_check={"event_id": 17},
+                                 combat=SimpleNamespace(active=False)),
+            handle=narrate, confirm=narrate, settle_roll=narrate,
+            continue_narration=narrate, has_unfinished=lambda: True,
+            nudge=lambda: "繼續探索。")
+        bot._v4_games["123"] = svc
+        it = interaction()
+        it.channel.send.return_value = msg
+        if path == "continue":
+            work = bot.tree.get_command("continue").callback(it)
+        elif path == "settle":
+            work = bot._v4_settle(it, "d20")
+        elif path == "admin":
+            work = bot._v4_admin(it, "依思", "搜索")
+        else:
+            work = bot._v4_turn(it, "搜索", confirmation=path == "confirm")
+        task = asyncio.create_task(work)
+        await asyncio.wait_for(produced.wait(), timeout=2)
+        try:
+            assert not history, "final output must wait for the pending edit"
+        finally:
+            release.set()
+            await asyncio.wait_for(task, timeout=2)
+        assert history[0] == partial + " ▍"
+        if outcome == "complete":
+            assert history[-1] == ("📖（續）" if path == "continue" else "📖 ") + final
+            assert "▍" not in history[-1] and "[PC1]" not in history[-1]
+        elif outcome == "empty" or path == "continue":
+            assert history[-1] == "deleted"
+        else:
+            assert history[-1] == "⚠️ narration failed"
+        callbacks[0](final)  # A late callback cannot restart a closed stream.
+        await asyncio.sleep(0)
+        assert len(history) == 2
+
+    run(scenario())
+
+
+def test_live_narration_restores_names_and_keeps_continuation_private(tmp_path):
+    s = service(tmp_path)
+    updates, continued, inputs = [], [], []
+    partial = "霧中，[PC1]緊握欄杆"
+    continuation = "，[PC2]低聲說：「它還在海裡。」"
+
+    async def narrate(*args, on_delta=None, **kwargs):
+        for i in range(1, len(partial) + 1):
+            on_delta(partial[:i])
+        return partial
+
+    async def continue_text(text, on_delta=None, **kwargs):
+        inputs.append(text)
+        for i in range(1, len(continuation) + 1):
+            on_delta(continuation[:i])
+        return continuation
+
+    s.narrator.narrate = narrate
+    s.narrator.continue_text = continue_text
+    _, text = run(s.handle("依思 rest", user_id="u1", structured=True,
+                           on_delta=updates.append))
+    assert text == "霧中，依思緊握欄杆" and s.has_unfinished()
+    assert s._unfinished["text"] == partial
+    ok, text = run(s.continue_narration(continued.append))
+    assert ok and text == "，大力蕉低聲說：「它還在海裡。」"
+    assert inputs == [partial] and not s.has_unfinished()
+    assert updates[-1] == "霧中，依思緊握欄杆"
+    assert continued[-1] == text
+    assert all("[" not in text and "PC" not in text for text in updates + continued)
+
+
 def test_discord_confirm_and_roll_route_to_authorized_service(tmp_path):
     bot = DiscordBot()
     svc = SimpleNamespace(

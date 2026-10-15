@@ -32,6 +32,42 @@ def _split(text: str, limit: int = 1900):
     return chunks
 
 
+class _NarrationStream:
+    """Bound live edits and drain them before the authoritative final edit."""
+
+    def __init__(self, message=None, min_chars=12):
+        self.message = message
+        self.min_chars = min_chars
+        self._task = None
+        self._last_edit = None
+        self._closed = False
+
+    def __call__(self, text):
+        if self._closed or self.message is None or len(text) <= self.min_chars:
+            return
+        now = asyncio.get_running_loop().time()
+        if self._task is not None and not self._task.done():
+            return
+        if self._last_edit is not None and now - self._last_edit < 2.0:
+            return
+        self._last_edit = now
+        self._task = asyncio.create_task(self._edit(text))
+
+    async def _edit(self, text):
+        try:
+            await self.message.edit(content=_clip(text) + " ▍")
+        except discord.HTTPException:
+            pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        self._closed = True
+        if self._task is not None:
+            await self._task
+
+
 HELP_TEXT = """🎲 **v6 引擎指令 / Commands**
 
 **玩家 / Player**
@@ -796,16 +832,9 @@ class DiscordBot(discord.Client):
             if v4svc.has_unfinished():
                 narr_msg = await interaction.channel.send(
                     "📖（續）DM 正在寫作…")
-                last_edit = [0.0]
-
-                def on_delta(acc: str):
-                    now = asyncio.get_event_loop().time()
-                    if now - last_edit[0] >= 2.0 and len(acc) > 6:
-                        last_edit[0] = now
-                        asyncio.create_task(self._edit_safe(narr_msg, acc))
-
                 try:
-                    cont, text = await v4svc.continue_narration(on_delta)
+                    async with _NarrationStream(narr_msg, min_chars=6) as stream:
+                        cont, text = await v4svc.continue_narration(stream)
                 except Exception:
                     log.exception("continue narration failed")
                     cont, text = False, ""
@@ -1014,7 +1043,7 @@ class DiscordBot(discord.Client):
             f"{_clip(text, 200)}")
 
         narr_msg = [None]   # created once the verdict is posted
-        last_edit = [0.0]
+        stream = _NarrationStream()
 
         async def on_resolved(lines):
             # engine verdict: instant, its own message
@@ -1023,30 +1052,24 @@ class DiscordBot(discord.Client):
             await interaction.channel.send(_clip("\n".join(lines)),
                                            view=view)
             # narration streams word-by-word into THIS message and
-            # keeps its streamed content (never replaced afterwards)
+            # receives its guarded final text after live edits finish
             narr_msg[0] = await interaction.channel.send(
                 "📖 DM 正在寫作…")
 
-        def on_delta(acc: str):
-            msg = narr_msg[0]
-            if msg is None:
-                return
-            now = asyncio.get_event_loop().time()
-            if now - last_edit[0] >= 2.0 and len(acc) > 12:
-                last_edit[0] = now
-                asyncio.create_task(self._edit_safe(msg, acc))
+            stream.message = narr_msg[0]
 
         try:
-            service = self._v4_service(str(interaction.channel_id))
-            if confirmation:
-                lines, narration = await service.confirm(
-                    str(interaction.user.id), on_delta=on_delta, on_resolved=on_resolved,
-                    admin=interaction.user.guild_permissions.manage_guild)
-            else:
-                lines, narration = await service.handle(
-                    text, interaction.user.display_name,
-                    user_id=str(interaction.user.id), structured=structured,
-                    on_delta=on_delta, on_resolved=on_resolved)
+            async with stream:
+                service = self._v4_service(str(interaction.channel_id))
+                if confirmation:
+                    lines, narration = await service.confirm(
+                        str(interaction.user.id), on_delta=stream, on_resolved=on_resolved,
+                        admin=interaction.user.guild_permissions.manage_guild)
+                else:
+                    lines, narration = await service.handle(
+                        text, interaction.user.display_name,
+                        user_id=str(interaction.user.id), structured=structured,
+                        on_delta=stream, on_resolved=on_resolved)
         except Exception as e:
             log.exception("v4 turn failed")
             if narr_msg[0] is not None:
@@ -1064,12 +1087,6 @@ class DiscordBot(discord.Client):
             view = CombatPanel(self) if g_.combat.active else None
             await interaction.channel.send(_clip("\n".join(lines)),
                                            view=view)
-
-    async def _edit_safe(self, msg, content):
-        try:
-            await msg.edit(content=_clip(content) + " ▍")
-        except discord.HTTPException:
-            pass
 
     async def _finalize_narr(self, msg, narration: str):
         """End state of the streamed narration message: the final
@@ -1099,7 +1116,7 @@ class DiscordBot(discord.Client):
         await interaction.followup.send(f"🎲 **{interaction.user.display_name}** {echo} 請求結算檢定")
 
         narr_msg = [None]
-        last_edit = [0.0]
+        stream = _NarrationStream()
 
         async def on_resolved(lines):
             g_ = self._v4_service(str(interaction.channel_id)).game
@@ -1109,20 +1126,14 @@ class DiscordBot(discord.Client):
             narr_msg[0] = await interaction.channel.send(
                 "📖 DM 正在寫作…")
 
-        def on_delta(acc: str):
-            msg = narr_msg[0]
-            if msg is None:
-                return
-            now = asyncio.get_event_loop().time()
-            if now - last_edit[0] >= 2.0 and len(acc) > 12:
-                last_edit[0] = now
-                asyncio.create_task(self._edit_safe(msg, acc))
+            stream.message = narr_msg[0]
 
         try:
-            lines, narration = await v4svc.settle_roll(
-                on_delta=on_delta, on_resolved=on_resolved,
-                user_id=str(interaction.user.id), admin=admin, actor=actor,
-                expected_event_id=expected_event_id)
+            async with stream:
+                lines, narration = await v4svc.settle_roll(
+                    on_delta=stream, on_resolved=on_resolved,
+                    user_id=str(interaction.user.id), admin=admin, actor=actor,
+                    expected_event_id=expected_event_id)
         except Exception as e:
             log.exception("v4 roll settle failed")
             if narr_msg[0] is not None:
@@ -1150,7 +1161,7 @@ class DiscordBot(discord.Client):
             f"**{character}** {_clip(text, 200)}")
 
         narr_msg = [None]
-        last_edit = [0.0]
+        stream = _NarrationStream()
 
         async def on_resolved(lines):
             g_ = self._v4_service(str(interaction.channel_id)).game
@@ -1160,22 +1171,16 @@ class DiscordBot(discord.Client):
             narr_msg[0] = await interaction.channel.send(
                 "📖 DM 正在寫作…")
 
-        def on_delta(acc: str):
-            msg = narr_msg[0]
-            if msg is None:
-                return
-            now = asyncio.get_event_loop().time()
-            if now - last_edit[0] >= 2.0 and len(acc) > 12:
-                last_edit[0] = now
-                asyncio.create_task(self._edit_safe(msg, acc))
+            stream.message = narr_msg[0]
 
         try:
-            lines, narration = await self._v4_service(
-                str(interaction.channel_id)).handle(
-                text, f"{interaction.user.display_name} (admin)",
-                structured=structured, admin_actor=character,
-                user_id=str(interaction.user.id),
-                on_delta=on_delta, on_resolved=on_resolved)
+            async with stream:
+                lines, narration = await self._v4_service(
+                    str(interaction.channel_id)).handle(
+                    text, f"{interaction.user.display_name} (admin)",
+                    structured=structured, admin_actor=character,
+                    user_id=str(interaction.user.id),
+                    on_delta=stream, on_resolved=on_resolved)
         except Exception as e:
             log.exception("v4 admin turn failed")
             if narr_msg[0] is not None:

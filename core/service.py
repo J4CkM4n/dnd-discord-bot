@@ -989,7 +989,7 @@ class V4Service:
         g = self.game
         from .templates import render_hint
         from .guards import (make_placeholder_map, make_restore_map,
-                             map_out, map_in, scrub_narration,
+                             map_out, map_in, map_stream_in, scrub_narration,
                              is_repetition, is_chinese, is_dialogue_echo)
         end_id = (self._unfinished or {}).get("end_event_id", 2**63)
         events = [e for e in g.ledger.entries[idx0:] if e.event_id <= end_id
@@ -1094,10 +1094,11 @@ class V4Service:
         party_inv = {ch: [n for n, _ in stacks]
                      for ch, stacks in g.inventory.items()}
         narrator = self._main_agent() if self.agent_config.enabled else self.narrator
+        stream_delta = (lambda text: on_delta(map_stream_in(text, rmap))) if on_delta else None
         narration = await narrator.narrate(
             safe_facts, g.world.here.name, safe_brief, hints=safe_hints,
             npc_knows=safe_knows, npc_name=npc_name,
-            extra_directive=extra, on_delta=on_delta,
+            extra_directive=extra, on_delta=stream_delta,
             player_input=map_out(player_input, pmap),
             scene_items=scene_items, party_inventory=party_inv,
             world=map_out(world_block(self.rules), pmap),
@@ -1229,9 +1230,11 @@ class V4Service:
         if not u.get("guidance"):
             await self._review_progress(u.get("player_input", ""))
         from .guards import (make_restore_map, make_placeholder_map, map_out,
-                             map_in, scrub_narration, is_chinese, validate_narration_items)
+                             map_in, map_stream_in, scrub_narration, is_chinese, validate_narration_items)
         if u["text"]:
             pmap = make_placeholder_map(list(self.game.party))
+            rmap = make_restore_map(list(self.game.party))
+            stream_delta = (lambda text: on_delta(map_stream_in(text, rmap))) if on_delta else None
             npc_name = u.get("npc_name", "")
             context = world_block(self.rules) + "\n" + build_memory(
                 self.game, npc_name=npc_name).render()
@@ -1241,7 +1244,7 @@ class V4Service:
             try:
                 narrator = self._main_agent() if self.agent_config.enabled else self.narrator
                 cont = await narrator.continue_text(
-                    u["text"], on_delta, context=map_out(context, pmap))
+                    u["text"], stream_delta, context=map_out(context, pmap))
             except Exception:
                 log.exception("continuation unavailable")
                 return False, ""
@@ -1260,7 +1263,7 @@ class V4Service:
             raw = full.strip().rstrip("*").rstrip()
             self._unfinished = (dict(u, text=full)
                                 if not raw or raw[-1] not in _END_PUNCT or self._narrator_interrupted() else None)
-            text = map_in(cont, make_restore_map(list(self.game.party)))
+            text = map_in(cont, rmap)
             self.game.ledger.add("narrator", "narration", text)
             self._recent_narrations = (self._recent_narrations + [text])[-5:]
             self._save(narration_only=True)

@@ -42,6 +42,15 @@ def map_in(text: str, rmap: dict) -> str:
     return _PC_TOKEN_RE.sub(sub, text)
 
 
+_PARTIAL_PC_TOKEN_RE = re.compile(
+    r"(?:\[\s*(?:P(?:C(?:\s*\d{0,2}\s*)?)?)?|\bPC(?:\s*\d{0,2}\s*)?)$")
+
+
+def map_stream_in(text: str, rmap: dict) -> str:
+    """Restore cumulative live text, withholding a split trailing PC token."""
+    return map_in(_PARTIAL_PC_TOKEN_RE.sub("", text), rmap)
+
+
 # ---- fake-dice scrubbing (v3: 反 vibe 骰網) ----
 # The narrator must NEVER contain dice notation, numbers-as-results, or
 # verdict arithmetic — those are engine-only vocabulary.
