@@ -315,6 +315,18 @@ def validate(g: Game, it: Intent, *, allow_unplanned_move: bool = False) -> str 
     if it.action in ("use", "give") and actor:
         if not any(s[0] == it.item for s in g.inventory.get(actor, [])):
             return f"SLOT:item:{it.item}"  # fabrication -> snark + deny
+    if it.action == "take":
+        from .pickups import preflight, PickupError
+        try:
+            preflight(g, it.item)
+        except PickupError as exc:
+            return "PICKUP:" + str(exc)
+    if it.action == "search" and "corpse_search" in it.args:
+        from .pickups import corpse_preflight, PickupError
+        try:
+            corpse_preflight(g, it)
+        except PickupError as exc:
+            return str(exc)
     if it.action == "observe" or (it.action == "creative"
             and _THROW_RE.search(it.utterance or it.raw or "")):
         foe, _ = resolve_target(g, it.target or it.utterance or it.raw)
@@ -719,6 +731,12 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
                 pass
     reason = validate(g, it)
     if reason:
+        if reason.startswith("PICKUP:"):
+            reason = reason.removeprefix("PICKUP:")
+            from .templates import render_hint
+            entry = g.ledger.add(it.actor or "?", "deny", reason,
+                                 reason=reason, item=it.item, snark=True)
+            return ResolveResult([f"🚫 {reason}", "🎭 " + render_hint(entry, g)], accepted=False)
         # item-from-nowhere: deny with a snark (human-DM 吐槽) — nothing
         # enters the world from thin air, but the refusal gets to be fun
         if reason.startswith("SLOT:item:"):
@@ -898,43 +916,41 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
         return ResolveResult([f"🎒 {actor} → {to}：{it.item}×1"])
 
     if it.action == "take":
-        # pick up a ground item or a revealed hidden item
+        # Preflight every item before moving any stack. Hidden items require
+        # search first. A standalone collection costs one combat action;
+        # linked plans retain their separate one-unit object interaction.
+        from .pickups import preflight
+        transfers, prop = preflight(g, it.item)
         s = g.world.here
-        for name, qty in s.ground_items:
-            if it.item and (it.item in name or name in it.item):
-                s.ground_items.remove((name, qty))
-                g.give_item(actor, name, qty)
-                g.ledger.add(actor, "item", f"{actor} 拾起 {name}×{qty}")
-                return ResolveResult([f"🎒 {actor} 拾起 {name}×{qty}"])
-        for name, qty in s.hidden_items:
-            if it.item and (it.item in name or name in it.item):
-                s.hidden_items.remove((name, qty))
-                g.give_item(actor, name, qty)
-                g.ledger.add(actor, "item", f"{actor} 拾起 {name}×{qty}")
-                return ResolveResult([f"🎒 {actor} 拾起 {name}×{qty}"])
-        # v5 0a — default to YES: an untracked but mechanically inert
-        # prop（the narrator may have described it）materializes into
-        # the scene and the take succeeds. Dice/value/plot items stay
-        # snark-denied — those must come from the DM or a plot beat.
-        from .director import try_materialize
-        if it.item and try_materialize(g, actor, it.item):
-            for name, qty in s.ground_items:  # re-run: it's tracked now
-                if it.item in name or name in it.item:
-                    s.ground_items.remove((name, qty))
-                    g.give_item(actor, name, qty)
-                    g.ledger.add(actor, "item", f"{actor} 拾起 {name}×{qty}")
-                    return ResolveResult(
-                        [f"🎒 {actor} 拾起 {name}×{qty}——它一直都在那裡"])
-        g.ledger.add(actor, "deny", f"場景中沒有「{it.item}」",
-                     reason=f"沒有「{it.item}」", item=it.item, snark=True)
-        from .templates import render_hint
-        return ResolveResult(
-            [f"🚫 場景中沒有「{it.item}」可拾取",
-             "🎭 " + render_hint(g.ledger.entries[-1], g)],
-            accepted=False)
+        if prop:
+            from .director import try_materialize
+            if not try_materialize(g, actor, prop):
+                return ResolveResult([f"🚫 場景中沒有「{prop}」可拾取"], accepted=False)
+        selected = {name for name, _ in transfers}
+        s.ground_items = [(name, qty) for name, qty in s.ground_items if name not in selected]
+        lines = []
+        for name, qty in transfers:
+            g.give_item(actor, name, qty)
+            note = f"{actor} 拾起 {name}×{qty}"
+            g.ledger.add(actor, "item", note, item=name, qty=qty, scene=s.id, source="ground")
+            lines.append("🎒 " + note + ("——它一直都在那裡" if prop else ""))
+        return ResolveResult(lines + (_post_rotation(g, actor) if g.combat.active else []))
 
     if it.action == "search":
         s = g.world.here
+        if "corpse_search" in it.args:
+            from .pickups import corpse_preflight
+            corpses = corpse_preflight(g, it)
+            # Death already generated loot once. Inspecting a body must not
+            # reroll drops, award XP, reveal unrelated secrets or create props.
+            items = [(n, q) for n, q in s.ground_items if q > 0]
+            note = f"{actor} 搜查 {'、'.join(corpses)} 的屍體；戰利品已在倒下時掉落，不會再次掉落。"
+            g.ledger.add(actor, "search", note, corpses=corpses, items=items, scene=s.id,
+                         method=it.raw)
+            ground = "、".join(f"{n}×{q}" for n, q in items)
+            lines = ["🔍 " + note, f"🎒 現在地上：{ground}。可用「拾起地上所有物品」。" if items
+                     else "地上沒有其他可拾取的物品。"]
+            return ResolveResult(lines + (_post_rotation(g, actor) if g.combat.active else []))
         # a search that NAMES a thing beats blind RNG: ~50% it's here
         from .director import ambient_find, named_find, scan_prop
         named = scan_prop(f"{it.raw or ''} {it.utterance or ''} "

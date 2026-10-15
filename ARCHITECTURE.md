@@ -69,6 +69,10 @@ additionally requires a complete deterministic parse. Both requests consume the
 shared budget. There are no retries. If interpretation also fails, only complete
 deterministic actions proceed; unresolved requests require clarification. Compound
 or linked requests go to the bounded action planner rather than executing a partial parse.
+Before that branch, the action operator recognizes complete collection and corpse-search
+requests deterministically. A mistaken compound flag cannot turn a single pickup or
+item list into an attack/use plan. Requests containing restrictions, alternatives,
+negation or another outcome retain semantic interpretation.
 
 Both `backend="auto"` and `backend="jev"` prefer native Jev with a configured key
 and retain LLM fallback. `backend="llm"` always selects the LLM router. Typed
@@ -76,6 +80,23 @@ commands bypass routing and action supervision; milestone progress review and
 narration can still call models.
 
 ## Player details and new mechanics
+
+### Collecting visible loot
+
+`pickups.py` normalizes one item, a named list, or all visible ground items into
+one `take` action. The engine preflights the entire collection, resolves exact
+names before unique partial matches, and transfers complete existing stacks.
+Missing or ambiguous items reject the whole collection before spending a turn.
+Hidden items require a successful search; collections never create items. The
+legacy single inert-prop director path remains available, excluding generic
+collection labels and game equipment. At most 20 item types can be collected
+per request; a standalone collection spends one action in combat.
+
+Corpse searches inspect defeated encounter members in the current scene and
+report existing ground loot. They never reroll death drops or XP, reveal unrelated
+hidden items, or require the player to predict loot names. Cutting methods require
+a held blade. Authorization, pending checks, staged persistence and replay apply
+to these deterministic actions as to other engine actions.
 
 ### Linked action plans
 

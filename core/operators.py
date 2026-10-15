@@ -155,6 +155,12 @@ class MainAgent:
         actor = review_candidate(g, parsed or Intent("talk"), user_id, admin_actor)["actor"]
         route, targets, exits = await DecisionGateway(self.gateway).classify(g, revision, text, actor)
         config, turn = self.gateway.config.routing, current_turn()
+        # An exact collection grammar is one engine action, even if a router
+        # mistakes a noun list (or a single pickup) for dependent actions.
+        from .pickups import parse_pickup, parse_corpse_search
+        if collection := parse_pickup(text, list(g.party)) or parse_corpse_search(text, list(g.party)):
+            report("action", revision, asdict(collection), gateway=self.gateway)
+            return ActionDecision(collection, revision)
         if route.choice("compound") == "yes" or route.choice("linked") == "yes":
             if turn:
                 turn.limit = config.creative_max_calls
@@ -346,6 +352,15 @@ class MainAgent:
     async def interpret(self, g, revision, text, parsed, *, user_id="", admin_actor="", rules=None,
                         plot_state=None, locked_intent=False):
         """g is a detached command snapshot, not the service's live game."""
+        from .pickups import parse_pickup, parse_corpse_search
+        collection = None
+        if not locked_intent:
+            collection = parse_pickup(text, list(g.party)) or parse_corpse_search(text, list(g.party))
+        elif parsed and parsed.args.get("corpse_search"):
+            collection = deepcopy(parsed)
+        if collection:
+            report("action", revision, asdict(collection), gateway=self.gateway)
+            return ActionDecision(collection, revision)
         ids = {e.event_id for e in g.ledger.entries}
         fallback = ActionDecision(deepcopy(parsed), revision)
         candidates = {"parsed": deepcopy(parsed)} if parsed else {}

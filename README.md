@@ -267,6 +267,7 @@ core/                   # engine and AI orchestration (snapshot v9)
 ├── decisions.py        # native Jev / LLM routing with validated choices
 ├── improvisation.py    # bounded, engine-owned creative effects
 ├── action_plans.py     # linked pickup/preparation/action plans and turn costs
+├── pickups.py          # atomic ground-item collections and corpse-loot inspection
 ├── hints.py            # persistent public-only stall guidance
 ├── debug_capture.py    # opt-in redacted local JSONL traces
 ├── trace_eval.py       # offline export, replay, and labeled evaluation
@@ -398,6 +399,21 @@ loops, and at most three main-model calls. Typed commands bypass routing and
 intent supervision; milestone progress and narration can still run.
 
 ## Director proposals and improvisation
+
+Picking up ground loot is one collection action. These requests work through
+`/explore` without an attack or healing goal:
+
+```text
+撿起地上的治療藥水
+撿起地上的治療藥水、匕首和火把
+撿起地上所有散落物品
+```
+
+The engine transfers existing visible stacks, up to 20 item types. A missing or
+ambiguous item rejects the whole list without a partial pickup. Hidden items
+must first be revealed by searching. In combat, a standalone collection uses
+one action. `搜索哥布林屍體` reports loot already on the ground without new drops
+or XP; cutting a body open requires a blade in inventory.
 
 Linked requests with one purpose can have up to three steps: one explicit
 pickup, optional preparation, then attack or item use. For example, picking up

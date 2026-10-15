@@ -69,7 +69,9 @@ def routing_questions(g):
                          "action? Style alone does not need new mechanics.",
         "wants_help": "Is the player asking the DM for help, hints, or what to do next?",
         "compound": "Are multiple mechanical actions or preparation steps requested? Speech or stylistic "
-                    "details accompanying one action do not count as extra actions.",
+                    "details accompanying one action do not count as extra actions. Picking up a list of "
+                    "ground items or all ground items is ONE take action, not a compound plan. "
+                    "Opening/searching a corpse for loot is ONE search attempt; unknown loot names are expected.",
         "linked": "Do preparation steps serve one explicit final goal, such as picking up ingredients, "
                   "mixing them, then attacking one target, or picking up a potion to heal an ally? "
                   "Independent goals, alternatives, hypotheticals and negated requests are not linked plans.",

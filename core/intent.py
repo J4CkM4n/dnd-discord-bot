@@ -140,6 +140,9 @@ def parse_command(text: str, party_names=()) -> Intent | None:
     actor, t = _action_text(text, party_names)
     if not t:
         return None
+    from .pickups import parse_pickup, parse_corpse_search
+    if collection := parse_pickup(text, party_names) or parse_corpse_search(text, party_names):
+        return collection
     if _ROBBERY.match(t):
         return None  # In particular, 打劫 must never match the attack verb 打.
     entry = _ENTRY_MOVE.fullmatch(t) if not _ENTRY_QUALIFIER.search(t) else None

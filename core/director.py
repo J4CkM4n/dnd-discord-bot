@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 _BLOCKED = re.compile(
     r"劍|刀|弓|弩|斧|槌|錘|矛|槍|炮|匕|盾|甲|鎧|盔"
     r"|藥水|藥劑|靈藥|丹"
+    r"|火把|繩索|绳索|草藥包|torch|rope"
     r"|金幣|銀兩|黃金|銅板|寶石|珍珠|珠寶|玉|瑪瑙|翡翠"
     r"|戒指|項鍊|墜飾|護符"
     r"|捲軸|書卷|法典"
@@ -33,7 +34,7 @@ _BLOCKED = re.compile(
     re.I)
 
 # props nobody should be able to conjure by naming them
-_NON_PROP = re.compile(r"空氣|牆|地板|天空|太陽|月亮|海|水$|^水")
+_NON_PROP = re.compile(r"空氣|牆|地板|天空|太陽|月亮|海|水$|^水|所有|全部|物品|物資|東西|东西|道具|散落|\b(?:all|everything|loot|items?|things?)\b|[、，,]", re.I)
 
 MAX_NAME = 10  # a prop name, not an essay
 
