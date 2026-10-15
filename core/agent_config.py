@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
-ROLES = ("main", "action", "progress", "director", "evaluator", "narrator")
+ROLES = ("main", "action", "progress", "director", "evaluator", "narrator", "router")
 
 
 class ConfigError(ValueError):
@@ -36,6 +36,26 @@ class RoleConfig:
 
 
 @dataclass(frozen=True)
+class RoutingConfig:
+    enabled: bool = False  # old configurations retain their original workflow
+    backend: str = "auto"
+    model: str = "jev-latest"
+    base_url: str = "https://api.typesafe.ai/v1"
+    api_key_env: str = "TYPESAFE_API_KEY"
+    api_key: str = field(default="", repr=False)
+    timeout: float = 5
+    probability: float = .85
+    confidence: float = .8
+    creative_max_calls: int = 8
+
+
+@dataclass(frozen=True)
+class HintConfig:
+    stalled_attempts: int = 3
+    cooldown: int = 3
+
+
+@dataclass(frozen=True)
 class AgentConfig:
     providers: dict[str, ProviderConfig]
     roles: dict[str, RoleConfig]
@@ -43,6 +63,8 @@ class AgentConfig:
     max_calls: int = 6
     progress_interval: int = 5
     director_evaluate: bool = False
+    routing: RoutingConfig = field(default_factory=RoutingConfig)
+    hints: HintConfig = field(default_factory=HintConfig)
 
 
 def _boolean(value, name):
@@ -74,7 +96,7 @@ def _env_bool(env, name, default):
 
 def parse_config(data: dict, env=None) -> AgentConfig:
     env = os.environ if env is None else env
-    _fields(data, ("version", "providers", "roles", "supervision"), "configuration")
+    _fields(data, ("version", "providers", "roles", "supervision", "routing", "hints"), "configuration")
     if type(data.get("version", 1)) is not int or data.get("version", 1) != 1:
         raise ConfigError("Unsupported agent configuration version")
     raw_providers = data.get("providers", {})
@@ -134,18 +156,53 @@ def parse_config(data: dict, env=None) -> AgentConfig:
         roles[name] = RoleConfig(
             provider, model.strip(),
             _number(raw.get("temperature", 0.7 if narrator else 0.8 if name == "director" else 0.1), "temperature", 0, 2),
-            _number(raw.get("max_tokens", 600 if name in ("main", "progress") else 400 if narrator else 200),
+            _number(raw.get("max_tokens", 1600 if name == "router" else 600 if name in ("main", "progress", "director") else 400 if narrator else 200),
                     "max_tokens", 16, 32768, True),
             _number(raw.get("timeout", 180 if narrator else 30), "timeout", 1, 300), think, effort)
     sup = data.get("supervision", {})
     _fields(sup, ("enabled", "max_calls", "progress_interval", "director_evaluate"), "supervision")
+    route = data.get("routing", {})
+    _fields(route, ("enabled", "backend", "model", "base_url", "api_key_env", "timeout",
+                    "probability", "confidence", "creative_max_calls"), "routing")
+    backend = route.get("backend", "auto")
+    if backend not in ("auto", "jev", "llm"):
+        raise ConfigError("routing.backend must be auto, jev, or llm")
+    url = route.get("base_url", "https://api.typesafe.ai/v1")
+    try:
+        parts = urlsplit(url)
+        valid = (parts.scheme in ("http", "https") and parts.hostname and not parts.username
+                 and not parts.password and not parts.query and not parts.fragment)
+        _ = parts.port
+    except (ValueError, TypeError, AttributeError):
+        valid = False
+    if not valid:
+        raise ConfigError("Invalid routing.base_url")
+    model, key_env = route.get("model", "jev-latest"), route.get("api_key_env", "TYPESAFE_API_KEY")
+    if not isinstance(model, str) or not 1 <= len(model.strip()) <= 200:
+        raise ConfigError("Invalid routing.model")
+    if not isinstance(key_env, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key_env):
+        raise ConfigError("Invalid routing.api_key_env")
+    key = env.get(key_env, "")
+    if "\n" in key or "\r" in key:
+        raise ConfigError("Invalid routing credential")
+    routing = RoutingConfig(
+        _boolean(route.get("enabled", False), "routing.enabled"), backend, model.strip(),
+        url.rstrip("/"), key_env, key,
+        _number(route.get("timeout", 5), "routing.timeout", 1, 30),
+        _number(route.get("probability", .85), "routing.probability", .5, 1),
+        _number(route.get("confidence", .8), "routing.confidence", 0, 1),
+        _number(route.get("creative_max_calls", 8), "routing.creative_max_calls", 6, 8, True))
+    hint = data.get("hints", {})
+    _fields(hint, ("stalled_attempts", "cooldown"), "hints")
+    hints = HintConfig(_number(hint.get("stalled_attempts", 3), "hints.stalled_attempts", 1, 20, True),
+                       _number(hint.get("cooldown", 3), "hints.cooldown", 1, 20, True))
     return AgentConfig(providers, roles,
                        _boolean(sup.get("enabled", True), "enabled"),
                        _number(sup.get("max_calls", 6), "max_calls", 4, 6, True),
                        _number(sup.get("progress_interval", 5), "progress_interval", 1, 100, True),
                        _boolean(sup["director_evaluate"] if "director_evaluate" in sup
                                 else _env_bool(env, "V4_DIRECTOR_EVALUATE", False),
-                                "director_evaluate"))
+                                "director_evaluate"), routing, hints)
 
 
 def load_agent_config(path: str | None = None, env=None) -> AgentConfig:

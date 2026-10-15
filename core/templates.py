@@ -24,6 +24,16 @@ def render_hint(entry, game=None) -> str:
     actor, target = entry.actor, d.get("target", "")
     kind = entry.kind
 
+    if kind == "improvisation":
+        return (f"{actor} 的花招奏效了。" if d.get("ok") else
+                f"{actor} 的花招差了一步；換個角度仍有機會。")
+    if kind == "improvisation_cancelled":
+        return f"情況已經改變，{actor} 原先的花招沒有生效。"
+    if kind == "check_pending":
+        return f"{actor} 準備嘗試，結果仍待擲骰決定。"
+    if kind == "tactic":
+        return f"{actor} 的機智為接下來的交鋒創造了機會。"
+
     if kind == "attack":
         if d.get("crit"):
             return _pick([f"{actor} 使出全力一擊，正中 {target} 的要害——漂亮的一擊！",

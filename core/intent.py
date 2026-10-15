@@ -79,6 +79,7 @@ class Intent:
     confidence: float = 1.0  # digestor fills this; low -> engine asks back
     wants_help: bool = False  # digestor: player is asking for guidance
     args: dict = field(default_factory=dict)
+    narrative: dict = field(default_factory=dict)  # attempted action and player flavor, never facts
 
 
 def _strip_particles(text: str) -> str:

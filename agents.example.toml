@@ -1,10 +1,12 @@
+# Copy to agents.toml before starting the bot. Local agents.toml is gitignored.
+# Keep API keys in environment variables or the ignored .env, never in TOML.
 # Model settings are loaded once at startup. Restart after editing.
 # Explicit values here override legacy LLM_URL / V4_* environment settings.
 version = 1
 
 [supervision]
 enabled = true
-max_calls = 6  # hard maximum; may be reduced to 4 or 5
+max_calls = 6  # ordinary turns; creative turns use routing.creative_max_calls
 progress_interval = 5
 # director_evaluate = false  # omitted: V4_DIRECTOR_EVALUATE or false
 
@@ -42,7 +44,7 @@ max_tokens = 600
 [roles.director]
 provider = "local"
 # model = "qwen2.5:7b-instruct"
-max_tokens = 200
+max_tokens = 1000
 
 [roles.evaluator]
 provider = "local"
@@ -53,3 +55,24 @@ max_tokens = 200
 provider = "local"
 # model = "qwen3.5:35b"
 max_tokens = 400
+
+# Jev makes bounded decisions; the existing LLM router is used without a key
+# or when Jev fails. No external Jev call occurs until TYPESAFE_API_KEY is set.
+[routing]
+enabled = true
+backend = "auto"  # auto / jev / llm; native failures fall back to roles.router
+model = "jev-latest"
+base_url = "https://api.typesafe.ai/v1"
+api_key_env = "TYPESAFE_API_KEY"
+timeout = 5
+probability = 0.85
+confidence = 0.8
+creative_max_calls = 8
+
+[roles.router]
+provider = "local"
+max_tokens = 1600
+
+[hints]
+stalled_attempts = 3
+cooldown = 3

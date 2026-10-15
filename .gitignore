@@ -1,4 +1,6 @@
 __pycache__/
+.venv/
+data/debug/
 *.tgz
 *.bak
 data/*.db
@@ -7,6 +9,9 @@ data/*.db-shm
 data/*.json
 keys/
 .env
+.env.*
+!.env.example
+agents.toml
 .zcodeignore
 HANDOFF.md
 MEMORY.md

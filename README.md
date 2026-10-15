@@ -1,32 +1,34 @@
-# D&D DM Bot — supervised agents and deterministic gameplay
+# D&D DM Bot — System One routing and supervised agents
 
-Self-hosted Dungeon Master for Discord. A main agent coordinates action
-interpretation, memory retrieval, the director, progress reviews, and narration.
-The engine owns authorization, dice, rules, and every game-state mutation.
-The game remains playable without models through typed commands and the CLI.
+Self-hosted Discord Dungeon Master for **黑暗海洋奇幻**: oppressive atmosphere,
+creative player methods, occasional dark wit, and engine-owned consequences.
+A System One router classifies actions; the orchestrator assigns action,
+director, evaluator, progress, and narrator specialists as needed. The game
+remains playable without models through typed commands and the CLI.
 
 ## Architecture
 
 ```mermaid
 flowchart TD
-    Player[Freeform player action] --> Main[Main agent: select and review operators]
-    Main --> Action[Action interpretation]
-    Main --> Memory[Deterministic memory retrieval]
-    Main --> Director[Director proposals]
-    Main --> Evaluator[Optional JEV evaluation]
-    Action --> Review[Main agent decision]
-    Memory --> Review
-    Director --> Review
-    Evaluator --> Review
-    Review --> Engine[Engine: authorize, validate, resolve]
-    Typed[Typed combat commands] --> Engine
-    Engine --> Commit[SQLite: commit game and append facts]
-    Commit --> Progress[Main agent: progress operator and review]
-    Progress --> Narrator[Main agent: narrator]
-    Narrator --> Discord[Guarded Discord output]
-    Main --> Audit[Separate operator audit records]
-    Progress --> Audit
+    Player[Freeform action] --> Router[System One: Jev with LLM fallback]
+    Router --> Main[Orchestrator: select specialists]
+    Main --> Action[Action interpretation when needed]
+    Main --> Director[New content or bounded effects]
+    Director --> Evaluator[Evaluator review]
+    Evaluator --> Approval[Main model approval]
+    Action --> Engine[Engine: authorize, validate, resolve]
+    Main -->|clear existing action| Engine
+    Approval --> Engine
+    Typed[Typed commands] --> Engine
+    Engine --> Commit[SQLite: game, events, audit, narration job, hints]
+    Commit --> Progress[Scheduled progress review]
+    Progress --> Narrator[Dark narration: player details and committed facts]
+    Narrator --> Discord[Guarded output]
+    Router -. opt-in .-> Debug[Local traces: export, replay, evaluate]
+    Narrator -.-> Debug
 ```
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the flow and engine boundaries.
 
 ## Quick Start
 
@@ -34,6 +36,7 @@ flowchart TD
 # Python 3.11+; Ollama locally or an OpenAI-compatible endpoint
 pip install -r requirements.txt
 cp .env.example .env        # fill DISCORD_TOKEN and V4_CHANNEL_IDS
+cp agents.example.toml agents.toml
 # Edit agents.toml for provider/model choices; credentials stay in environment.
 set -a
 source .env
@@ -55,6 +58,7 @@ models and providers:
 
 ```bash
 cp .env.example .env
+cp agents.example.toml agents.toml
 docker compose up -d --build
 docker compose logs -f bot
 ```
@@ -62,6 +66,10 @@ docker compose logs -f bot
 The bot runs as UID/GID `10001:10001` and needs no published ports. Credentials
 are read from `.env` at runtime and excluded from the image. Any variable named
 by `api_key_env` in `agents.toml` must also be present in `.env`.
+
+`agents.example.toml` is the public template. Local `agents.toml`, `.env`, and
+`.env.*` overrides are gitignored (`.env.example` remains public). API keys belong
+in the environment or `.env`; TOML uses only `api_key_env` variable names.
 
 `agents.toml` is excluded from the build context and image; supply it as a
 runtime mount when running the image directly. Compose mounts `agents.toml`,
@@ -91,7 +99,8 @@ thinking length help diagnose authentication, missing models, and truncation.
 DEBUG also includes bounded input and structured decision previews. Configured
 API keys and the Discord token are redacted; HTTP headers, full prompts, raw
 error response bodies, and library wire dumps are omitted. Set `LOG_LEVEL=INFO`
-and recreate the container to return to normal logging.
+and recreate the container to return to normal logging. Full AI/user capture
+is a separate opt-in switch, `AI_DEBUG_CAPTURE=full`; see below.
 
 For local Ollama, Compose defaults to `http://host.docker.internal:11434`,
 including a host-gateway mapping for Linux. The host's model server must listen
@@ -252,8 +261,13 @@ gamerules.json          # single source of truth: world tone + canon +
                         # narrative constraints (injected into the
                         # narrator prompt; edit here to change the world)
 
-core/                   # the game engine (v6)
-├── intent.py           # Intent dataclass + deterministic parser
+core/                   # engine and AI orchestration (snapshot v8)
+├── intent.py           # Intent + narrative brief + deterministic parser
+├── decisions.py        # native Jev / LLM routing with validated choices
+├── improvisation.py    # bounded, engine-owned creative effects
+├── hints.py            # persistent public-only stall guidance
+├── debug_capture.py    # opt-in redacted local JSONL traces
+├── trace_eval.py       # offline export, replay, and labeled evaluation
 ├── world.py            # Scene graph, NPCs (with knows), encounters
 ├── turn.py             # Game state: party, combat, inventory, slots
 ├── rules_core.py       # validate + resolve (the only write path)
@@ -295,17 +309,19 @@ legacy/                 # v3 code (archived, not imported)
 
 ## Models and centralized configuration
 
+Copy `agents.example.toml` to your local, ignored `agents.toml` before starting.
 `agents.toml` is loaded once when the bot starts and shared by every channel.
 Use `AGENT_CONFIG=/path/to/agents.toml` for a different file. Restart after edits.
 Invalid configuration fails startup with a nonzero exit status.
 
 | Role | Default model | Responsibility |
 |---|---|---|
-| `main` | qwen2.5:7b-instruct | Select operators, reconcile intent, approve proposals and guidance |
+| `main` | qwen2.5:7b-instruct | Approve new proposals and progress guidance; retain old supervision when routing is disabled |
+| `router` | qwen2.5:7b-instruct | LLM routing when native Jev is unavailable or disabled |
 | `action` | qwen2.5:7b-instruct | Interpret freeform actions with confidence |
 | `progress` | qwen2.5:7b-instruct | Assess goals, stalls, and repeated actions from evidence |
-| `director` | qwen2.5:7b-instruct | Propose unplanned scenes or inert props |
-| `evaluator` | qwen2.5:7b-instruct | Optional relevance/consistency review for JEV |
+| `director` | qwen2.5:7b-instruct | Propose scenes, inert props, and bounded improvisation |
+| `evaluator` | qwen2.5:7b-instruct | Required routed-proposal review; optional item review in the older workflow |
 | `narrator` | qwen3.5:35b | Render committed facts and approved guidance |
 
 Each `[roles.<role>]` accepts `provider`, `model`, `temperature`, `max_tokens`,
@@ -345,83 +361,109 @@ Ollama thinking inherits `V4_DIGEST_THINK` / `V4_NARR_THINK`; optional evaluatio
 inherits `V4_DIRECTOR_EVALUATE`. Code defaults apply when these are absent.
 Discord token, channel IDs, and `DATA_DIR` remain environment settings.
 
-## Main-agent control and progress
+## System One routing and orchestration
 
-The main model selects a bounded set of action, memory, and director operators,
-then reviews their reports. It can accept an existing intent or request
-clarification; it cannot invent a mechanical result. For a clear movement intent
-whose destination has no exit yet, the controller also schedules a Director/JEV
-repair before final review, even if the initial plan omitted the Director.
-When the action operator misses a movement intent, the main agent can delegate
-one Director repair that returns a proposed intent and scene for review.
-Operators cannot call one
-another, write campaign state, or send Discord messages. The service hosts the
-controller and enforces ownership, confirmation, legality, and final verification.
+The `agents.example.toml` template enables `[routing]` with `backend="auto"`. Configure
+`TYPESAFE_API_KEY` to use native **TypeSafe Jev** at
+`https://api.typesafe.ai/v1/systemone`; without it, `roles.router` uses your
+existing LLM. One failed native request makes one LLM fallback call.
+`backend="llm"` forces the LLM; `backend="jev"` also retains fallback.
 
-Every command allows at most **six model calls**, including failures, evaluation,
-and narration, with at most **three main-model calls**. Optional work reserves a
-final main decision and narration. There are no retries or delegation cycles.
-`[supervision].max_calls` can lower the limit to 4 or 5. Typed combat bypasses
-intent supervision; inventory and status remain immediate. If the main model
-fails, only a deterministic parsed action can proceed; otherwise the player is
-asked to clarify. Low-confidence movement, attack, and search require confirmation.
+Native Jev receives bounded player action text (1,500 characters), public scene
+description (500), visible target names, exits, and a recent public NPC exchange
+(500). API secrets, account IDs, inventory, hidden items, private knowledge, and
+unpublished plot are excluded from its body. The API key authenticates via header.
 
-The controller schedules progress review after explicit help, a scene change,
-a plot beat, combat completion, or every five accepted gameplay actions
-(`progress_interval`). Simultaneous triggers coalesce. The game commits first;
-the progress operator then reports to the main agent before narration. A budget
-shortage or failed review preserves pending triggers for a later turn or
-`/continue`, without replaying the action.
+Batched typed choices cover category, target, destination, ambiguity, creative
+detail, improvisation, help, and compound actions. Clear supported actions go
+directly to the engine; uncertain/open-ended actions use the action specialist.
+Default direct thresholds are probability 0.85 and confidence 0.8; absent native
+confidence requires interpretation. LLM self-reported confidence is uncalibrated,
+so its direct path additionally requires a complete deterministic parse.
 
-Progress reports distinguish authored objectives from inferred goals and cite
-visible event IDs. They can flag stalls/repetition and recommend choices from
-current public state. They cannot complete objectives, move plot clocks, grant
-rewards, or add facts. Optional public authored objectives belong in `plot.json`:
-`"objectives": [{"id": "route", "text": "尋找航路", "public": true}]`.
-Unpublished objectives and future beats stay out of progress prompts. The main
-agent selects guidance from the report; only approved choices reach narration.
+Player words and details are stored as a narrative brief, separate from facts,
+and survive pending rolls and narration restarts. Style changes the response,
+not damage or rewards. An attack with a threat about a sea-bottom debt collector
+uses ordinary attack rules; narration responds while preserving dark atmosphere.
+Multiple independent actions ask the player to choose one. When models fail,
+only complete deterministic requests may proceed.
 
-`[supervision].enabled = false` retains the older direct interpretation/director
-flow while still using centralized providers and the shared call budget. Legacy
-Python callers using `V4Service(..., llm_url, ...)` also retain that flow unless
-an enabled `AgentConfig` or gateway is supplied.
+Ordinary commands have at most **six calls** by default (`max_calls`, 4–6).
+Creative proposals and scene extensions can use **eight**
+(`creative_max_calls`, 6–8), including failures, fallback, reviews, and narration.
+Required reviews and prose reserve slots; there are no retries or delegation
+loops, and at most three main-model calls. Typed commands bypass routing and
+intent supervision; milestone progress and narration can still run.
 
-## Director decisions and campaign memory
+## Director proposals and improvisation
 
-The director uses **Judge–Evaluate–Verify (JEV)**. Ownership, action eligibility,
-existing exits/discoveries, and scene limits are checked before generation.
-The model proposes one scene or inert item; the engine validates its types,
-limits, uniqueness, and item restrictions before staging it with the action.
-Rejected actions leave no generated world objects behind.
+TypeSafe **Jev** is a System One model; director **Judge–Evaluate–Verify** is a
+separate review workflow. New routed scene/item proposals and improvised effects
+require evaluator review, main approval, and engine verification. Models propose
+attempts; the engine owns checks, costs, results, and state mutation.
 
-In supervised games, **new routes and movement repairs always require JEV**
-using the configured `evaluator` role, followed by main-agent approval and
-engine verification. The evaluator checks the original intent, current location,
-known places, obstacles, canon, and campaign memory. An unlisted destination is a
-story gap to examine rather than an automatic request to rephrase.
-For example, `/explore 登上船長的船` can propose a moored ship's deck connected
-back to the dock, then move there only after all three checks approve it. It
-does not grant the ship, move the captain, or sail away. Existing exits are reused.
-Combat, pending checks, ownership, low-confidence confirmation, and scene limits
-still apply. Rejected repairs explain the blocked step and retain an audit
-decision; they do not advance the turn or plot. Insufficient call budgets defer
-the repair without creating an unjudged scene. There is at most one repair per
-command, within the six-call limit; progress review can wait for a later turn.
+A creative plan uses one canonical skill, an engine DC tier (10/14/18), up to two
+owned-item costs, two success effects, and one failure NPC reaction. Effects
+include minor enemy damage, potion-backed healing, advantage, cover, NPC attitude,
+inert props, adjacent scenes, and one catalog salvage reward per scene shared
+by the party. Arbitrary numeric damage/DCs and items are rejected; a plan permits
+at most one major effect. Exploration checks can await `/roll`; combat attempts
+consume a normal action slot. Saved plans are revalidated and settled once.
 
-Set `[supervision].director_evaluate = true` (or legacy
-`V4_DIRECTOR_EVALUATE=on`) to also evaluate ordinary item proposals; this optional
-setting defaults to `off`. It also controls evaluation in the legacy direct
-flow. Invalid, unavailable, or negative evaluations reject the proposal; no
-retries occur. Existing
-deterministic gameplay remains available. This is a decision workflow, not a
-trained new model; narrative consistency judgments remain fallible.
+An unlisted destination can be a story gap: `/explore 登上船長的船` may propose
+an adjacent deck and move there after review. It does not grant the ship, move
+the captain, or start sailing. Ownership, combat, pending checks, scene limits,
+and rollback still apply. Rejected proposals create no world objects. The older
+item-evaluation option remains available when routing is disabled.
 
-The director and narrator recall up to **12 historical engine facts / 3,000
-characters**, ranked by scene, referenced characters, plot relevance, and
-recency. Current state takes precedence over history. Narration, table talk,
-and rejected proposals never become factual memory. Hidden items and
-undisclosed NPC knowledge stay out of narrator recall. Authored `world.canon`
-continues to be shared background in prompts.
+## Hints, progress, and memory
+
+Stalled exploration gets a public hint after three attempts, with a three-attempt
+cooldown, configurable under `[hints]`. Rejected attempts count; rest, observation,
+meta/table talk, and combat rounds do not. Meaningful progress resets counters;
+settled rolls reset without counting an extra attempt. Explicit help bypasses
+cooldown. Counters survive restarts; hints use current public options.
+
+Progress review runs after help, scene changes, plot beats, combat completion,
+or every five accepted actions (`progress_interval`). Gameplay commits first;
+the main agent reviews advice before narration. Budget shortages defer triggers
+to later turns or `/continue`. Progress cannot complete objectives, move clocks,
+or grant rewards. Public authored objectives can be declared in `plot.json` as
+`"objectives": [{"id":"route","text":"尋找航路","public":true}]`.
+
+Director and narrator recall up to 12 historical engine facts / 3,000 characters.
+Current state takes precedence. Narration, table talk, and rejected proposals
+never become factual memory. Hidden items and undisclosed NPC knowledge stay
+out of narrator recall; authored `world.canon` remains shared background.
+
+Set `[routing].enabled=false` to restore the previous supervised workflow in
+this version. TOML without `[routing]` retains that workflow.
+`[supervision].enabled=false` retains legacy direct interpretation/director flow.
+Legacy Python constructor callers retain direct flow unless supplied an enabled
+configuration or gateway.
+
+## Detailed debug capture and evaluation
+
+Set `AI_DEBUG_CAPTURE=full` in `.env` and recreate the process to record JSONL
+under `DATA_DIR/debug`. Default `off` creates no trace files. Capture includes
+user input/output, prompts and content responses, routing decisions, validation,
+pre-state/commits, and delivered text. Known keys/tokens are redacted; headers
+and provider reasoning are excluded. Internal snapshots and player identifiers
+remain local in the debug artifact. Files rotate at 25 MiB with seven-day
+retention and a 250 MiB cap enforced on writes; failures do not interrupt play.
+Compose uses the existing campaign-data volume.
+
+```bash
+python -m core.trace_eval export data/debug --output session.jsonl
+python -m core.trace_eval evaluate session.jsonl --labels labels.jsonl
+python -m core.trace_eval replay session.jsonl --trace-id TRACE_ID
+```
+
+Replay uses recorded responses in a temporary database with no live provider
+requests or campaign writes. It checks requests, output, state, and recorded
+call consumption. See [AI evaluation](docs/ai-evaluation.md) for label examples,
+Docker commands, and recommendations on calibration, new effects, dark tone,
+and playability.
 
 ## Persistence and migration
 
@@ -440,14 +482,18 @@ corresponding state transaction. Approved guidance is saved with the narration
 job before streaming, and interrupted streams remain resumable. A restart uses
 that guidance without invoking action operators or resolving the action again.
 
-Snapshots include pending checks, player-bound confirmations, combat effects,
+Snapshot v8 includes pending checks and creative plans, narrative briefs,
+party-shared reward allowances, player-bound confirmations, combat effects,
 plot progress, RNG state, and continuation references. `/confirm` and `/roll`
 enforce ownership. A failed write leaves committed state intact; a failed
 callback or narrator leaves a resumable `/continue`. Commands serialize within
 each channel, including narration, while other channels can progress. Run one
 bot process per database; revision checks reject stale writers.
 
-On first access to a channel, v4–v6 `v4_state_<channel>.json` saves (or
+The snapshot codec loads v4–v8. Disabling routing keeps saves compatible with
+this version; restoring an older binary requires its pre-upgrade backup.
+
+On first access to a channel, v4–v7 `v4_state_<channel>.json` saves (or
 `v4_state.json` for an unnamed channel) import once in a transaction. Originals
 are preserved and never updated; subsequent starts use SQLite. Corrupt or
 unsupported saves produce an explicit error instead of a fresh campaign.
@@ -470,7 +516,7 @@ counts, and recall sizes. Offline verification:
 
 ```bash
 pip install -r requirements.txt pytest
-python -m pytest tests/ -q
+python -X utf8 -m pytest tests/ -q
 python core/cli.py selftest
 ```
 

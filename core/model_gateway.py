@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 import httpx
 
 from .agent_config import AgentConfig
+from .debug_capture import capture
 
 log = logging.getLogger("dnd-bot")
 
@@ -43,6 +44,7 @@ class TurnContext:
                   "role": role, "status": status, "call_count": self.calls,
                   "event_ids": [], **payload}
         self.records.append(record)
+        capture("operator", record=record)
         return record
 
 
@@ -148,19 +150,21 @@ class ModelGateway:
         headers = {"Authorization": f"Bearer {provider.api_key}"} if provider.api_key else {}
         return spec, provider, url, body, headers
 
-    def _begin(self, role):
+    def _begin(self, role, *, provider=None, model=None):
         context = current_turn()
-        spec = self.config.roles[role]
+        if provider is None:
+            spec = self.config.roles[role]
+            provider, model = spec.provider, spec.model
         if context:
             if context.remaining <= _reserve.get() or (role == "main" and context.main_calls >= 3):
-                context.record(role, "budget_exhausted", kind="model_call", provider=spec.provider, model=spec.model)
+                context.record(role, "budget_exhausted", kind="model_call", provider=provider, model=model)
                 log.warning("model | trace=%s role=%s status=budget_exhausted remaining=%d reserved=%d",
                             context.trace_id, role, context.remaining, _reserve.get())
                 raise BudgetExceeded("Model call budget exhausted")
             context.calls += 1
             context.main_calls += role == "main"
-            return context.record(role, "running", kind="model_call", provider=spec.provider, model=spec.model)
-        return {"role": role, "provider": spec.provider, "model": spec.model, "status": "running"}
+            return context.record(role, "running", kind="model_call", provider=provider, model=model)
+        return {"role": role, "provider": provider, "model": model, "status": "running"}
 
     def _finish(self, record, started):
         record["latency_ms"] = round((time.monotonic() - started) * 1000, 2)
@@ -178,6 +182,7 @@ class ModelGateway:
 
     def _redact(self, text, *, partial=False):
         secrets = [p.api_key for p in self.config.providers.values()]
+        secrets.append(self.config.routing.api_key)
         secrets.append(os.environ.get("DISCORD_TOKEN", ""))
         for secret in secrets:
             if secret:
@@ -208,6 +213,9 @@ class ModelGateway:
     async def complete(self, role: str, prompt: str, *, json_mode=False, max_tokens=None) -> str:
         record, started = self._begin(role), time.monotonic()
         spec, provider, url, body, headers = self._request(role, prompt, json_mode, False, max_tokens)
+        capture("model_request", call_id=record.get("call_count", 1), role=role,
+                provider=provider.api, request=body)
+        content = ""
         log.debug("model request | trace=%s role=%s api=%s endpoint=%s timeout=%s "
                   "json=%s stream=false max_tokens=%s think=%s prompt_chars=%d",
                   record.get("trace_id", "-"), role, provider.api, self.diagnostic(url),
@@ -223,6 +231,8 @@ class ModelGateway:
                        else data["choices"][0]["message"]["content"])
             if not isinstance(content, str):
                 raise ValueError()
+            record["usage"] = data.get("usage") if provider.api == "openai" else {
+                "input_tokens": data.get("prompt_eval_count"), "output_tokens": data.get("eval_count")}
             content = self._redact(content).strip()
             reason = (data.get("done_reason") if provider.api == "ollama"
                       else data["choices"][0].get("finish_reason"))
@@ -244,6 +254,8 @@ class ModelGateway:
             raise ModelError(f"Model request failed for role {role}") from None
         finally:
             self._finish(record, started)
+            capture("model_response", call_id=record.get("call_count", 1), role=role,
+                    content=content, metadata=record)
 
     async def object(self, role, prompt):
         return json_object(await self.complete(role, prompt, json_mode=True))
@@ -251,6 +263,8 @@ class ModelGateway:
     async def stream(self, role: str, prompt: str, on_delta=None, *, max_tokens=None) -> str:
         record, started = self._begin(role), time.monotonic()
         spec, provider, url, body, headers = self._request(role, prompt, False, True, max_tokens)
+        capture("model_request", call_id=record.get("call_count", 1), role=role,
+                provider=provider.api, request=body)
         log.debug("model request | trace=%s role=%s api=%s endpoint=%s timeout=%s connect_timeout=%s "
                   "read_timeout=%s stream=true "
                   "max_tokens=%s think=%s prompt_chars=%d",
@@ -277,6 +291,11 @@ class ModelGateway:
                                     done = True
                                     break
                             chunk = json.loads(line)
+                            if "usage" in chunk:
+                                record["usage"] = chunk["usage"]
+                            elif "eval_count" in chunk:
+                                record["usage"] = {"input_tokens": chunk.get("prompt_eval_count"),
+                                                   "output_tokens": chunk.get("eval_count")}
                             if "error" in chunk:
                                 raise ValueError()
                             if provider.api == "ollama":
@@ -314,4 +333,6 @@ class ModelGateway:
         finally:
             record["output_chars"] = len(text)
             self._finish(record, started)
+            capture("model_response", call_id=record.get("call_count", 1), role=role,
+                    content=text, metadata=record)
         return self._redact(text, partial=not done or truncated)

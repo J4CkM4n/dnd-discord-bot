@@ -143,6 +143,10 @@ def _apply_check_effect(g: Game, actor: str, effect: dict | None,
                         ok: bool, lines: list[str]) -> None:
     """Mechanical outcome of a settled check. Runs whether the die came
     from the engine (auto) or the player's own /roll (pending path)."""
+    if effect and effect.get("kind") == "improvisation":
+        from .improvisation import apply_effects
+        apply_effects(g, actor, effect["plan"], ok, lines)
+        return
     if not effect or not ok:
         return
     kind = effect.get("kind", "")
@@ -243,6 +247,14 @@ def validate(g: Game, it: Intent, *, allow_unplanned_move: bool = False) -> str 
         return f"沒有角色「{actor}」"
     if actor and not g.alive(actor):
         return f"{actor} 已倒地（HP 0），無法行動"
+    if "improvisation" in it.args:
+        from .improvisation import verify_improvisation
+        plan = it.args["improvisation"]
+        if it.action != "creative" or not isinstance(plan, dict) or plan.get("actor") != actor:
+            return "花招與行動角色不一致。"
+        reason = verify_improvisation(g, plan)
+        if reason:
+            return "花招條件不成立：" + reason
     if g.combat.active and any(not f.dead and f.hp > 0 for f in g.enemies.values()) \
             and it.action not in ("pass", "chat") and actor in g.combat.acted:
         waiting = [n for n in g.party if g.alive(n) and n not in g.combat.acted]
@@ -698,6 +710,11 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
             g.ledger.add(actor, "deny", f"拒絕：{reason}", reason=reason)
             return ResolveResult([f"⏳ {reason}"], accepted=False)
 
+    # Expire the previous stance before the next action, so newly-created
+    # defense/cover survives this action's rotation and the enemy response.
+    if isinstance(getattr(g, "_dodge", None), dict):
+        g._dodge.pop(actor, None)
+
     if it.action == "attack":
         # confirm only when the digestor is genuinely uncertain (freeform
         # /explore with ambiguous phrasing); /combat always sets confidence=1
@@ -900,6 +917,9 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
         return ResolveResult(lines)
 
     if it.action == "creative":
+        if "improvisation" in it.args:
+            from .improvisation import resolve_improvisation
+            return resolve_improvisation(g, it.args["improvisation"])
         # v5 A1 affordances: creative actions with real consequences
         u = it.utterance or it.raw or ""
         _THROW_RE = re.compile(r"掟|擲|丟|抛|扔|撒|潑|噴|倒向|throw", re.I)
@@ -1244,9 +1264,6 @@ def _post_rotation(g: Game, actor: str = "") -> list[str]:
     out: list[str] = []
     if not g.combat.active:
         return out
-    # the actor's dodge stance ends when they next act
-    if actor and isinstance(getattr(g, "_dodge", None), dict):
-        g._dodge.pop(actor, None)
     if actor and actor not in g.combat.acted:
         g.combat.acted.append(actor)
     pending = [n for n in g.party
@@ -1320,5 +1337,6 @@ def resolve(g: Game, it: Intent) -> ResolveResult:
     if p is not None and not p.get("origin"):
         p["origin"] = (it.utterance or it.raw or "")[:120]
         p["help"] = bool(getattr(it, "wants_help", False))
+        p["narrative"] = it.narrative
     return r
 

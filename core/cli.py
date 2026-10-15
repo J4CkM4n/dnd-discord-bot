@@ -7,6 +7,7 @@
 import os
 import random
 import sys
+import tempfile
 from copy import deepcopy
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -297,8 +298,10 @@ def selftest() -> None:
     kinds = {e.kind for e in g.ledger.entries}
     assert {"scene", "combat", "check", "attack", "heal",
             "deny"} <= kinds, kinds
-    g.ledger.save("/tmp/v4-ledger-test.json")
-    assert Ledger.load("/tmp/v4-ledger-test.json").turn == g.ledger.turn
+    with tempfile.TemporaryDirectory(prefix="dnd-selftest-") as directory:
+        ledger_path = os.path.join(directory, "ledger.json")
+        g.ledger.save(ledger_path)
+        assert Ledger.load(ledger_path).turn == g.ledger.turn
 
     print("V4 P1 SELFTEST: PASS — engine-driven game fully playable, "
           "zero LLM involved")

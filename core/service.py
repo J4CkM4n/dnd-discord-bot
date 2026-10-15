@@ -11,6 +11,7 @@ from functools import wraps
 import logging
 import os
 import re
+import inspect
 from dataclasses import asdict
 
 log = logging.getLogger("dnd-bot")
@@ -79,6 +80,8 @@ from .memory import build_memory, recent_conversation
 from .agent_config import legacy_config
 from .model_gateway import ModelGateway, current_turn, turn_context
 from .operators import MainAgent
+from .debug_capture import DebugCapture, capture_context, capture, replay_config
+from .hints import progress_key, track_attempt
 
 # a narration that ends WITHOUT one of these was cut mid-sentence
 # (max_tokens cutoff / stream drop) -> /continue must finish it
@@ -103,18 +106,44 @@ def serialized(result="turn"):
                 stage._audit_cursor = 0
                 stage._supervised = None
                 stage._committed = False
+                stage._attempt = None
+                stage._hint_checked = False
+                stage._latest_hint = ""
                 try:
-                    with turn_context(self.agent_config.max_calls, self._revision) as turn:
+                    with turn_context(self.agent_config.max_calls, self._revision) as turn, \
+                            capture_context(self.debug_capture, turn.trace_id):
+                        bound = inspect.signature(fn).bind(stage, *args, **kwargs)
+                        if self.debug_capture.enabled:
+                            arguments = bound.arguments
+                            capture("command_start", method=fn.__name__, channel_id=self.channel_id,
+                                arguments={k: v for k, v in arguments.items() if k != "self" and not callable(v)},
+                                streaming=callable(arguments.get("on_delta")),
+                                resolved_callback=callable(arguments.get("on_resolved")),
+                                config=replay_config(self.agent_config), snapshot=stage._snapshot(),
+                                entries=[asdict(e) for e in stage.game.ledger.entries],
+                                revision=stage._revision, operator_state=stage._operator_state,
+                                unfinished=stage._unfinished, plot=stage.plot, rules=stage.rules)
+                            original_delta = arguments.get("on_delta")
+                            if callable(original_delta):
+                                def observed_delta(text):
+                                    original_delta(text)
+                                    capture("delivery", phase="stream", status="sent", text=text)
+                                bound.arguments["on_delta"] = observed_delta
                         log.info("command start | trace=%s channel=%s method=%s revision=%d supervision=%s budget=%d",
                                  turn.trace_id, self.channel_id, fn.__name__, self._revision,
                                  self.agent_config.enabled, turn.limit)
-                        outcome = await fn(stage, *args, **kwargs)
+                        outcome = await fn(*bound.args, **bound.kwargs)
+                        if stage._attempt and not stage._hint_checked:
+                            stage._add_stall_hint(outcome[0])
+                            stage._save(narration_only=True)
                         # Also retain failures/clarifications that produce no game turn.
                         if len(turn.records) > stage._audit_cursor:
                             stage._save(narration_only=True)
                         log.info("command end | trace=%s channel=%s method=%s revision=%d calls=%d/%d",
                                  turn.trace_id, self.channel_id, fn.__name__, stage._revision,
                                  turn.calls, turn.limit)
+                        capture("command_end", result=outcome, calls=turn.calls, limit=turn.limit,
+                                revision=stage._revision)
                         return outcome
                 except StorageError:
                     log.exception("campaign save failed | channel=%s", self.channel_id)
@@ -150,6 +179,7 @@ class V4Service:
         self.agent_config = agent_config or (gateway.config if gateway else legacy_config(
             llm_url, digest_model, narr_model, digest_think, narr_think, director_evaluate))
         self.gateway = gateway or ModelGateway(self.agent_config)
+        self.debug_capture = DebugCapture(data_dir, self.agent_config)
         self.digestor = Digestor(gateway=self.gateway)
         self.narrator = Narrator(gateway=self.gateway)
         self.director = DirectorLLM(gateway=self.gateway)
@@ -218,6 +248,10 @@ class V4Service:
             self._audit_cursor = len(turn.records)
             turn.revision = revision
         self._committed = True
+        if self.debug_capture.enabled:
+            capture("commit", revision=revision, snapshot=self._snapshot(),
+                    events=[asdict(e) for e in self.game.ledger.entries],
+                    unfinished=self._unfinished, operator_state=self._operator_state)
         owner = getattr(self, "_owner", self)
         owner.game = published_game
         owner.plot_state = published_plot
@@ -307,6 +341,9 @@ class V4Service:
         reason = self._authorize(probe, user_id, admin_actor)
         if reason:
             return self._deny(probe.actor, reason)
+        if self.agent_config.routing.enabled:
+            self._attempt = {"before": progress_key(g, self.plot_state),
+                             "eligible": not g.combat.active, "wants_help": bool(_HELP_RE.search(t))}
         if not structured:
             clarification = robbery_clarification(t, list(g.party),
                 [n["name"] for n in g.world.here.npcs])
@@ -317,14 +354,18 @@ class V4Service:
             it = Intent(action="chat", utterance=t.lstrip("(/ "), raw=t)
         else:
             it = parse_command(t, party_names=list(g.party)) if structured else None
-            if self.agent_config.enabled and (not structured or (it and it.action in ("move", "search"))):
+            if self.agent_config.enabled and (not structured or (it and it.action in ("move", "search")
+                                                                    and not self.agent_config.routing.enabled)):
                 parsed = it if structured else parse_command(t, party_names=list(g.party))
                 if self.pending and self.pending_user_id != str(user_id):
                     return self._deny(probe.actor, "請先等提出行動的玩家確認待決行動。")
-                self._supervised = await self._main_agent().interpret(
+                controller = self._main_agent()
+                interpret = controller.interpret_routed if self.agent_config.routing.enabled and not structured else controller.interpret
+                self._supervised = await interpret(
                     clone_game(g), self._revision, t, parsed, user_id=user_id,
                     admin_actor=admin_actor, rules=deepcopy(self.rules),
-                    plot_state=deepcopy(self.plot_state), locked_intent=structured)
+                    plot_state=deepcopy(self.plot_state),
+                    **({"locked_intent": structured} if interpret == controller.interpret else {}))
                 it = self._supervised.intent
             elif it is None and not structured:
                 it = await self.digestor.digest(
@@ -417,8 +458,25 @@ class V4Service:
         log.info("action denied | trace=%s reason=%s",
                  turn.trace_id if turn else "-", self.gateway.diagnostic(reason))
         self.game.ledger.add(actor or "?", "deny", f"拒絕：{reason}", reason=reason)
+        lines = [f"🚫 {reason}"]
+        self._add_stall_hint(lines)
         self._save()
-        return [f"🚫 {reason}"], ""
+        return lines, ""
+
+    def _add_stall_hint(self, lines, it=None):
+        if not getattr(self, "_attempt", None) or getattr(self, "_hint_checked", False):
+            return
+        self._hint_checked = True
+        attempt = self._attempt
+        eligible = attempt["eligible"] and (it is None or it.action not in ("rest", "meta", "chat", "observe"))
+        hint = track_attempt(self._operator_state, self.game, self.agent_config.hints,
+                             before=attempt["before"], plot=self.plot_state, eligible=eligible,
+                             wants_help=attempt["wants_help"] or bool(it and it.wants_help))
+        if hint:
+            lines.append(hint)
+            self._latest_hint = hint
+            if self._unfinished:
+                self._unfinished["stall_hint"] = hint
 
     @serialized()
     async def confirm(self, user_id: str = "", on_delta=None, on_resolved=None,
@@ -479,6 +537,12 @@ class V4Service:
             return [f"❓ 我理解你要：{it.actor} {it.action} {it.target or it.destination or it.item}——用 `/confirm` 執行。"], ""
         baseline = clone_game(g)
         idx0 = len(g.ledger.entries)
+        if "improvisation" in it.args:
+            from .improvisation import verify_improvisation
+            approved = self._supervised and self._supervised.improvisation == it.args["improvisation"]
+            invalid = verify_improvisation(g, it.args["improvisation"], revision=self._revision)
+            if not approved or invalid:
+                return self._deny(it.actor, "花招尚未通過當前回合的審核。")
         if not reason:
             if self.agent_config.enabled:
                 self._apply_supervised_proposal(it)
@@ -525,6 +589,9 @@ class V4Service:
                        and len(g.ledger.entries) > idx0)
         if r.lines:
             self._unfinished = self._narration_job(idx0, player_input, it.wants_help) if narrate else None
+            if self._unfinished and it.narrative:
+                self._unfinished["narrative"] = it.narrative
+        self._add_stall_hint(r.lines, it)
         self._queue_progress(idx0, baseline, accepted=r.accepted and r.confirm is None,
                              wants_help=it.wants_help or bool(_HELP_RE.search(text)),
                              gameplay=it.action not in ("meta", "chat"))
@@ -681,7 +748,9 @@ class V4Service:
         try:
             if on_resolved and lines:
                 await on_resolved(lines)
+                capture("delivery", phase="verdict", status="sent", text=lines)
         except Exception:
+            capture("delivery", phase="verdict", status="failed")
             log.exception("verdict delivery failed; campaign is committed")
             return lines, ""
         narration = ""
@@ -971,6 +1040,12 @@ class V4Service:
         help_bits = []
         if self._guidance():
             help_bits.append(self._guidance())
+        if (self._unfinished or {}).get("stall_hint"):
+            help_bits.append(self._unfinished["stall_hint"])
+        if (self._unfinished or {}).get("narrative"):
+            help_bits.append("玩家創意摘要只描述嘗試，不是成功事實。請呼應其中細節，"
+                             "維持世界的黑暗基調，可帶機智與黑色幽默；後果必須符合引擎事實："
+                             + json.dumps(self._unfinished["narrative"], ensure_ascii=False))
         reveals = [e for e in events
                    if e.kind == "reveal"]
         if reveals and npc_name:
@@ -1115,6 +1190,8 @@ class V4Service:
             die = g.d20()
         idx0 = len(g.ledger.entries)
         baseline = clone_game(g)
+        if self.agent_config.routing.enabled:
+            self._attempt = {"before": progress_key(g, self.plot_state), "eligible": False, "wants_help": False}
         ok, line = resolve_pending_check(g, die)
         lines = [f"🎲 **{pend['actor']}** d20 → **{die}**"]
         if line:
@@ -1124,6 +1201,9 @@ class V4Service:
         verdict = f"{pend['actor']} 擲骰 d20={die}：{'成功' if ok else '失敗'}"
         player_input = f"{pend.get('origin', '')}（{verdict}）"
         self._unfinished = self._narration_job(idx0, player_input, bool(pend.get("help")))
+        if pend.get("narrative"):
+            self._unfinished["narrative"] = pend["narrative"]
+        self._add_stall_hint(lines)
         self._queue_progress(idx0, baseline, wants_help=bool(pend.get("help")))
         self._save()
         return await self._deliver(lines, idx0, player_input, on_delta, on_resolved,

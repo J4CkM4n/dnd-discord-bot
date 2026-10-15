@@ -1,157 +1,189 @@
-# D&D DM Bot — Architecture (v6)
+# D&D DM Bot — System One architecture (snapshot v8)
+
+The world remains **黑暗海洋奇幻**: oppressive fog, ancient threats, real costs,
+and occasional dark wit. Player creativity shapes the attempted method and the
+narration; the engine determines what actually happens. `gamerules.json` is the
+source of truth for tone and canon.
 
 ```mermaid
-graph TB
-    subgraph "Discord Channel"
-        P[Player<br/>/explore /attack /use /skill<br/>/defend /flee /observe /roll /rules]
-        TP[Table Talk<br/>plain text - ignored]
-    end
-
-    subgraph "Adapter Layer"
-        AD[discord_bot.py<br/>26 commands<br/>typed combat family + admin]
-    end
-
-    subgraph "LLM Periphery 30%"
-        DG[Digestor<br/>qwen2.5:7b<br/>text → Intent JSON]
-        NR["Narrator<br/>qwen3.5:35b · think off<br/>skeletons → streamed prose"]
-        DR[Director<br/>qwen2.5:7b<br/>unplanned scenes/items → typed JSON]
-    end
-
-    subgraph "Game Engine 70%"
-        RC[rules_core.py<br/>validate + resolve<br/>ONLY write path]
-        TU[turn.py<br/>Game state<br/>party · combat · inventory]
-        WO[world.py<br/>Scene graph<br/>NPCs + knows + encounters]
-        LD[Ledger<br/>append-only facts<br/>stable event IDs]
-    end
-
-    subgraph "Shared Math no LLM"
-        CL[charlib.py<br/>AC · PB · slots]
-        DC[dice.py<br/>roll expressions]
-        CK[checks.py<br/>total modifiers]
-        MV[moves.py<br/>class move tables]
-    end
-
-    subgraph "Guards v3 lessons"
-        G1[Placeholder names<br/>PC1 PC2 mapping]
-        G2[Fake-dice scrub<br/>regex families]
-        G3[Repetition guard<br/>SequenceMatcher]
-        G4[s2t + language check<br/>Traditional Chinese]
-        G5[Input sanitization<br/>injection defense]
-        G6[Ownership check<br/>user_id → owner_id]
-    end
-
-    subgraph "Output"
-        TM[templates.py<br/>prose skeletons<br/>deterministic]
-        HP[health_board.py<br/>debug portal<br/>log stream]
-    end
-
-    P -->|slash command| AD
-    TP -->|plain text| AD
-    AD -->|freeform text| DG
-    AD -->|typed family<br/>structured intent| RC
-    DG -->|Intent JSON| RC
-
-    RC --> TU
-    RC --> WO
-    RC -->|facts| LD
-
-    TU --> CL
-    TU --> MV
-    RC --> DC
-    RC --> CK
-
-    RC -->|before narrator| G1
-    RC -->|before narrator| G5
-    RC -->|before narrator| G6
-    LD -->|skeleton hints| TM
-    TM -->|with guards| NR
-    NR -->|after| G2
-    NR -->|after| G3
-    NR -->|after| G4
-    NR -->|prose| AD
-    TM -->|fallback prose| AD
-
-    LD -->|new entries| HP
-
-    style RC fill:#4a9,color:#fff
-    style TU fill:#4a9,color:#fff
-    style WO fill:#4a9,color:#fff
-    style LD fill:#4a9,color:#fff
-    style DG fill:#f84,color:#fff
-    style NR fill:#f84,color:#fff
+flowchart TD
+    Player[Freeform action] --> Service[Service: ownership and serialized staging]
+    Service --> Router[System One: Jev or LLM router]
+    Router --> Clear{Clear supported action?}
+    Clear -->|yes| Intent[Validated intent and narrative brief]
+    Clear -->|no| Action[Action specialist]
+    Action --> Intent
+    Intent --> Novel{Needs new content or effects?}
+    Novel -->|yes| Director[Director proposal]
+    Director --> Evaluator[Evaluator review]
+    Evaluator --> Main[Main agent approval]
+    Main --> Engine[Engine: revalidate and resolve]
+    Novel -->|no| Engine
+    Typed[Typed commands] --> Service
+    Service -->|typed intent| Engine
+    Engine --> Hints[Track progress and public stall hints]
+    Hints --> Commit[SQLite transaction: snapshot, events, audits, narration job]
+    Commit --> Verdict[Deliver engine verdict]
+    Verdict --> Progress[Scheduled progress specialist and main review]
+    Progress --> Narrator[Narrator: committed facts and player details]
+    Narrator --> Output[Guarded Traditional Chinese prose]
+    Service -. opt-in .-> Capture[Local debug JSONL]
+    Router -.-> Capture
+    Narrator -.-> Capture
+    Capture --> Offline[Export, evaluate, isolated replay]
 ```
 
-## Turn Flow Detail
+## Routing and specialists
 
-```mermaid
-sequenceDiagram
-    participant P as Player
-    participant A as Adapter
-    participant D as Digestor 12b
-    participant E as Engine
-    participant L as Ledger
-    participant T as Templates
-    participant N as Narrator 27b
-    participant C as Channel
+`MainAgent.interpret_routed` orchestrates the bounded workflow. Specialists return
+data; they cannot delegate to one another, access the service, write game state,
+or send messages. The `main` model reviews proposals and progress guidance;
+routine existing actions need no main-model call.
 
-    P->>A: /explore 我搜索甲板
-    A->>C: 🎭 PlayerName 我搜索甲板
-    A->>D: digest text
-
-    D->>E: Intent{action:search, actor:PC}
-    Note over E: guards: ownership,<br/>input sanitization
-    E->>E: WIS check d20+mod
-    E->>L: append check fact
-    E->>T: render skeleton
-
-    alt LLM available
-        T->>N: skeleton + facts + NPC knows
-        N->>N: guards: scrub dice,<br/>repetition, s2t
-        N->>C: 📖 prose 80-160字
-    else LLM down
-        T->>C: skeleton as prose
-    end
-
-    E->>C: 🎲 check result (instant)
-```
-
-## Data Flow
-
-```mermaid
-graph LR
-    subgraph "State"
-        V4S[campaigns.db<br/>per-channel snapshots · events<br/>director decisions · narration status]
-        RDB[rules.db<br/>2918 SRD chunks]
-    end
-
-    subgraph "Engine"
-        GAME[Game object<br/>in-memory]
-    end
-
-    GAME -->|atomic commit before verdict and narration| V4S
-    V4S -->|load on restart| GAME
-    RDB -->|SRD lookup| GAME
-
-    subgraph "Debug Portal"
-        HB[health_board.py]
-    end
-
-    V4S -->|new ledger entries| HB
-    GAME -->|combat status| HB
-```
-
-## Key Design Decisions
-
-| Decision | Why |
+| Component | Responsibility |
 |---|---|
-| Engine has the only write path | LLM cannot cheat — no attack surface |
-| Ledger is append-only | Full audit trail; complete snapshots provide recovery |
-| Narrator gets skeletons | Fewer tokens to generate, smaller hallucination surface |
-| NPC `knows` + `disclosed` lists | Narrator cannot invent quest content; the engine drips one NEW fact per successful exchange and players see their intel progress (`/status`, 已問出 x/y) |
-| Help detection = digestor field (`wants_help`) | Intent reading by meaning is the LLM's job; keyword regex only backstops the no-LLM fallback |
-| Narrator voices the engine's pick | A `reveal` fact must be spoken verbatim in dialogue — information flow stays engine-owned |
-| Plain text = table talk | No accidental DM triggers from chatter |
-| Typed combat family (structured intent) | Zero ambiguity, per-action autocomplete |
-| Per-round action slots | Discord is not a table — nobody waits |
-| Director LLM proposes, engine canonizes | Unplanned places/finds without breaking state ownership |
-| Selftest with seed | Byte-identical replays for regression |
+| `DecisionGateway` / `router` | Batched category, target, destination, ambiguity, detail, improvisation, help, and compound-action decisions |
+| `action` | Interpret open-ended methods, references, arguments, and uncertain routes |
+| Deterministic memory | Retrieve bounded engine facts with event references |
+| `director` | Propose adjacent scenes, inert props, or bounded improvisation |
+| `evaluator` | Review player intent, canon, coherence, and costs |
+| `main` | Approve proposals and select evidence-based guidance |
+| `progress` | Assess public objectives, repetition, and options after commit |
+| `narrator` | Describe committed results while responding to player details |
+
+Native **TypeSafe Jev**, a System One decision model, is separate from the older
+**Judge–Evaluate–Verify** director workflow. Jev never determines dice outcomes
+or mechanical legality. `/v1/systemone` receives batched typed choice questions.
+Answers must include exactly the known options, finite probability distributions
+summing to one, and a selected maximum. Missing confidence disables the direct path.
+
+The direct path requires probability ≥ 0.85 and confidence ≥ 0.8 for all relevant
+decisions by default. It conservatively supports attack, move, search, observe,
+defend, escape, rest, and pass. Existing destinations and targets must agree with
+deterministic parsing when available. Attack details needing method interpretation
+go through the action specialist.
+
+Without a TypeSafe key, or after one failed native request, `roles.router` uses
+the configured LLM. Its self-reported confidence is uncalibrated: direct routing
+additionally requires a complete deterministic parse. Both requests consume the
+shared budget. There are no retries. If interpretation also fails, only complete
+deterministic actions proceed; unresolved or compound requests require clarification.
+
+Both `backend="auto"` and `backend="jev"` prefer native Jev with a configured key
+and retain LLM fallback. `backend="llm"` always selects the LLM router. Typed
+commands bypass routing and action supervision; milestone progress review and
+narration can still call models.
+
+## Player details and new mechanics
+
+`NarrativeBrief` stores original words, attempted action, and creative details
+separately from canonical facts. It travels with the saved narration job and
+pending check, so `/roll` and `/continue` preserve the original idea. The narrator
+is told this describes an attempt; only engine facts establish success and costs.
+
+Ordinary actions retain ordinary engine resolution. Novel mechanics require a
+director proposal, schema checks, evaluator approval, main approval, and engine
+verification against the current revision. Each improvisation uses one of the 18
+canonical skills and an engine-owned DC: easy 10, moderate 14, or hard 18. Models
+cannot supply numeric damage, DCs, quantities, or executable effects.
+
+| Effect | Engine constraint |
+|---|---|
+| `damage` | Living current enemy; `1d4`; existing death, loot, and XP handlers |
+| `heal` | Party member; owned 治療藥水 consumed; `2d4+2` |
+| `advantage` | Next attack against the selected enemy gains advantage |
+| `cover` | Attacks against the party target have disadvantage until that member next acts |
+| `npc_reaction` | Present NPC disposition moves one step; success softens, failure increases suspicion |
+| `prop` | Existing inert-item verifier; no valuable or mechanically significant items |
+| `scene` | Existing scene verifier; adjacent route, no movement or combat escape |
+| `reward` | `salvage` = one 繩索; once per scene across the whole party |
+
+Plans allow at most two success effects, one failure reaction, two distinct
+owned-item costs, and one major effect (damage, healing, reward, or scene).
+Costs are paid when the attempt begins. Exploration checks can wait for `/roll`;
+combat checks resolve immediately and consume the normal action slot. Saved plans
+are revalidated on settlement; changed scene, targets, or reward availability
+cancel effects. Pending checks clear after settlement, preventing repeat effects.
+
+New scene extensions and generated search props also receive evaluator and main
+approval in routed mode. Rejected scene extensions leave the world unchanged.
+A rejected optional search prop can still leave an ordinary search available
+under the existing engine rules.
+
+## Budgets and hints
+
+Ordinary commands use `[supervision].max_calls` (default 6, configurable 4–6).
+Creative proposals and scene extensions use `[routing].creative_max_calls`
+(default 8, configurable 6–8). Failures, fallback, reviews, progress, and narration
+all count. Required reviews and narration reserve slots; progress can defer to a
+later command or `/continue`. Main-model calls remain limited to three per command.
+
+Stall detection compares meaningful state changes rather than turn numbers or
+prose. Rejected attempts count. Rest, observation, meta/table talk, and combat
+rounds do not count as stalled exploration. A `/roll` that changes state resets
+the counter without counting an extra attempt.
+
+Guidance appears after three stalled attempts, with a three-attempt cooldown by
+default. Explicit help bypasses cooldown. Counters persist in `operator_state`;
+guidance is saved in the narration job. Hints use pending-roll instructions,
+existing exits, visible NPCs, and typed combat options, without revealing hidden
+items, private knowledge, or future plot beats.
+
+## State and transactions
+
+`service.py` serializes each channel command and stages private copies. The
+engine rechecks ownership, eligibility, combat slots, resources, and proposal
+preconditions at execution. One SQLite transaction commits the snapshot, new
+ledger events, director decisions, operator audit, and narration job before
+verdict delivery. Failed writes publish no staged state.
+
+Progress review and narration follow gameplay commit. Output/model failures
+leave durable continuations; restart or `/continue` resumes prose without
+rerouting or resolving the action. Audit reports are separate from canonical
+facts. Narration and rejected proposals do not become factual memory.
+
+Snapshot v8 adds the persisted, party-shared improvisation reward allowance.
+The codec still loads v4–v7 snapshots, pending checks, and confirmations.
+Database schema v2 is unchanged. `DATA_DIR/campaigns.db` remains authoritative;
+legacy JSON files remain read-only migration checkpoints.
+
+`[routing].enabled=false` restores the previous supervised workflow in this
+version. `[supervision].enabled=false` selects the legacy direct workflow.
+Configurations without a routing table retain their previous behavior. Disabling
+routing does not downgrade v8 saves for an older binary; preserve a database
+backup before deploying.
+
+`agents.example.toml` is the public configuration template. Copy it to the
+gitignored `agents.toml` for local settings. Credentials belong in environment
+variables or the ignored `.env`; TOML references their names with `api_key_env`.
+
+## Debug capture and offline evaluation
+
+`LOG_LEVEL=DEBUG` enables bounded operational diagnostics. Separately,
+`AI_DEBUG_CAPTURE=full` enables local traces under `DATA_DIR/debug`, off by default.
+They record arguments, pre-state, nonsecret configuration, model request bodies
+and content responses, choices/probabilities, validation failures, commits,
+delivered text, final output, usage, and latency. HTTP headers and provider
+reasoning are excluded. Known keys and the Discord token are redacted before JSON
+serialization.
+
+Local artifacts include player text, identifiers, and internal campaign state,
+including hidden facts needed for replay. They are separate from native Jev's
+public payload. Files rotate at 25 MiB, with seven-day retention and a 250 MiB
+cap enforced on writes. File creation requests mode 0600; Windows ACLs still
+govern access. Capture I/O failures do not interrupt gameplay. Oversized or
+interrupted traces can be incomplete and are rejected for replay.
+
+`core.trace_eval` exports JSONL, computes routing/call/latency/clarification metrics,
+incorporates human labels, and replays responses using `httpx.MockTransport` in a
+temporary SQLite database. It compares request bodies, output, snapshots, and
+recorded call consumption without live provider requests or campaign writes.
+Redaction can prevent exact replay; mismatches remain visible. See
+[AI evaluation](docs/ai-evaluation.md) for commands and improvement priorities.
+
+Native Jev receives only bounded player action text (1,500 characters), public
+scene description (500), visible targets, existing exits, and a recent public
+NPC exchange (500). Account IDs, inventory, hidden items, private knowledge,
+unpublished plot, and campaign snapshots are excluded. Native routing runs only
+when enabled and a TypeSafe key is configured. Other LLM specialists use their
+configured providers and role-specific context.
