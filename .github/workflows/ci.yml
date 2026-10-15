@@ -13,3 +13,23 @@ jobs:
       - run: pip install -r requirements.txt pytest
       - run: python -m pytest tests/ -q
       - run: python core/cli.py selftest
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cp .env.example .env
+      - run: docker compose config --quiet
+      - run: docker compose build
+      - run: docker compose run --rm --no-deps bot python core/cli.py selftest
+      - name: Check config loading and persistent volume permissions
+        run: |
+          docker compose run --rm --no-deps bot python -c '
+          import os
+          from core.agent_config import load_agent_config
+          from core.service import V4Service
+          config = load_agent_config()
+          service = V4Service(os.environ["DATA_DIR"], channel_id="docker-smoke", agent_config=config)
+          assert service.repository.load("docker-smoke") is not None
+          assert os.getuid() == 10001
+          '

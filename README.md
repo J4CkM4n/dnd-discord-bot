@@ -47,6 +47,62 @@ python core/cli.py selftest
 python core/cli.py
 ```
 
+## Docker Compose
+
+Requires Docker Engine with Compose v2 (or Docker Desktop). Create `.env` and
+fill in `DISCORD_TOKEN` and `V4_CHANNEL_IDS`, then edit `agents.toml` for your
+models and providers:
+
+```bash
+cp .env.example .env
+docker compose up -d --build
+docker compose logs -f bot
+```
+
+The bot runs as UID/GID `10001:10001` and needs no published ports. Credentials
+are read from `.env` at runtime and excluded from the image. Any variable named
+by `api_key_env` in `agents.toml` must also be present in `.env`.
+
+Compose mounts `agents.toml`, `gamerules.json`, and `plot.json` read-only. An
+`AGENT_CONFIG` path in `.env` selects an alternative host TOML file to mount;
+the container always reads it at `/app/agents.toml`. After changing mounted
+configuration, run `docker compose restart bot`. After changing `.env`, run
+`docker compose up -d --force-recreate bot` to reload the environment.
+
+For local Ollama, Compose defaults to `http://host.docker.internal:11434`,
+including a host-gateway mapping for Linux. The host's model server must listen
+on an interface reachable from containers; Linux Ollama installations may need
+`OLLAMA_HOST=0.0.0.0:11434`. For a remote Ollama server, set `DOCKER_LLM_URL` in
+`.env`. An explicit provider `base_url` in `agents.toml` overrides this value;
+use a URL reachable from inside the container. OpenAI-compatible providers use
+their configured URL and credentials in the same way as a normal installation.
+Model servers and model downloads are managed separately from this Compose file.
+
+Campaign SQLite files and per-channel overrides persist in the `campaign-data`
+named volume at `/app/data`; Compose overrides `DATA_DIR` to that path. The
+host's `./data` directory is not mounted automatically. To migrate existing
+data into a **fresh volume before the first start**, stop the existing bot and
+prepare a consistent copy of its data (including SQLite WAL files when present),
+then run:
+
+```bash
+docker compose build
+docker compose run --rm --no-deps --user 0 \
+  --volume "$PWD/data:/import:ro" bot \
+  sh -c 'cp -a /import/. /app/data/ && chown -R 10001:10001 /app/data'
+docker compose up -d
+```
+
+This also imports an existing `rules.db` for `/rules` and legacy JSON saves.
+Keep one running bot per campaign database. `docker compose down` preserves
+the volume; `docker compose down -v` deletes its campaign data.
+
+Run the engine self-test inside the image without logging in to Discord:
+
+```bash
+docker compose run --rm --no-deps bot python core/cli.py selftest
+```
+
 ## Commands (26: 16 player + 10 admin)
 
 | Player | Admin |

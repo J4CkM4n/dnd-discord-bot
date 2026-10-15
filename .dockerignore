@@ -1,0 +1,36 @@
+# Credentials, local state, and repository metadata stay outside the image.
+.git
+.github
+.env
+.env.*
+**/.env
+**/.env.*
+keys
+data
+deploy
+.agents
+.codex
+.aws
+.codebase-memory
+
+# Development environments, caches, tests, and archived implementations.
+.venv
+venv
+env
+**/__pycache__
+**/*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+tests
+legacy
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/*.bak
+**/*.tgz
+**/*.pem
+**/*.key
+.DS_Store

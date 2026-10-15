@@ -1,0 +1,42 @@
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: dnd-discord-bot:local
+    init: true
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /app/data
+      AGENT_CONFIG: /app/agents.toml
+      # Container loopback is not the host. Override for a remote model server.
+      LLM_URL: ${DOCKER_LLM_URL:-http://host.docker.internal:11434}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - campaign-data:/app/data
+      - type: bind
+        source: ${AGENT_CONFIG:-./agents.toml}
+        target: /app/agents.toml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./gamerules.json
+        target: /app/gamerules.json
+        read_only: true
+      - type: bind
+        source: ./plot.json
+        target: /app/plot.json
+        read_only: true
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  campaign-data:
