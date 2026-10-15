@@ -349,7 +349,12 @@ Discord token, channel IDs, and `DATA_DIR` remain environment settings.
 
 The main model selects a bounded set of action, memory, and director operators,
 then reviews their reports. It can accept an existing intent or request
-clarification; it cannot invent a mechanical result. Operators cannot call one
+clarification; it cannot invent a mechanical result. For a clear movement intent
+whose destination has no exit yet, the controller also schedules a Director/JEV
+repair before final review, even if the initial plan omitted the Director.
+When the action operator misses a movement intent, the main agent can delegate
+one Director repair that returns a proposed intent and scene for review.
+Operators cannot call one
 another, write campaign state, or send Discord messages. The service hosts the
 controller and enforces ownership, confirmation, legality, and final verification.
 
@@ -389,11 +394,25 @@ The model proposes one scene or inert item; the engine validates its types,
 limits, uniqueness, and item restrictions before staging it with the action.
 Rejected actions leave no generated world objects behind.
 
+In supervised games, **new routes and movement repairs always require JEV**
+using the configured `evaluator` role, followed by main-agent approval and
+engine verification. The evaluator checks the original intent, current location,
+known places, obstacles, canon, and campaign memory. An unlisted destination is a
+story gap to examine rather than an automatic request to rephrase.
+For example, `/explore 登上船長的船` can propose a moored ship's deck connected
+back to the dock, then move there only after all three checks approve it. It
+does not grant the ship, move the captain, or sail away. Existing exits are reused.
+Combat, pending checks, ownership, low-confidence confirmation, and scene limits
+still apply. Rejected repairs explain the blocked step and retain an audit
+decision; they do not advance the turn or plot. Insufficient call budgets defer
+the repair without creating an unjudged scene. There is at most one repair per
+command, within the six-call limit; progress review can wait for a later turn.
+
 Set `[supervision].director_evaluate = true` (or legacy
-`V4_DIRECTOR_EVALUATE=on`) to add one advisory model call checking relevance
-and consistency against canon, current state, and campaign history. It uses the
-configured `evaluator` role. Default: `off`. Invalid, unavailable,
-or negative evaluations reject the proposal; no retries occur. Existing
+`V4_DIRECTOR_EVALUATE=on`) to also evaluate ordinary item proposals; this optional
+setting defaults to `off`. It also controls evaluation in the legacy direct
+flow. Invalid, unavailable, or negative evaluations reject the proposal; no
+retries occur. Existing
 deterministic gameplay remains available. This is a decision workflow, not a
 trained new model; narrative consistency judgments remain fallible.
 

@@ -57,6 +57,10 @@ _DUEL_PATTERNS = (
 _DUEL_QUALIFIER = re.compile(
     r"不|沒|没|唔|別|别|拒絕|拒绝|如果|假如|是否|[?？]|"
     r"練習|练习|切磋|模擬|模拟|友誼|友谊|非致命|點到為止|点到为止")
+_ENTRY_MOVE = re.compile(
+    r"^(?:登上|走上|進入|进入|走進|走进|踏入|爬上|climb aboard\b|board\b|enter\b)"
+    r"\s*(?P<destination>[^，。！？,;；]+?)[。！!]*$", re.I)
+_ENTRY_QUALIFIER = re.compile(r"不|沒|没|唔|別|别|如果|假如|是否|[?？]|然後|然后|並|\b(?:and|then|if)\b", re.I)
 
 
 @dataclass
@@ -137,6 +141,9 @@ def parse_command(text: str, party_names=()) -> Intent | None:
         return None
     if _ROBBERY.match(t):
         return None  # In particular, 打劫 must never match the attack verb 打.
+    entry = _ENTRY_MOVE.fullmatch(t) if not _ENTRY_QUALIFIER.search(t) else None
+    if entry:
+        return Intent("move", actor=actor, destination=entry["destination"].strip(), raw=text)
     if not _DUEL_QUALIFIER.search(t):
         for pattern in _DUEL_PATTERNS:
             duel = pattern.fullmatch(t)

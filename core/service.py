@@ -334,6 +334,10 @@ class V4Service:
             if structured and it is not None:
                 it.confidence = 1.0
         if it is None:
+            if self._supervised and self._supervised.director_decision:
+                self._decisions.append(asdict(self._supervised.director_decision))
+            if self._supervised and self._supervised.feedback:
+                return [self._supervised.feedback], ""
             return [self._interpretation_help(probe)], ""
         if it.action == "talk" and not it.utterance:
             it.utterance = (it.raw or "")[:120]
@@ -438,7 +442,9 @@ class V4Service:
                 admin_actor=admin_actor, rules=deepcopy(self.rules),
                 plot_state=deepcopy(self.plot_state), locked_intent=True)
             if self._supervised.intent is None:
-                return ["❓ 請再描述你想確認的行動。"], ""
+                if self._supervised.director_decision:
+                    self._decisions.append(asdict(self._supervised.director_decision))
+                return [self._supervised.feedback or "❓ 請再描述你想確認的行動。"], ""
         return await self._execute(it, user_id, admin_actor, it.raw, on_delta, on_resolved)
 
     async def _execute(self, it, user_id, admin_actor, text, on_delta, on_resolved):
@@ -533,6 +539,7 @@ class V4Service:
         decision, proposal = result.director_decision, result.proposal
         if proposal:
             reason = ("stale_revision" if result.source_revision != self._revision else
+                      "evaluation_required" if proposal.kind == "scene" and decision.evaluation != "approved" else
                       verify_proposal(self.game, proposal) or validate(self.game, it, allow_unplanned_move=True))
             if reason:
                 decision.reasons.append(reason)

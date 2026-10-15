@@ -73,6 +73,12 @@ class ActionDecision:
     source_revision: int
     proposal: DirectorProposal | None = None
     director_decision: DirectorDecision | None = None
+    feedback: str = ""
+
+
+def unplanned_move(g, intent):
+    return bool(intent and intent.action == "move" and intent.destination
+                and not g.world.find_exit(intent.destination))
 
 
 def public_options(g):
@@ -153,7 +159,10 @@ class MainAgent:
                     '你是主代理，控制所有操作員。選擇本回合要諮詢的操作員，只輸出 '
                     '{"consult":["action","memory","director"]}。可選任意子集，每個最多一次。'
                     '沒有可靠 parsed 意圖時必須選 action；memory 是免費確定性檢索。'
-                    'director 僅在需要未規劃場景或普通搜索道具時選用。'
+                    'director 可修復明確但尚未建模的行動，例如登上碼頭旁船長的船，'
+                    '或補充未規劃場景和普通搜索道具。缺少出口不是要求玩家重述的理由。'
+                    '移動意圖未被 action 正確解析時可同時選 action 和 director；'
+                    '導演提出修復後仍須 JEV 與你的最後批准。'
                     '操作員不能互相呼叫。進度在引擎提交後審查；你不能改寫規則或創造遊戲結果。',
                     {"player_input": text, "parsed": asdict(parsed) if parsed else None,
                      "current": json.loads(build_memory(g).current), "remaining_calls": current_turn().remaining,
@@ -185,23 +194,41 @@ class MainAgent:
                     if it:
                         candidates["action"] = it
                 selected = candidates.get("action", candidates.get("parsed"))
-                if "director" in requested and selected:
+                # A clear spatial gap always gets a bounded repair attempt,
+                # even when the initial model plan omitted the director.
+                spatial = next((v for v in (selected, parsed) if unplanned_move(g, v)), None)
+                selected_for_proposal = spatial or selected
+                if selected_for_proposal and (spatial or "director" in requested) \
+                        and selected_for_proposal.action in ("move", "search"):
                     # Authorize/validate before spending any generation calls.
-                    preflight = review_candidate(g, selected, user_id, admin_actor)
-                    checked = deepcopy(selected)
+                    preflight = review_candidate(g, selected_for_proposal, user_id, admin_actor)
+                    checked = deepcopy(selected_for_proposal)
                     checked.actor = preflight["actor"]
                     if preflight["authorized"] and not preflight["needs_confirmation"] \
                             and not preflight["reason"] and not getattr(g, "_pending_check", None):
                         proposal, decision = await self.propose(g, checked, rules or {}, plot_state or {})
-                        proposed_intent = selected
+                        proposed_intent = selected_for_proposal
                         reports["director"] = report("director", revision, asdict(decision) if decision else None,
                                                      gateway=self.gateway)
+                elif "director" in requested and not locked_intent:
+                    checked = Intent("move", actor=actor, raw=text)
+                    preflight = review_candidate(g, checked, user_id, admin_actor)
+                    if preflight["authorized"] and not preflight["reason"]:
+                        repaired, proposal, decision = await self.repair_move(
+                            g, checked, rules or {}, plot_state or {})
+                        if repaired:
+                            candidates["repair"] = repaired
+                            proposed_intent = repaired
+                        reports["director"] = report("director", revision, asdict(decision), gateway=self.gateway)
             with reserve_calls(1):
                 final = await self._main(
                     '審核操作員報告並決定。只輸出 {"decision":"execute"或"clarify",'
-                    '"intent":"parsed"或"action","director":false}。只能選已提供的意圖。'
+                    '"intent":"parsed"或"action"或"repair","director":false}。只能選已提供的意圖。'
                     'director=true 表示批准已通過驗證的提案。衝突或不確定時 clarify；不能自行改寫意圖。'
                     'current 與 checks 是引擎提供的當前場景與預檢，不代表行動已成功。'
+                    '明確的移動若只是缺少出口，先審核導演修復和 JEV 結果。'
+                    'JEV approved 且修復保留玩家意願時，可選對應意圖並 director=true 以繼續。'
+                    '這只准許嘗試該行動，不准宣稱取得物品、所有權或其他額外結果。'
                     '明確指定場上目標的決鬥／單挑是 attack；普通攻擊有預設招式，'
                     '不必追問武器或方法。意圖清楚時選 execute，讓引擎處理規則與結果。'
                     'action 報告無效時，可選擇清楚且通過預檢的 parsed 意圖。'
@@ -223,10 +250,17 @@ class MainAgent:
             if final["decision"] == "execute" and intent is None:
                 raise ModelError("Unknown intent report")
             if not final["director"] or intent is not proposed_intent:
-                proposal = None
-                if decision:
+                if decision and (proposal is not None or intent is not proposed_intent):
                     decision.reasons.append("main_rejected")
+                proposal = None
             report("main", revision, final, gateway=self.gateway)
+            # An LLM's execute cannot bypass a rejected/unavailable JEV gate.
+            if unplanned_move(g, intent) and not proposal:
+                preflight = review_candidate(g, intent, user_id, admin_actor)
+                if preflight["authorized"] and not preflight["reason"] and not preflight["needs_confirmation"]:
+                    return ActionDecision(None, revision, None, decision, self.repair_feedback(decision))
+            if intent is None and decision:
+                return ActionDecision(None, revision, None, decision, self.repair_feedback(decision))
             return ActionDecision(deepcopy(intent), revision, proposal, decision)
         except (ModelError, ValueError, TypeError, KeyError) as exc:
             turn = current_turn()
@@ -236,20 +270,34 @@ class MainAgent:
             report("main", revision, {"fallback": "parsed" if parsed else "clarify"},
                    status="fallback", gateway=self.gateway)
             # A failed supervisor cannot authorize a model-interpreted action.
+            if decision:
+                decision.reasons.append("main_unavailable")
+                return ActionDecision(None, revision, None, decision, self.repair_feedback(decision))
             return fallback
 
     async def propose(self, g, it, rules, plot_state):
         kind = ""
         s = g.world.here
         if it.action == "move" and not g.world.find_exit(it.destination):
-            if g.director_scene_count < MAX_DIRECTOR_SCENES:
-                kind = "scene"
+            kind = "scene"
         elif it.action == "search" and not s.hidden_items and not scan_prop(f"{it.raw} {it.utterance} {it.item}"):
             kind = "item"
         if not kind:
             return None, None
         decision = DirectorDecision(kind, s.id)
-        memory = build_memory(g, it.raw, audience="director", plot_state=plot_state).render()
+        if kind == "scene":
+            decision.reasons.append("story_gap")
+            if g.combat.active:
+                decision.reasons.append("combat_requires_flee")
+                return None, decision
+            if g.director_scene_count >= MAX_DIRECTOR_SCENES:
+                decision.reasons.append("scene_limit")
+                return None, decision
+        required = 2 if kind == "scene" or self.gateway.config.director_evaluate else 1
+        if current_turn().remaining < required + 2:
+            decision.reasons.append("repair_budget_exhausted")
+            return None, decision
+        memory = self.repair_context(g, it.raw, rules, plot_state)
         if kind == "scene":
             content = await self.director.gen_scene(rules.get("tone", "奇幻"), s.name, s.description,
                 it.destination, gamerules_canon=(rules.get("world") or {}).get("canon", []), memory=memory)
@@ -262,15 +310,83 @@ class MainAgent:
         if reason:
             decision.reasons.append(reason)
             return None, decision
-        if self.gateway.config.director_evaluate:
+        # New routes are story repairs: JEV is mandatory even when optional
+        # mundane-item evaluation is disabled in configuration.
+        if kind == "scene" or self.gateway.config.director_evaluate:
             approved, reason = await self.director.evaluate(asdict(proposal),
                 _json(rules) + "\n" + memory, it.raw or it.destination)
             decision.evaluation = "approved" if approved else "rejected"
             decision.reasons.append(reason)
             report("evaluator", current_turn().revision, {"approved": approved, "reason": reason}, gateway=self.gateway)
+            log.info("story repair | trace=%s kind=%s evaluation=%s", current_turn().trace_id, kind, decision.evaluation)
             if not approved:
                 return None, decision
         return proposal, decision
+
+    @staticmethod
+    def repair_context(g, text, rules, plot_state):
+        known_places = [{"id": s.id, "name": s.name, "description": s.description[:120],
+                         "exits": s.exits, "npcs": [n["name"] for n in s.npcs]}
+                        for s in g.world.scenes.values()]
+        return (build_memory(g, text, audience="director", plot_state=plot_state).render()
+                + "\n世界設定與既有場所（不能重新創造或任意移動）：\n"
+                + _json({"rules": rules, "places": known_places, "combat_active": g.combat.active}))
+
+    async def repair_move(self, g, checked, rules, plot_state):
+        """One director repair and one JEV evaluation, then main review."""
+        decision = DirectorDecision("scene", g.world.current, reasons=["story_repair"])
+        if g.combat.active:
+            decision.reasons.append("combat_requires_flee")
+            return None, None, decision
+        if current_turn().remaining < 4:
+            decision.reasons.append("repair_budget_exhausted")
+            return None, None, decision
+        context = self.repair_context(g, checked.raw, rules, plot_state)
+        raw = await self.director.repair_move(context, checked.raw)
+        if raw is None:
+            decision.reasons.append("no_grounded_repair")
+            return None, None, decision
+        intent = Intent("move", actor=checked.actor, destination=raw["destination"].strip(),
+                        raw=checked.raw, confidence=.8)
+        proposal = None
+        decision.proposal = raw["scene"]
+        if unplanned_move(g, intent):
+            proposal = DirectorProposal("scene", g.world.current, raw["scene"])
+            reason = verify_proposal(g, proposal)
+            if reason:
+                decision.reasons.append(reason)
+                return None, None, decision
+        elif raw["scene"] is not None:
+            decision.reasons.append("existing_exit_needs_no_scene")
+            return None, None, decision
+        approved, reason = await self.director.evaluate(
+            {"intent": asdict(intent), "scene": raw["scene"]}, context, checked.raw)
+        decision.evaluation = "approved" if approved else "rejected"
+        decision.reasons.append(reason)
+        report("evaluator", current_turn().revision, {"approved": approved, "reason": reason}, gateway=self.gateway)
+        log.info("story repair | trace=%s kind=move evaluation=%s", current_turn().trace_id, decision.evaluation)
+        return (intent, proposal, decision) if approved else (None, None, decision)
+
+    @staticmethod
+    def repair_feedback(decision):
+        reasons = decision.reasons if decision else []
+        if "combat_requires_flee" in reasons:
+            detail = "目前仍在戰鬥中，不能靠補出新出口直接脫離；請先用 `/flee`。"
+        elif "repair_budget_exhausted" in reasons:
+            detail = "本回合模型呼叫額度不足以完成導演及 JEV 審查，請管理員檢查 max_calls 設定。"
+        elif "evaluation_unavailable" in reasons:
+            detail = "JEV 評估服務暫時無法完成審查，請稍後重試或請管理員查看 bot 日誌。"
+        elif "invalid_evaluation" in reasons:
+            detail = "JEV 評估回覆格式未通過驗證，請管理員查看 bot 日誌。"
+        elif "main_unavailable" in reasons:
+            detail = "主代理暫時無法完成最後審核，請稍後重試。"
+        elif decision and decision.evaluation == "rejected":
+            detail = "JEV 未批准這個場景延伸，請確認目的地與如何從目前位置到達。"
+        elif "scene_limit" in reasons:
+            detail = "此遊戲已達新增場景上限；可用 `/scene` 查看現有出口。"
+        else:
+            detail = "導演尚未提出可採用的故事延伸，或主代理未批准。請補充要前往的地方與路徑。"
+        return "❓ 已嘗試修復故事銜接。" + detail + "行動尚未執行。"
 
     async def review_progress(self, g, revision, triggers, plot, query="", npc_name=""):
         """Scheduled by the controller AFTER commit; advisory report then main review."""

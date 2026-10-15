@@ -157,9 +157,10 @@ def test_uncertain_action_requires_owner_confirmation(tmp_path):
     assert "🚫" in lines[0] and s.pending
 
 
-def test_director_proposal_requires_main_approval_and_commit_before_progress(tmp_path):
+def test_director_proposal_requires_jev_main_approval_and_commit_before_delivery(tmp_path):
     endpoint = Endpoint(main=[{"consult": ["director"]}, {**EXECUTE_PARSED, "director": True}, {"options": [0]}],
-        director=[{"name": "霧中小巷", "description": "石板上覆著青苔。", "npc": ""}], progress=[PROGRESS])
+        director=[{"name": "霧中小巷", "description": "石板上覆著青苔。", "npc": ""}],
+        evaluator=[{"relevant": True, "consistent": True, "reason": "符合"}], progress=[PROGRESS])
     s = supervised(tmp_path, endpoint)
     old_scene = s.game.world.current
     seen = []
@@ -169,13 +170,15 @@ def test_director_proposal_requires_main_approval_and_commit_before_progress(tmp
         assert "progress" not in roles(endpoint)
     lines, _ = run(s.handle("依思 go 小巷", user_id="u1", on_resolved=delivered))
     assert lines and s.game.world.current != old_scene and seen == [s.game.world.current]
-    assert roles(endpoint) == ["main", "director", "main", "progress", "main", "narrator"]
+    assert roles(endpoint) == ["main", "director", "evaluator", "main", "narrator"]
+    assert s._operator_state["pending_triggers"] == ["scene"]
     assert decisions(s)[-1]["accepted"] is True
 
 
 def test_main_rejects_director_proposal(tmp_path):
     endpoint = Endpoint(main=[{"consult": ["director"]}, EXECUTE_PARSED],
-        director=[{"name": "霧中小巷", "description": "石板上覆著青苔。", "npc": ""}])
+        director=[{"name": "霧中小巷", "description": "石板上覆著青苔。", "npc": ""}],
+        evaluator=[{"relevant": True, "consistent": True, "reason": "符合"}])
     s = supervised(tmp_path, endpoint)
     before = encode_game(s.game)
     run(s.handle("依思 go 小巷", user_id="u1"))
