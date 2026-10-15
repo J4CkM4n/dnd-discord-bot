@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass
 
 from .director import DirectorProposal, DirectorDecision, verify_proposal, scan_prop, MAX_DIRECTOR_SCENES
 from .intent import Intent
-from .memory import build_memory
+from .memory import build_memory, retired_demo_event
 from .model_gateway import ModelError, current_turn, reserve_calls
 from .rules_core import validate
 
@@ -110,7 +110,7 @@ def progress_input(g, plot, query, npc_name=""):
              "defend", "observe", "creative", "insight", "meta", "help"}
     actions = [{"event_id": e.event_id, "turn": e.turn, "actor": e.actor, "kind": e.kind}
                for e in g.ledger.entries if e.kind in kinds
-               and e.data.get("visibility") != "private"][-20:]
+               and e.data.get("visibility") != "private" and not retired_demo_event(g, e)][-20:]
     evidence = set(memory.event_ids) | {a["event_id"] for a in actions}
     # Campaign authors can explicitly publish objectives. Unfired beats/clocks
     # and NPC private knowledge are never sent to this operator.

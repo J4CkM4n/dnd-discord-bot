@@ -13,6 +13,12 @@ PUBLIC_KINDS = {"scene", "scene_fire", "item", "loot", "death", "combat",
                 "heal", "damage", "xp", "reveal", "beat", "rest"}
 
 
+def retired_demo_event(g, event) -> bool:
+    """Keep original audit history, but don't recall removed demos as actors."""
+    return any(name not in g.party and (event.actor == name or name in event.text)
+               for name in getattr(g, "retired_demo_names", []))
+
+
 @dataclass(frozen=True)
 class MemoryContext:
     current: str
@@ -46,7 +52,7 @@ def build_memory(g, query: str = "", *, audience: str = "narrator",
     mentioned = [name for name in names if name in query or name == npc_name]
     ranked = []
     for e in g.ledger.entries:
-        if e.kind not in PUBLIC_KINDS or e.data.get("visibility") == "private":
+        if e.kind not in PUBLIC_KINDS or e.data.get("visibility") == "private" or retired_demo_event(g, e):
             continue
         if npc_name and e.kind == "reveal" and e.data.get("npc") != npc_name:
             continue

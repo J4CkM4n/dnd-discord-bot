@@ -29,6 +29,7 @@ def encode_game(g: Game) -> dict:
         "turn": g.ledger.turn,
         "rng": g._random.getstate(),
         "director_scene_count": getattr(g, "director_scene_count", 0),
+        "retired_demo_names": getattr(g, "retired_demo_names", []),
         "effects": {key: getattr(g, key, None) for key in TRANSIENT_FIELDS},
     }
 
@@ -90,4 +91,5 @@ def decode_game(blob: dict, entries: list[dict]) -> Game:
         g._random.setstate(_tuples(blob["rng"]))
     g.director_scene_count = blob.get("director_scene_count", sum(
         e.kind == "director_scene" for e in g.ledger.entries))
+    g.retired_demo_names = list(blob.get("retired_demo_names", []))
     return g

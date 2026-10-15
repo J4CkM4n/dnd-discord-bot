@@ -7,6 +7,7 @@
 import os
 import random
 import sys
+from copy import deepcopy
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -15,6 +16,18 @@ from core.ledger import Ledger
 from core.rules_core import resolve
 from core.turn import Game
 from core.world import World, Scene, Enemy
+
+
+DEMO_PARTY = {
+    "依思": {"occupation": "Warlock",
+             "stats": {"STR": 11, "DEX": 14, "CON": 16, "INT": 11,
+                       "WIS": 14, "CHA": 17},
+             "hp_now": 11, "hp_max": 11, "level": 2},
+    "大力蕉": {"occupation": "Druid",
+               "stats": {"STR": 10, "DEX": 13, "CON": 16, "INT": 12,
+                         "WIS": 17, "CHA": 9},
+               "hp_now": 11, "hp_max": 11, "level": 2},
+}
 
 
 def seed_starter_knowledge(g: Game) -> bool:
@@ -42,7 +55,8 @@ def build_demo_game(seed: int = None) -> Game:
     return g
 
 
-def _build_demo_world_party() -> Game:
+def build_starter_game() -> Game:
+    """Production starter world. Players create their own party with /pc."""
     world = World()
     world.add_scene(Scene(
         "dock", "霧錨鎮碼頭",
@@ -58,19 +72,16 @@ def _build_demo_world_party() -> Game:
     world.scenes["tavern"].exits["dock"] = "碼頭"
     world.current = "dock"
 
-    party = {
-        "依思": {"occupation": "Warlock",
-                 "stats": {"STR": 11, "DEX": 14, "CON": 16, "INT": 11,
-                           "WIS": 14, "CHA": 17},
-                 "hp_now": 11, "hp_max": 11, "level": 2},
-        "大力蕉": {"occupation": "Druid",
-                   "stats": {"STR": 10, "DEX": 13, "CON": 16, "INT": 12,
-                             "WIS": 17, "CHA": 9},
-                   "hp_now": 11, "hp_max": 11, "level": 2},
-    }
-    g = Game(party, world,
+    g = Game({}, world,
              encounters={"tavern": [Enemy.make("哥布林①", 7, 15, 3, "1d6"),
                                     Enemy.make("哥布林②", 5, 13, 2, "1d4")]})
+    seed_starter_knowledge(g)
+    return g
+
+
+def _build_demo_world_party() -> Game:
+    starter = build_starter_game()
+    g = Game(deepcopy(DEMO_PARTY), starter.world, starter.encounters)
     g.give_item("依思", "治療藥水", 2)
     g.give_item("大力蕉", "治療藥水", 2)
     seed_starter_knowledge(g)

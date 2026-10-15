@@ -61,6 +61,13 @@ class CampaignRepository:
                         channel_id TEXT PRIMARY KEY REFERENCES channels(channel_id),
                         payload TEXT NOT NULL
                     );
+                    CREATE TABLE IF NOT EXISTS campaign_archives (
+                        id INTEGER PRIMARY KEY,
+                        channel_id TEXT NOT NULL,
+                        revision INTEGER NOT NULL,
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        payload TEXT NOT NULL
+                    );
                     PRAGMA user_version=2;
                     COMMIT;
                 """)
@@ -106,8 +113,9 @@ class CampaignRepository:
     def commit(self, channel_id: str, revision: int, snapshot: dict | None,
                events: list[dict], unfinished: dict | None,
                decisions: list[dict] = (), imported_from: str | None = None, *,
-               operator_records: list[dict] = (), operator_state: dict | None = None) -> int:
-        """snapshot=None commits narration only. Never rewrite previous events."""
+               operator_records: list[dict] = (), operator_state: dict | None = None,
+               restart: bool = False) -> int:
+        """Append facts, or atomically archive and replace a confirmed reset."""
         started = time.monotonic()
         try:
             with self.connect() as conn:
@@ -118,6 +126,23 @@ class CampaignRepository:
                 if (row[0] if row else 0) != revision:
                     raise StorageError("Campaign changed in another service; reload required")
                 last_id = row[1] if row else 0
+                if restart:
+                    if snapshot is None:
+                        raise StorageError("A reset needs a snapshot")
+                    if row is not None:
+                        archive = {}
+                        tables = ("channels", "events", "director_decisions", "narration",
+                                  "operator_reports", "operator_state")
+                        for table in tables:
+                            cursor = conn.execute(f"SELECT * FROM {table} WHERE channel_id=?", (channel_id,))
+                            columns = [c[0] for c in cursor.description]
+                            archive[table] = [dict(zip(columns, r)) for r in cursor.fetchall()]
+                        conn.execute("INSERT INTO campaign_archives(channel_id,revision,payload) VALUES (?,?,?)",
+                                     (channel_id, revision, _json(archive)))
+                        for table in tables[1:]:
+                            conn.execute(f"DELETE FROM {table} WHERE channel_id=?", (channel_id,))
+                        conn.execute("UPDATE channels SET imported_from=NULL WHERE channel_id=?", (channel_id,))
+                    last_id = 0
                 for event in events:
                     if event["event_id"] != last_id + 1:
                         raise StorageError("Event append is out of sequence")

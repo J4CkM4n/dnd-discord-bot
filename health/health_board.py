@@ -45,21 +45,21 @@ MARKER = "🩸 **隊伍健康看板 / Party Health Board**"
 # Discord's 2000-char message limit. Bump GUIDE_VERSION to republish an
 # updated guide (the old pin is unpinned first).
 GUIDE_MARKER = "📘 **玩家指南 / Game Guide**"
-GUIDE_VERSION = 2
+GUIDE_VERSION = 3
 GUIDE_CHUNKS = [
-    GUIDE_MARKER + """ v2（本訊息由看板機器人發布；指南更新時會自動重發新版）
+    GUIDE_MARKER + """ v3（本訊息由看板機器人發布；指南更新時會自動重發新版）
 
 **這是什麼遊戲？**
 AI 地下城主（DM）主持的《龍與地下城》5e 冒險：你們扮演角色說話、行動、擲骰；DM 扮演全世界。
 核心原則：**引擎判定、模型敘事** — 骰值、HP、物品、情報全部由系統計算，DM 只把結果寫成故事。
 
 **🚀 快速開始**
-1️⃣ `/pc <名字> <職業>` 建立角色（屬性由系統公正擲骰）
-2️⃣ `/explore <描述>` 自由行動——粵語英文都得
-3️⃣ 之後直接玩：說話＝行動！
+1️⃣ 管理員用 `/new_game` 開始遊戲
+2️⃣ 每位玩家用 `/pc <名字> <職業>` 建立角色（屬性由系統公正擲骰）
+3️⃣ `/scene` 查看場景，再用 `/explore <描述>` 自由行動——粵語英文都得
 
 **💬 怎麼行動（/explore 自由描述）**
-例子：「我匿埋一邊」（潛行）、「用醫藥救依思」（醫藥）、「向船長打聽線索」（社交）、
+例子：「我匿埋一邊」（潛行）、「用醫藥救隊友」（醫藥）、「向船長打聽線索」（社交）、
 「執起地下把劍」（拾取）。引擎自動挑技能＋熟練加值；唔確定就出檢定卡等你骰。""",
 
     """**🎯 檢定怎麼骰**
@@ -78,6 +78,7 @@ AI 地下城主（DM）主持的《龍與地下城》5e 冒險：你們扮演角
 `/give` 給隊友（不填對象＝放地上） · `/continue` 卡住時推進 · `/help` 說明
 
 **🎛 管理員**
+`/new_game` 開始新遊戲 · `/reset_game` 封存並重新開始（填 `reset confirm` 確認）
 explore/attack/use/skill/defend/flee/observe-roll/give 的 `-admin` 版本""",
 
     """**📜 情報系統**

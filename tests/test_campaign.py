@@ -55,6 +55,7 @@ class Director:
 def service(tmp_path, channel="t", evaluate=False):
     s = V4Service(str(tmp_path), "http://unused", channel_id=channel,
                   director_evaluate=evaluate)
+    s.game = build_demo_game()
     s.game._random.seed(1)
     for n, uid in (("依思", "u1"), ("大力蕉", "u2")):
         s.game.party[n]["owner_id"] = uid
@@ -351,6 +352,8 @@ def test_same_channel_serializes_but_other_channels_progress(tmp_path):
 
 def test_json_import_is_lossless_idempotent_and_preserves_original(tmp_path):
     g = build_demo_game(seed=7)
+    for name, entry in g.party.items():
+        entry["owner_id"] = name  # imported player characters, not unowned demos
     g.ledger.add("engine", "scene", "在碼頭", scene="dock")
     g.ledger.add("narrator", "narration", "未完成")
     blob = encode_game(g)

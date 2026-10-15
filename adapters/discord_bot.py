@@ -32,12 +32,12 @@ def _split(text: str, limit: int = 1900):
     return chunks
 
 
-HELP_TEXT = """🎲 **v6 引擎指令 / Commands**（玩家 16 · 管理 10）
+HELP_TEXT = """🎲 **v6 引擎指令 / Commands**
 
 **玩家 / Player**
 `/pc <名字> <職業>` — 建立角色（屬性由系統公正擲骰）
 `/explore <text>` — 探索／對話／移動（自由描述，引擎判定）
-　· 範例：`/explore 依思詢問船長關於巴鐸的線索`
+　· 範例：`/explore 我想向老船長打聽附近的消息`
 `/confirm` — 確認待確認的行動
 
 **戰鬥指令 / Combat**（各指令有自己的自動完成清單）
@@ -59,11 +59,14 @@ HELP_TEXT = """🎲 **v6 引擎指令 / Commands**（玩家 16 · 管理 10）
 `/inventory` — 物品欄＋法術格＋18 技能（★熟練）＋招式
 `/give <item> [to]` — 給隊友；不填 to＝放在地上（可拾回）
 `/status` — 隊伍 HP／法術格／場景／戰鬥／📜已知情報
+`/scene` — 當前場景／人物／出口／可見物品（不推進回合）
 `/rules <關鍵字>` — 查 SRD（火球術/哥布林/豁免…即時無 LLM）
 `/continue` — 未完成的敘事先逐字續寫；否則推進遊戲
 `/help` — 本說明
 
 **管理員 / Admin**
+`/new_game` — 開始此頻道的新遊戲（已有遊戲時不覆蓋）
+`/reset_game [confirmation]` — 封存舊遊戲並重新開始；填 `reset confirm` 確認
 `/explore-admin <text> <char>` — 以任意角色探索
 `/attack-admin` `/use-admin` `/skill-admin` `/defend-admin` `/flee-admin`
 `/observe-admin` — 以任意角色執行對應戰鬥行為（自動完成同玩家版）
@@ -212,6 +215,41 @@ class DiscordBot(discord.Client):
 
     def _register_commands(self):
         svc = self  # closure alias
+
+        @self.tree.command(name="new_game", description="開始新遊戲 / start a new game")
+        @app_commands.guild_only()
+        @app_commands.default_permissions(manage_guild=True)
+        async def new_game_cmd(interaction: discord.Interaction):
+            if not interaction.user.guild_permissions.manage_guild:
+                await interaction.response.send_message("🚫 需要管理伺服器權限。", ephemeral=True)
+                return
+            await interaction.response.defer(thinking=True)
+            out = await svc._v4_service(str(interaction.channel_id)).new_game(
+                str(interaction.user.id), admin=True)
+            for chunk in _split(out):
+                await interaction.followup.send(chunk)
+
+        @self.tree.command(name="reset_game", description="封存並重設遊戲 / archive and reset game")
+        @app_commands.guild_only()
+        @app_commands.default_permissions(manage_guild=True)
+        @app_commands.describe(confirmation="填 reset confirm 確認清除目前角色及進度")
+        async def reset_game_cmd(interaction: discord.Interaction, confirmation: str = ""):
+            if not interaction.user.guild_permissions.manage_guild:
+                await interaction.response.send_message("🚫 需要管理伺服器權限。", ephemeral=True)
+                return
+            await interaction.response.defer(thinking=True)
+            out = await svc._v4_service(str(interaction.channel_id)).reset_game(
+                str(interaction.user.id), confirmation, admin=True)
+            for chunk in _split(out):
+                await interaction.followup.send(chunk)
+
+        @self.tree.command(name="scene", description="查看當前場景 / show current scene")
+        async def scene_cmd(interaction: discord.Interaction):
+            out = svc._v4_service(str(interaction.channel_id)).scene()
+            chunks = _split(out)
+            await interaction.response.send_message(chunks[0])
+            for chunk in chunks[1:]:
+                await interaction.followup.send(chunk)
 
         # ---- /pc (character creation) ----
 

@@ -127,7 +127,7 @@ Run the engine self-test inside the image without logging in to Discord:
 docker compose run --rm --no-deps bot python core/cli.py selftest
 ```
 
-## Commands (26: 16 player + 10 admin)
+## Commands
 
 | Player | Admin |
 |---|---|
@@ -142,6 +142,8 @@ docker compose run --rm --no-deps bot python core/cli.py selftest
 | `/roll [expr]` — dice (settles checks, auto-continues) | |
 | `/give item [to]` — transfer; no recipient = set down | |
 | `/status` — party + scene + disclosed intel | |
+| `/scene` — current location, NPCs, exits, visible items | `/new_game` — start an unused channel |
+| | `/reset_game [confirmation]` — archive and restart |
 | `/rules <query>` — SRD lookup (zh aliases, no LLM) | |
 | | `/inspire-admin [char]` — grant inspiration |
 | `/continue` — finish unfinished narration, else unstuck | |
@@ -156,6 +158,30 @@ verdict messages carry one-tap buttons (🛡 defend · 👁 observe ·
 **In-channel keywords** (instant, no LLM): `status` `inv` `moves` `scene`
 
 **Plain text** = table talk (silently ignored, no reaction, no reply)
+
+To start, a member with **Manage Server** permission runs `/new_game` in the
+game channel. Each player then creates a character with `/pc`, checks `/scene`,
+and describes an action with `/explore`. `/new_game` refuses to overwrite a game
+that already has characters or activity. `/scene` reads engine state without
+advancing a turn, calling a model, or revealing hidden items or NPC knowledge.
+
+To restart, run `/reset_game`, then enter `reset confirm` in its `confirmation`
+option. This requires Manage Server permission. It archives the old campaign and
+starts at the dock with an empty party. Characters, inventories, generated scenes,
+combat, plot progress, pending actions/checks, narration, and operator guidance
+start fresh. Other channels and configuration files are unaffected. The previous
+snapshot, event history, narration, director decisions, and operator records are
+retained as JSON rows in `campaign_archives` in `data/campaigns.db`; archives are
+excluded from active campaign memory. Reset and archival commit atomically, and
+the channel revision continues increasing to reject stale writers. There is no
+Discord archive restore command.
+
+Normal campaigns start without demo characters. On loading an older save, the
+bot removes recognizable, unowned demo entries for 依思 and 大力蕉, along with
+their inventories and pending actions. Player-owned characters (including ones
+with those names), custom characters, world progress, and the original event
+history are preserved. Removed demo events are excluded from model memory and
+progress reports. The CLI demo and engine tests still use the demo party.
 
 At the starting dock, use `/explore 我想向老船長打聽附近的消息`.
 The captain shares one new fact per successful conversation: the route to the

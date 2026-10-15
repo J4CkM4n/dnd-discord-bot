@@ -53,6 +53,7 @@ class Game:
         self.ledger = Ledger()
         self._random = random.Random()
         self.director_scene_count = 0
+        self.retired_demo_names: list[str] = []
 
     # ---------- helpers ----------
 

@@ -63,7 +63,7 @@ def world_block(rules: dict) -> str:
             "玩家因此撲空＝敘事的錯。")
     return "\n".join(bits)
 
-from .cli import META, build_demo_game, seed_starter_knowledge
+from .cli import META, DEMO_PARTY, build_starter_game, seed_starter_knowledge
 from .digestor import Digestor
 from .director import (canonize_scene, DirectorProposal, DirectorDecision,
                        verify_proposal, scan_prop, MAX_DIRECTOR_SCENES)
@@ -162,9 +162,21 @@ class V4Service:
         self.rules = load_gamerules(channel_id, data_dir)
         self.plot = load_plot()
         self.plot_state = new_state(self.plot)
-        self.game = self._load() or build_demo_game()
+        self.game = self._load() or build_starter_game()
         repaired_knowledge = seed_starter_knowledge(self.game)
-        if self._revision == 0 or repaired_knowledge:
+        # Only recognizable, unowned seed characters are demo data. A player
+        # choosing the same name must never lose their character on restart.
+        demos = [name for name, template in DEMO_PARTY.items()
+                 if (entry := self.game.party.get(name))
+                 and not entry.get("owner_id") and not entry.get("owner")
+                 and entry.get("occupation") == template["occupation"]
+                 and entry.get("stats") == template["stats"]]
+        if demos:
+            self._drop_characters(demos)
+            self.game.retired_demo_names = sorted(set(self.game.retired_demo_names) | set(demos))
+            self._operator_state = {"accepted_turns": 0, "pending_triggers": [], "last_reviewed_event": 0}
+            log.info("removed unowned demo characters | channel=%s count=%d", channel_id, len(demos))
+        if self._revision == 0 or repaired_knowledge or demos:
             self._save()
 
     # ---------- persistence ----------
@@ -177,7 +189,8 @@ class V4Service:
                     pending_admin=self.pending_admin)
         return blob
 
-    def _save(self, *, narration_only: bool = False, imported_from=None) -> None:
+    def _save(self, *, narration_only: bool = False, imported_from=None,
+              restart: bool = False) -> None:
         # Historical entries are immutable; stamp only the newly staged events.
         for e in self.game.ledger.entries[self._saved_count:]:
             e.data.setdefault("scene", self.game.world.current)
@@ -197,7 +210,7 @@ class V4Service:
             None if narration_only else self._snapshot(),
             [asdict(e) for e in self.game.ledger.entries[self._saved_count:]],
             self._unfinished, self._decisions, imported_from=imported_from,
-            operator_records=audits, operator_state=self._operator_state)
+            operator_records=audits, operator_state=self._operator_state, restart=restart)
         self._revision = revision
         self._saved_count = len(self.game.ledger.entries)
         self._decisions = []
@@ -671,6 +684,72 @@ class V4Service:
 
     # ---------- non-turn mutations: same lock and transaction boundary ----------
 
+    def _drop_characters(self, names):
+        """Remove current references without rewriting the historical ledger."""
+        g = self.game
+        for name in names:
+            g.party.pop(name, None)
+            g.inventory.pop(name, None)
+        g.combat.order = [c for c in g.combat.order if c["name"] not in names]
+        g.combat.acted = [n for n in g.combat.acted if n not in names]
+        g.combat.idx = g.combat.idx % len(g.combat.order) if g.combat.order else 0
+        for attr in ("_aid", "_dodge", "_stealth", "_help_check"):
+            for name in names:
+                getattr(g, attr, {}).pop(name, None)
+        if (getattr(g, "_pending_check", None) or {}).get("actor") in names:
+            g._pending_check = None
+        if self.pending and self.pending.actor in names:
+            self.pending, self.pending_user_id, self.pending_admin = None, "", False
+        # Placeholder mappings change when the party changes.
+        self._unfinished = None
+        self._recent_narrations = []
+
+    @serialized("text")
+    async def new_game(self, user_id: str, *, admin: bool = False) -> str:
+        if not admin:
+            return "🚫 需要管理伺服器權限。"
+        if self.game.party or self.game.ledger.entries or self.game.ledger.turn \
+                or self.pending or self._unfinished or self.game.combat.active:
+            return "⚠️ 此頻道已有遊戲，請用 `/scene` 查看；重新開始請用 `/reset_game`。"
+        self.game.ledger.add("engine", "meta", "新遊戲已開始", user_id=str(user_id))
+        self._save()
+        return "🎲 新遊戲已開始！請每位玩家用 `/pc` 建立角色。\n" + self.scene()
+
+    @serialized("text")
+    async def reset_game(self, user_id: str, confirmation: str = "", *, admin: bool = False) -> str:
+        if not admin:
+            return "🚫 需要管理伺服器權限。"
+        if confirmation.strip().lower() != "reset confirm":
+            return ("⚠️ 將重新開始此頻道的遊戲，清除目前角色、物品、場景進度及待定行動。"
+                    "舊遊戲會封存。確認請用 `/reset_game confirmation:reset confirm`。")
+        self.game = build_starter_game()
+        self.plot_state = new_state(self.plot)
+        self.pending, self.pending_user_id, self.pending_admin = None, "", False
+        self._unfinished = None
+        self._recent_narrations = []
+        self._operator_state = {"accepted_turns": 0, "pending_triggers": [], "last_reviewed_event": 0}
+        self._saved_count = 0
+        self.game.ledger.add("engine", "meta", "遊戲已重設", user_id=str(user_id))
+        self._save(restart=True)
+        return "🔄 舊遊戲已封存，新遊戲已開始！請用 `/pc` 建立角色。\n" + self.scene()
+
+    def scene(self) -> str:
+        """Public current-scene facts only; no action, model call, or write."""
+        g = self.game
+        s = g.world.here
+        lines = [f"📍 **{s.name}**", s.description]
+        if s.fire:
+            lines.append("🔥 場景正在燃燒。")
+        lines.append("👥 人物：" + ("、".join(n["name"] for n in s.npcs) or "無"))
+        lines.append("🚪 出口：" + ("、".join(s.exits.values()) or "無"))
+        lines.append("📦 地上物品：" + ("、".join(f"{n} ×{q}" for n, q in s.ground_items) or "無"))
+        if g.combat.active:
+            lines.append(f"⚔️ 戰鬥 R{g.combat.round}")
+            lines.extend(f"👹 {n} {f.hp}/{f.hp_max}HP" for n, f in g.enemies.items() if not f.dead)
+        if not g.party:
+            lines.append("👉 請先用 `/pc` 建立角色，再用 `/explore` 行動。")
+        return "\n".join(lines)
+
     @serialized("text")
     async def create_character(self, name: str, occupation: str, user_id: str, owner: str) -> str:
         g = self.game
@@ -743,19 +822,7 @@ class V4Service:
             return f"🚫 只有 {entry.get('owner', '?')} 可以刪除 {name}。"
         if confirmation.strip().lower() != "remove confirm":
             return f"⚠️ 確認刪除 {name}？填 `remove confirm`"
-        g.party.pop(name)
-        g.inventory.pop(name, None)
-        g.combat.order = [c for c in g.combat.order if c["name"] != name]
-        g.combat.acted = [n for n in g.combat.acted if n != name]
-        g.combat.idx = g.combat.idx % len(g.combat.order) if g.combat.order else 0
-        for attr in ("_aid", "_dodge", "_stealth", "_help_check"):
-            getattr(g, attr, {}).pop(name, None)
-        if (getattr(g, "_pending_check", None) or {}).get("actor") == name:
-            g._pending_check = None
-        if self.pending and self.pending.actor == name:
-            self.pending, self.pending_user_id, self.pending_admin = None, "", False
-        # Placeholder name mappings change when the party changes.
-        self._unfinished = None
+        self._drop_characters([name])
         g.ledger.add(name, "meta", f"刪除了角色 {name}")
         self._save()
         return f"🗑️ 已刪除 {name}。"
