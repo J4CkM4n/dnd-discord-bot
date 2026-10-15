@@ -142,7 +142,8 @@ docker compose run --rm --no-deps bot python core/cli.py selftest
 |---|---|
 | `/pc name occupation` — create character | `/explore-admin text char` |
 | `/explore <text>` — freeform action | `/attack-admin char target move` |
-| `/confirm` — confirm pending action | `/use-admin char item on` |
+| `/confirm` — confirm pending action / resume linked plan | `/use-admin char item on` |
+| `/plan [status|resume|cancel]` — inspect or control your plan | |
 | `/attack [target] [move]` — typed combat family | `/skill-admin char skill on` |
 | `/use [item] [on]` — item / feed a DOWNED ally | `/defend-admin` `/flee-admin` |
 | `/skill [skill] [on]` — 18 skills ★, context targets | `/observe-admin char target` |
@@ -261,10 +262,11 @@ gamerules.json          # single source of truth: world tone + canon +
                         # narrative constraints (injected into the
                         # narrator prompt; edit here to change the world)
 
-core/                   # engine and AI orchestration (snapshot v8)
+core/                   # engine and AI orchestration (snapshot v9)
 ├── intent.py           # Intent + narrative brief + deterministic parser
 ├── decisions.py        # native Jev / LLM routing with validated choices
 ├── improvisation.py    # bounded, engine-owned creative effects
+├── action_plans.py     # linked pickup/preparation/action plans and turn costs
 ├── hints.py            # persistent public-only stall guidance
 ├── debug_capture.py    # opt-in redacted local JSONL traces
 ├── trace_eval.py       # offline export, replay, and labeled evaluation
@@ -397,6 +399,23 @@ intent supervision; milestone progress and narration can still run.
 
 ## Director proposals and improvisation
 
+Linked requests with one purpose can have up to three steps: one explicit
+pickup, optional preparation, then attack or item use. For example, picking up
+a healing potion, mixing it with owned poison, and attacking a goblin is a
+proposed preparation/attack plan. The engine requires the potion to be visible
+on the ground, the poison to be carried, and the target to be present; the
+models cannot create missing ingredients or declare that mixing succeeded.
+
+One pickup can accompany an action. Crafting consumes its materials and one
+action, with an engine skill check (or `/roll d20` outside combat). A reviewed
+successful preparation creates a single-use improvised projectile: DEX vs AC,
+`1d4` damage, consumed on hit or miss. Crafting and attacking use separate
+actions. `/confirm` or `/plan resume` explicitly advances the saved plan when
+the actor can act again; current scene, target, resources and ownership are
+rechecked. `/plan status` shows progress; `/plan cancel` stops remaining steps.
+There is no automatic normal-attack fallback when a requested method fails.
+Independent goals, hypotheticals and unsupported chains require clarification.
+
 TypeSafe **Jev** is a System One model; director **Judge–Evaluate–Verify** is a
 separate review workflow. New routed scene/item proposals and improvised effects
 require evaluator review, main approval, and engine verification. Models propose
@@ -482,7 +501,8 @@ corresponding state transaction. Approved guidance is saved with the narration
 job before streaming, and interrupted streams remain resumable. A restart uses
 that guidance without invoking action operators or resolving the action again.
 
-Snapshot v8 includes pending checks and creative plans, narrative briefs,
+Snapshot v9 includes linked action plans and prepared items, pending checks,
+creative proposals, narrative briefs,
 party-shared reward allowances, player-bound confirmations, combat effects,
 plot progress, RNG state, and continuation references. `/confirm` and `/roll`
 enforce ownership. A failed write leaves committed state intact; a failed
@@ -490,7 +510,7 @@ callback or narrator leaves a resumable `/continue`. Commands serialize within
 each channel, including narration, while other channels can progress. Run one
 bot process per database; revision checks reject stale writers.
 
-The snapshot codec loads v4–v8. Disabling routing keeps saves compatible with
+The snapshot codec loads v4–v9. Disabling routing keeps saves compatible with
 this version; restoring an older binary requires its pre-upgrade backup.
 
 On first access to a channel, v4–v7 `v4_state_<channel>.json` saves (or

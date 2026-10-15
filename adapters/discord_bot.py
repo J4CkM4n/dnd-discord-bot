@@ -75,6 +75,7 @@ HELP_TEXT = """🎲 **v6 引擎指令 / Commands**
 `/explore <text>` — 探索／對話／移動（自由描述，引擎判定）
 　· 範例：`/explore 我想向老船長打聽附近的消息`
 `/confirm` — 確認待確認的行動
+`/plan [action]` — 查看相依行動計畫；resume 繼續下一步，cancel 取消
 
 **戰鬥指令 / Combat**（各指令有自己的自動完成清單）
 `/attack [目標] [招式]` — 攻擊（目標清單帶敵人 HP；招式按角色列出）
@@ -427,6 +428,14 @@ class DiscordBot(discord.Client):
         async def confirm_cmd(interaction: discord.Interaction):
             await self._v4_turn(interaction, "confirm", confirmation=True)
 
+        @self.tree.command(name="plan", description="查看、繼續或取消相依行動計畫")
+        @app_commands.choices(action=[
+            app_commands.Choice(name="查看計畫", value="status"),
+            app_commands.Choice(name="繼續下一步", value="resume"),
+            app_commands.Choice(name="取消剩餘步驟", value="cancel")])
+        async def plan_cmd(interaction: discord.Interaction, action: str = "status"):
+            await self._v4_turn(interaction, f"plan {action}", plan_action=action)
+
         # ---- combat command family ----------------------------------------
         # One command per action, each with its OWN typed autocomplete —
         # a single /combat with a polymorphic `target` could never show
@@ -449,6 +458,16 @@ class DiscordBot(discord.Client):
                                 name))
             if not entries:
                 entries.append(("AC 15（自訂）", "AC 15"))
+            q = (current or "").strip().lower()
+            return [app_commands.Choice(name=d[:100], value=v[:100])
+                    for d, v in entries if not q or q in d.lower()][:25]
+
+        async def attack_target_ac(interaction, current: str):
+            g = svc._v4_service(str(interaction.channel_id)).game
+            entries = [(f"{n} HP {f.hp}/{f.hp_max}（敵）", n)
+                       for n, f in g.enemies.items() if not f.dead and f.hp > 0]
+            entries += [(f"{n['name']}（NPC，攻擊會使其敵對）", n["name"])
+                        for n in g.world.here.npcs if n["name"] not in g.enemies]
             q = (current or "").strip().lower()
             return [app_commands.Choice(name=d[:100], value=v[:100])
                     for d, v in entries if not q or q in d.lower()][:25]
@@ -508,9 +527,9 @@ class DiscordBot(discord.Client):
                     for d, v in entries if not q or q in d.lower()][:25]
 
         @self.tree.command(name="attack",
-                           description="⚔️ 攻擊（戰鬥中）/ attack a target")
-        @app_commands.describe(target="目標（敵人清單）", move="招式")
-        @app_commands.autocomplete(target=enemy_ac, move=combat_move_ac)
+                           description="⚔️ 攻擊敵人或場景 NPC / attack a target")
+        @app_commands.describe(target="目標（敵人或場景 NPC）", move="招式")
+        @app_commands.autocomplete(target=attack_target_ac, move=combat_move_ac)
         async def attack_cmd(interaction: discord.Interaction,
                              target: str, move: str = ""):
             char = await _caller_char(interaction)
@@ -884,7 +903,7 @@ class DiscordBot(discord.Client):
         @self.tree.command(name="attack-admin",
                            description="(Admin) 以任意角色攻擊")
         @app_commands.describe(character="角色", target="目標", move="招式")
-        @app_commands.autocomplete(character=any_char_ac, target=enemy_ac,
+        @app_commands.autocomplete(character=any_char_ac, target=attack_target_ac,
                                    move=combat_move_ac)
         async def attack_admin_cmd(interaction: discord.Interaction,
                                    character: str, target: str,
@@ -1029,7 +1048,7 @@ class DiscordBot(discord.Client):
     # ------------------------------------------------------------------
 
     async def _v4_turn(self, interaction, text, echo=None,
-                       structured=False, confirmation=False):
+                       structured=False, confirmation=False, plan_action=""):
         """Player v4 turn — v3 word-by-word UX:
         defer → echo (followup, resolves the thinking indicator) →
         engine verdict (instant) → narration streams into its own
@@ -1061,7 +1080,10 @@ class DiscordBot(discord.Client):
         try:
             async with stream:
                 service = self._v4_service(str(interaction.channel_id))
-                if confirmation:
+                if plan_action:
+                    lines, narration = await service.action_plan(
+                        plan_action, str(interaction.user.id), on_delta=stream, on_resolved=on_resolved)
+                elif confirmation:
                     lines, narration = await service.confirm(
                         str(interaction.user.id), on_delta=stream, on_resolved=on_resolved,
                         admin=interaction.user.guild_permissions.manage_guild)

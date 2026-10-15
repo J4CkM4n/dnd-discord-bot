@@ -156,7 +156,7 @@ def parse_config(data: dict, env=None) -> AgentConfig:
         roles[name] = RoleConfig(
             provider, model.strip(),
             _number(raw.get("temperature", 0.7 if narrator else 0.8 if name == "director" else 0.1), "temperature", 0, 2),
-            _number(raw.get("max_tokens", 1600 if name == "router" else 600 if name in ("main", "progress", "director") else 400 if narrator else 200),
+            _number(raw.get("max_tokens", 1600 if name == "router" else 800 if name == "action" else 600 if name in ("main", "progress", "director") else 400 if narrator else 200),
                     "max_tokens", 16, 32768, True),
             _number(raw.get("timeout", 180 if narrator else 30), "timeout", 1, 300), think, effort)
     sup = data.get("supervision", {})

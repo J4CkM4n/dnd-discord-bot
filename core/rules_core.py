@@ -143,6 +143,10 @@ def _apply_check_effect(g: Game, actor: str, effect: dict | None,
                         ok: bool, lines: list[str]) -> None:
     """Mechanical outcome of a settled check. Runs whether the die came
     from the engine (auto) or the player's own /roll (pending path)."""
+    if effect and effect.get("kind") == "linked_prepare":
+        from .action_plans import settle_preparation
+        settle_preparation(g, actor, effect["plan_id"], ok, lines)
+        return
     if effect and effect.get("kind") == "improvisation":
         from .improvisation import apply_effects
         apply_effects(g, actor, effect["plan"], ok, lines)
@@ -247,6 +251,33 @@ def validate(g: Game, it: Intent, *, allow_unplanned_move: bool = False) -> str 
         return f"沒有角色「{actor}」"
     if actor and not g.alive(actor):
         return f"{actor} 已倒地（HP 0），無法行動"
+    if "linked_plan" in it.args or "linked_plan_id" in it.args:
+        if it.action != "creative":
+            return "行動計畫與引擎行動不一致。"
+        if getattr(g, "_pending_check", None):
+            return "尚有待定檢定，請先用 `/roll d20`。"
+        if "linked_plan" in it.args:
+            from .action_plans import parse_plan, approve_preparation, PlanError
+            plan = it.args["linked_plan"]
+            fields = {"version", "id", "actor", "source_revision", "origin_scene", "goal", "player_words",
+                      "steps", "next_step", "status", "stop_reason", "preparation", "prepared_item"}
+            if type(plan) is not dict or set(plan) != fields or plan.get("actor") != actor \
+                    or type(plan["version"]) is not int or type(plan["next_step"]) is not int \
+                    or type(plan["source_revision"]) is not int or type(plan["steps"]) is not list \
+                    or type(plan["player_words"]) is not str:
+                return "行動計畫格式不完整。"
+            try:
+                checked = parse_plan({"relationship": "linked" if len(plan["steps"]) > 1 else "single",
+                                      "goal": plan["goal"], "steps": plan["steps"]},
+                                     g, actor, plan["source_revision"], plan["player_words"])
+                if any(plan[k] != checked[k] for k in fields - {"preparation"}):
+                    return "行動計畫尚未通過當前狀態驗證。"
+                if any(s["action"] == "prepare" for s in plan["steps"]):
+                    approve_preparation(plan["preparation"])
+                elif plan["preparation"] is not None:
+                    return "普通行動不能附加製作效果。"
+            except (PlanError, KeyError, TypeError) as exc:
+                return str(exc) if isinstance(exc, PlanError) else "行動計畫格式不完整。"
     if "improvisation" in it.args:
         from .improvisation import verify_improvisation
         plan = it.args["improvisation"]
@@ -268,6 +299,9 @@ def validate(g: Game, it: Intent, *, allow_unplanned_move: bool = False) -> str 
         if not any(s[0] == it.item for s in g.inventory.get(actor, [])):
             return f"SLOT:item:{it.item}"  # fabrication -> snark + deny
     if it.action == "attack":
+        item = it.args.get("thrown_item")
+        if item and not any(n == item and q > 0 for n, q in g.inventory.get(actor, [])):
+            return f"沒有可投擲的「{item}」；不會改用普通攻擊。"
         foe, tgt_char = resolve_target(g, it.target)
         if foe is None and tgt_char is None:
             # check scene NPCs — attacking one turns them hostile
@@ -549,6 +583,7 @@ def _throw(g: Game, actor: str, it: Intent, utter: str) -> ResolveResult | None:
             if name in n or n in name:
                 g.world.here.ground_items.remove((n, q))
                 break
+    prepared = (getattr(g, "_prepared_items", None) or {}).pop(name, None)
     foe, tgt_char = resolve_target(g, it.target or utter)
     if foe is not None or tgt_char:
         tname = foe.name if foe else tgt_char
@@ -583,7 +618,7 @@ def _throw(g: Game, actor: str, it: Intent, utter: str) -> ResolveResult | None:
                 e["hp_now"] = max(0, int(e["hp_now"]) - dmg)
                 lines.append(f"　💔 {tgt_char} HP → "
                              f"**{e['hp_now']}/{e['hp_max']}**")
-        else:
+        elif not prepared:
             # a miss still puts the item somewhere in the scene
             g.world.here.ground_items.append((name, 1))
         g.ledger.add(actor, "creative", f"{actor} 掟出 {name}",
@@ -679,6 +714,14 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
         g.ledger.add(it.actor or "?", "table",
                      f"桌邊：{(it.utterance or it.raw)[:80]}")
         return ResolveResult([], accepted=True)
+    if "linked_plan" in it.args or "linked_plan_id" in it.args:
+        from .action_plans import current_plan, resolve_plan
+        resume = "linked_plan_id" in it.args
+        plan = current_plan(g, it.actor) if resume else it.args["linked_plan"]
+        if not isinstance(plan, dict) or plan.get("actor") != it.actor \
+                or (resume and plan.get("id") != it.args["linked_plan_id"]):
+            return ResolveResult(["沒有可繼續的行動計畫。"], accepted=False)
+        return resolve_plan(g, plan, resume=resume)
     g.ledger.next_turn()
     # v5 async-friendly combat: PER-ROUND ACTION SLOTS. Discord is not
     # a table — players shouldn't wait on one specific order. Any PC
@@ -748,7 +791,11 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
                     # re-resolve target (now in g.enemies)
                     foe, tgt_char = resolve_target(g, it.target)
                     break
-        r = _attack(g, actor, it.target, it.args.get("move", ""))
+        if it.args.get("thrown_item"):
+            item = it.args["thrown_item"]
+            r = _throw(g, actor, Intent("creative", target=it.target, item=item), f"投擲 {item}")
+        else:
+            r = _attack(g, actor, it.target, it.args.get("move", ""))
         # only an EXECUTED attack burns the turn: a denied one (no
         # spell slot for the chosen move) must NOT advance rotation —
         # the player hasn't acted yet, they were told to pick another

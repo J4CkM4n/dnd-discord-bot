@@ -34,7 +34,7 @@ max_tokens = 600
 [roles.action]
 provider = "local"
 # model = "qwen2.5:7b-instruct"
-max_tokens = 240
+max_tokens = 800 # Up to three linked steps, including material names and targets.
 
 [roles.progress]
 provider = "local"

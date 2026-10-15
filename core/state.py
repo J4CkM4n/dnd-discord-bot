@@ -7,8 +7,9 @@ from .ledger import Entry
 from .turn import Game
 from .world import Enemy, Scene, World
 
-STATE_VERSION = 8
-TRANSIENT_FIELDS = ("_pending_check", "_aid", "_dodge", "_stealth", "_help_check", "_improv_rewards")
+STATE_VERSION = 9
+TRANSIENT_FIELDS = ("_pending_check", "_aid", "_dodge", "_stealth", "_help_check", "_improv_rewards",
+                    "_action_plans", "_prepared_items")
 
 
 def clone_game(game: Game) -> Game:
@@ -39,9 +40,9 @@ def _tuples(value):
 
 
 def decode_game(blob: dict, entries: list[dict]) -> Game:
-    """Load v4–v8 snapshots; malformed saves fail rather than reset a campaign."""
+    """Load v4–v9 snapshots; malformed saves fail rather than reset a campaign."""
     if not isinstance(blob, dict) or type(blob.get("v")) is not int \
-            or blob["v"] not in (4, 5, 6, 7, STATE_VERSION):
+            or blob["v"] not in (4, 5, 6, 7, 8, STATE_VERSION):
         raise ValueError("Unsupported game state version")
     if not isinstance(blob["party"], dict) or not isinstance(blob["world"], dict):
         raise ValueError("Invalid party/world in save")

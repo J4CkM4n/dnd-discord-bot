@@ -125,7 +125,7 @@ async def replay(rows):
         # Only commands captured by the serialized service wrapper are eligible.
         allowed = {"handle", "confirm", "settle_roll", "continue_narration", "create_character",
                    "remove_character", "transfer_item", "admin_give", "admin_inspire", "admin_xp",
-                   "new_game", "reset_game"}
+                   "new_game", "reset_game", "action_plan"}
         if start["method"] not in allowed:
             raise ValueError("Unsupported replay command")
         arguments = dict(start["arguments"])

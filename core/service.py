@@ -485,7 +485,7 @@ class V4Service:
 
     async def _confirm(self, user_id, on_delta, on_resolved, admin=False):
         if self.pending is None:
-            return ["（沒有待確認的行動）"], ""
+            return await self._resume_plan(user_id, on_delta, on_resolved)
         if self.pending_user_id != str(user_id) or (self.pending_admin and not admin):
             return self._deny("?", "只有提出行動的玩家可以確認。")
         it = deepcopy(self.pending)
@@ -504,6 +504,48 @@ class V4Service:
                     self._decisions.append(asdict(self._supervised.director_decision))
                 return [self._supervised.feedback or "❓ 請再描述你想確認的行動。"], ""
         return await self._execute(it, user_id, admin_actor, it.raw, on_delta, on_resolved)
+
+    @serialized()
+    async def action_plan(self, action="status", user_id="", on_delta=None, on_resolved=None):
+        """Explicit status/resume/cancel; narration continuation never runs steps."""
+        from .action_plans import plans, plan_status
+        probe = Intent("meta")
+        reason = self._authorize(probe, user_id)
+        if reason:
+            return self._deny(probe.actor, reason)
+        if action == "status":
+            return plan_status(self.game, probe.actor), ""
+        if action == "resume":
+            return await self._resume_plan(user_id, on_delta, on_resolved)
+        if action != "cancel":
+            return ["請選擇 status、resume 或 cancel。"], ""
+        plan = plans(self.game).get(probe.actor)
+        if not plan or plan["status"] in ("completed", "failed", "cancelled"):
+            return ["（沒有可取消的行動計畫）"], ""
+        plan["status"] = "cancelled"
+        plan["stop_reason"] = "玩家取消；不會執行剩餘步驟。已消耗材料不退還，已製成物品保留。"
+        pend = getattr(self.game, "_pending_check", None)
+        if pend and (pend.get("effect") or {}).get("plan_id") == plan["id"]:
+            self.game._pending_check = None
+        self.game.ledger.add(probe.actor, "action_plan", plan["stop_reason"],
+                             plan_id=plan["id"], status="cancelled")
+        capture("action_plan", plan_id=plan["id"], outcome="cancelled")
+        self._save()
+        return ["📋 " + plan["stop_reason"]], ""
+
+    async def _resume_plan(self, user_id, on_delta, on_resolved):
+        from .action_plans import current_plan
+        probe = Intent("creative")
+        reason = self._authorize(probe, user_id)
+        if reason:
+            return self._deny(probe.actor, reason)
+        plan = current_plan(self.game, probe.actor)
+        if not plan:
+            return ["（沒有待確認的行動或可繼續的計畫）"], ""
+        probe.args = {"linked_plan_id": plan["id"]}
+        probe.raw = plan["player_words"]
+        probe.narrative = {"player_words": plan["player_words"], "attempted_action": plan["goal"]}
+        return await self._execute(probe, user_id, "", probe.raw, on_delta, on_resolved)
 
     async def _execute(self, it, user_id, admin_actor, text, on_delta, on_resolved):
         g = self.game
@@ -524,6 +566,11 @@ class V4Service:
         self.pending_admin = False
         if getattr(g, "_pending_check", None) and it.action not in ("help", "meta", "chat"):
             return self._deny(it.actor, "尚有待定檢定，請由該角色的玩家用 `/roll d20` 結算。")
+        if "linked_plan" in it.args:
+            approved = (self._supervised and self._supervised.linked_plan == it.args["linked_plan"]
+                        and self._supervised.source_revision == self._revision)
+            if not approved or it.action != "creative" or it.args["linked_plan"].get("actor") != it.actor:
+                return self._deny(it.actor, "行動計畫尚未通過當前回合的審核。")
         reason = validate(g, it, allow_unplanned_move=True)
         if reason and it.action in ("move", "search"):
             return self._deny(it.actor, reason)
@@ -775,7 +822,7 @@ class V4Service:
         g.combat.order = [c for c in g.combat.order if c["name"] not in names]
         g.combat.acted = [n for n in g.combat.acted if n not in names]
         g.combat.idx = g.combat.idx % len(g.combat.order) if g.combat.order else 0
-        for attr in ("_aid", "_dodge", "_stealth", "_help_check"):
+        for attr in ("_aid", "_dodge", "_stealth", "_help_check", "_action_plans"):
             for name in names:
                 getattr(g, attr, {}).pop(name, None)
         if (getattr(g, "_pending_check", None) or {}).get("actor") in names:
@@ -1287,4 +1334,9 @@ class V4Service:
             return f"❓ 待確認：{p.actor} {p.action} {p.target or p.destination}——用 `/confirm`。"
         if getattr(self.game, "_pending_check", None):
             return f"🎲 等待 {self.game._pending_check['actor']} 的 `/roll d20`。"
+        from .action_plans import current_plan, describe
+        active = [describe(plan) for name in self.game.party
+                  if (plan := current_plan(self.game, name))]
+        if active:
+            return "\n".join(active) + "\n用 `/plan status` 查看、`/confirm` 繼續或 `/plan cancel` 取消。"
         return render_turn_context(self.game, "") if self.game.party else "❓ 先用 `/pc` 建立角色。"

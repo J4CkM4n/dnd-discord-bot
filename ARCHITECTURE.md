@@ -1,4 +1,4 @@
-# D&D DM Bot — System One architecture (snapshot v8)
+# D&D DM Bot — System One architecture (snapshot v9)
 
 The world remains **黑暗海洋奇幻**: oppressive fog, ancient threats, real costs,
 and occasional dark wit. Player creativity shapes the attempted method and the
@@ -42,7 +42,7 @@ routine existing actions need no main-model call.
 
 | Component | Responsibility |
 |---|---|
-| `DecisionGateway` / `router` | Batched category, target, destination, ambiguity, detail, improvisation, help, and compound-action decisions |
+| `DecisionGateway` / `router` | Batched category, target, destination, ambiguity, detail, improvisation, help, compound and linked-action decisions |
 | `action` | Interpret open-ended methods, references, arguments, and uncertain routes |
 | Deterministic memory | Retrieve bounded engine facts with event references |
 | `director` | Propose adjacent scenes, inert props, or bounded improvisation |
@@ -67,7 +67,8 @@ Without a TypeSafe key, or after one failed native request, `roles.router` uses
 the configured LLM. Its self-reported confidence is uncalibrated: direct routing
 additionally requires a complete deterministic parse. Both requests consume the
 shared budget. There are no retries. If interpretation also fails, only complete
-deterministic actions proceed; unresolved or compound requests require clarification.
+deterministic actions proceed; unresolved requests require clarification. Compound
+or linked requests go to the bounded action planner rather than executing a partial parse.
 
 Both `backend="auto"` and `backend="jev"` prefer native Jev with a configured key
 and retain LLM fallback. `backend="llm"` always selects the LLM router. Typed
@@ -75,6 +76,53 @@ commands bypass routing and action supervision; milestone progress review and
 narration can still call models.
 
 ## Player details and new mechanics
+
+### Linked action plans
+
+The router distinguishes mechanical steps from dialogue/style and flags steps
+serving one goal. `MainAgent._interpret_linked` assigns decomposition to the
+action specialist. It returns one goal, relationship, and at most three steps.
+The v1 engine vocabulary is `take`, `prepare`, then `attack` or `use`, in that
+order. A pickup must supply the final item or a preparation ingredient; a
+preparation must supply the final attack. Independent goals, hypotheticals,
+negations, unsupported steps and silent changes of method are rejected without
+executing a partial plan. Inputs are bounded to 1500 characters.
+
+`action_plans.py` verifies exact visible ground items, actor-owned materials,
+and a present target before mutation. Hidden items cannot satisfy pickups.
+One explicitly requested pickup transfers one unit and is an object interaction
+alongside the next action. Existing pickup/use or pickup/throw chains require
+no director call. Every decomposition receives evaluator and main approval to
+check that no requested method or ingredient was dropped.
+
+Novel preparation additionally requires a director template, evaluator and main
+approval. The only v1 template is `improvised_throw`: one or two player-specified
+materials (one unit each), an SRD skill, and easy/moderate/hard engine DC. Crafting
+spends one action and consumes the ingredients on either outcome. In combat the
+engine rolls and advances the normal action slot; outside combat it preserves
+the existing `/roll d20` flow. Success creates a registered single-use projectile;
+failure creates nothing and ends the plan. There are no numeric model-defined
+damage, poison, area, healing or reward effects.
+
+Crafting always stops before the attack. `/confirm` (when no ordinary confirmation
+is pending) or `/plan resume` rechecks ownership, actor health, original scene,
+target, item possession and combat slot before the next action. Throwing uses
+the standard DEX-vs-AC attack and `1d4` damage, with existing NPC hostility,
+death, loot and XP handling. Prepared projectiles are consumed on hit or miss.
+Missing conditions pause the plan with a concrete reason; there is no fallback
+to a normal attack. `/plan status` is read-only; `/plan cancel` cancels remaining
+steps and its own pending craft check without refunds. `/continue` only resumes
+narration or shows guidance; it never executes plan steps.
+
+Plans and prepared-item registrations live in the staged game snapshot. Every
+step and stop reason is recorded with a plan ID, while model proposals/reviews
+remain operator audits. Debug capture and offline replay include plan creation,
+roll settlement, status, cancellation and explicit continuation. No additional
+payload fields are sent to TypeSafe; actor inventory and ground-item details
+are supplied only to the configured planning specialists. The creative call
+budget remains eight, including routing fallback and narration.
+
+### Narration and individual improvisations
 
 `NarrativeBrief` stores original words, attempted action, and creative details
 separately from canonical facts. It travels with the saved narration job and
@@ -142,15 +190,16 @@ leave durable continuations; restart or `/continue` resumes prose without
 rerouting or resolving the action. Audit reports are separate from canonical
 facts. Narration and rejected proposals do not become factual memory.
 
-Snapshot v8 adds the persisted, party-shared improvisation reward allowance.
-The codec still loads v4–v7 snapshots, pending checks, and confirmations.
+Snapshot v9 adds per-character linked plans and registered prepared items;
+v8 introduced the party-shared improvisation reward allowance.
+The codec still loads v4–v8 snapshots, pending checks, and confirmations.
 Database schema v2 is unchanged. `DATA_DIR/campaigns.db` remains authoritative;
 legacy JSON files remain read-only migration checkpoints.
 
 `[routing].enabled=false` restores the previous supervised workflow in this
 version. `[supervision].enabled=false` selects the legacy direct workflow.
 Configurations without a routing table retain their previous behavior. Disabling
-routing does not downgrade v8 saves for an older binary; preserve a database
+routing does not downgrade v9 saves for an older binary; preserve a database
 backup before deploying.
 
 `agents.example.toml` is the public configuration template. Copy it to the

@@ -68,8 +68,11 @@ def routing_questions(g):
         "improvisation": "Does this attempt need mechanics or world content beyond an existing "
                          "action? Style alone does not need new mechanics.",
         "wants_help": "Is the player asking the DM for help, hints, or what to do next?",
-        "compound": "Are multiple independent mechanical actions requested? Speech or stylistic "
+        "compound": "Are multiple mechanical actions or preparation steps requested? Speech or stylistic "
                     "details accompanying one action do not count as extra actions.",
+        "linked": "Do preparation steps serve one explicit final goal, such as picking up ingredients, "
+                  "mixing them, then attacking one target, or picking up a potion to heal an ally? "
+                  "Independent goals, alternatives, hypotheticals and negated requests are not linked plans.",
     }.items():
         questions[key] = choice(instruction, {"yes": "Yes", "no": "No"})
     return questions, targets, exits
