@@ -143,7 +143,11 @@ class CombatPanel(discord.ui.View):
 
 
 class DiscordBot(discord.Client):
-    def __init__(self, message_content: bool = True):
+    def __init__(self, message_content: bool = True, *, agent_config=None, gateway=None):
+        from core.agent_config import load_agent_config
+        from core.model_gateway import ModelGateway
+        self.agent_config = agent_config or (gateway.config if gateway else load_agent_config())
+        self.model_gateway = gateway or ModelGateway(self.agent_config)
         intents = discord.Intents.default()
         intents.message_content = message_content
         super().__init__(intents=intents)
@@ -192,22 +196,8 @@ class DiscordBot(discord.Client):
         if cid not in self._v4_games:
             from core.service import V4Service
             data_dir = os.environ.get("DATA_DIR", "data")
-            # V4_NARR_THINK / V4_DIGEST_THINK: "off"/"on" forces the
-            # Ollama think toggle (required for qwen3.x reasoning
-            # models); unset = code default (off)
-            def _think_env(key):
-                raw = os.environ.get(key, "").strip().lower()
-                return (False if raw in ("off", "false", "0")
-                        else True if raw in ("on", "true", "1") else None)
             self._v4_games[cid] = V4Service(
-                data_dir,
-                os.environ.get("LLM_URL", "http://127.0.0.1:11434"),
-                os.environ.get("V4_DIGEST_MODEL", "qwen2.5:7b-instruct"),
-                os.environ.get("V4_NARR_MODEL", "qwen3.5:35b"),
-                channel_id=cid,
-                narr_think=_think_env("V4_NARR_THINK"),
-                digest_think=_think_env("V4_DIGEST_THINK"),
-                director_evaluate=_think_env("V4_DIRECTOR_EVALUATE") is True)
+                data_dir, channel_id=cid, agent_config=self.agent_config, gateway=self.model_gateway)
         return self._v4_games[cid]
 
     def _in_v4(self, interaction_or_channel) -> bool:

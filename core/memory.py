@@ -17,6 +17,7 @@ PUBLIC_KINDS = {"scene", "scene_fire", "item", "loot", "death", "combat",
 class MemoryContext:
     current: str
     facts: tuple[str, ...]
+    event_ids: tuple[int, ...] = ()
 
     def render(self) -> str:
         return ("當前引擎狀態（優先於歷史；歷史不代表物品或人物仍在原地）：\n"
@@ -52,15 +53,16 @@ def build_memory(g, query: str = "", *, audience: str = "narrator",
         rank = (e.data.get("scene") == s.id,
                 any(n in e.text for n in mentioned), e.kind in ("beat", "reveal"), e.event_id)
         ranked.append((rank, e))
-    chosen, seen, size = [], set(), 0
+    chosen, ids, seen, size = [], [], set(), 0
     for _, e in sorted(ranked, key=lambda pair: pair[0], reverse=True):
         text = f"[事件 {e.event_id}／回合 {e.turn}] {e.text}"
         if e.text in seen or size + len(text) + 1 > MAX_CHARS:
             continue
         chosen.append(text)
+        ids.append(e.event_id)
         seen.add(e.text)
         size += len(text) + 1
         if len(chosen) == MAX_FACTS:
             break
     log.info("memory | audience=%s facts=%d chars=%d", audience, len(chosen), size)
-    return MemoryContext(json.dumps(current, ensure_ascii=False), tuple(chosen))
+    return MemoryContext(json.dumps(current, ensure_ascii=False), tuple(chosen), tuple(ids))

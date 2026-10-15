@@ -5,80 +5,20 @@ turn; this adds novel-flavoured rendering on top. Any failure returns ""
 and the game loses nothing (degraded mode by construction).
 """
 
-import httpx
+from .agent_config import legacy_config
+from .model_gateway import ModelGateway
 
 
 class Narrator:
-    def __init__(self, llm_url: str, model: str = "qwen3.5:35b",
-                 think: bool | None = False):
-        self.url = llm_url.rstrip("/")
-        self.model = model
-        # None = omit (model default); False/True forces Ollama's native
-        # think toggle — REQUIRED for qwen3.x-style reasoning models,
-        # whose thinking would otherwise consume the whole token budget
-        self.think = think
-
-    def _body(self, prompt: str, max_tokens: int, stream: bool) -> dict:
-        body = {
-            "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": stream,
-            "options": {"temperature": 0.7, "num_predict": max_tokens}}
-        if self.think is not None:
-            body["think"] = self.think
-        return body
+    def __init__(self, llm_url: str = "http://127.0.0.1:11434", model: str = "qwen3.5:35b",
+                 think: bool | None = False, *, gateway=None):
+        self.gateway = gateway or ModelGateway(legacy_config(llm_url, narr_model=model, narr_think=think))
 
     async def _call(self, prompt: str, max_tokens: int) -> str:
-        """Non-streaming native /api/chat call."""
-        async with httpx.AsyncClient(timeout=180) as c:
-            r = await c.post(f"{self.url}/api/chat",
-                             json=self._body(prompt, max_tokens, False))
-            r.raise_for_status()
-            return (r.json().get("message", {}).get("content")
-                    or "").strip()
+        return await self.gateway.complete("narrator", prompt, max_tokens=max_tokens)
 
-    async def _stream(self, prompt: str, on_delta=None,
-                      max_tokens: int = 400) -> str:
-        """Streaming native /api/chat (ndjson) — on_delta receives the
-        growing text as tokens arrive (v3 word-by-word UX).
-        v6 latency guard: per-chunk read timeout — a stalled generation
-        returns whatever arrived instead of hanging the player."""
-        import json as _json
-        text = ""
-        # generous total, but ANY single read taking >15s = stall
-        timeout = httpx.Timeout(180.0, connect=5.0, read=15.0)
-        async with httpx.AsyncClient(timeout=timeout) as c:
-            try:
-                async with c.stream(
-                        "POST", f"{self.url}/api/chat",
-                        json=self._body(prompt, max_tokens, True)) as resp:
-                    resp.raise_for_status()
-                    async for line in resp.aiter_lines():
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            chunk = _json.loads(line)
-                        except _json.JSONDecodeError:
-                            continue
-                        delta = (chunk.get("message", {})
-                                 .get("content", ""))
-                        if delta:
-                            text += delta
-                            if on_delta:
-                                try:
-                                    on_delta(text)
-                                except Exception:
-                                    pass
-                        if chunk.get("done"):
-                            break
-            except httpx.HTTPError as e:
-                # stall/timeout mid-stream: keep the partial prose
-                import logging
-                logging.getLogger("dnd-bot").warning(
-                    "narration stream interrupted (%s), %d chars so far",
-                    type(e).__name__, len(text))
-        return text
+    async def _stream(self, prompt: str, on_delta=None, max_tokens: int = 400) -> str:
+        return await self.gateway.stream("narrator", prompt, on_delta, max_tokens=max_tokens)
 
     async def continue_text(self, partial: str, on_delta=None, context: str = "") -> str:
         """Resume narration that was cut off mid-output: continue the

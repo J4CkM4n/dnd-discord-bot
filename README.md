@@ -1,36 +1,43 @@
-# D&D DM Bot — v6 · Engine × Generative Director
+# D&D DM Bot — supervised agents and deterministic gameplay
 
-Self-hosted Dungeon Master for Discord. **Game engine does 70%** (rules,
-state, combat, dice); **LLM does 30%** (reading player intent, writing
-prose). The game is fully playable without any LLM.
+Self-hosted Dungeon Master for Discord. A main agent coordinates action
+interpretation, memory retrieval, the director, progress reviews, and narration.
+The engine owns authorization, dice, rules, and every game-state mutation.
+The game remains playable without models through typed commands and the CLI.
 
 ## Architecture
 
-```
-Player text ──→ [Digestor LLM 12b] ──→ Intent JSON
-                                             │
-                                             ▼
-                                    [GAME ENGINE]  ←── no LLM
-                                    validate + resolve
-                                    dice · HP · items · combat · scenes
-                                             │
-                                             ▼
-                                    [Ledger]  append-only facts
-                                             │
-                              ┌──────────────┼──────────────┐
-                              ▼              ▼              ▼
-                        [Templates]    [Narrator 27b]   [Debug Portal]
-                        skeleton prose  polish + flavour  #dnd-health
-                        (no LLM)        (s2t + guards)    log stream
+```mermaid
+flowchart TD
+    Player[Freeform player action] --> Main[Main agent: select and review operators]
+    Main --> Action[Action interpretation]
+    Main --> Memory[Deterministic memory retrieval]
+    Main --> Director[Director proposals]
+    Main --> Evaluator[Optional JEV evaluation]
+    Action --> Review[Main agent decision]
+    Memory --> Review
+    Director --> Review
+    Evaluator --> Review
+    Review --> Engine[Engine: authorize, validate, resolve]
+    Typed[Typed combat commands] --> Engine
+    Engine --> Commit[SQLite: commit game and append facts]
+    Commit --> Progress[Main agent: progress operator and review]
+    Progress --> Narrator[Main agent: narrator]
+    Narrator --> Discord[Guarded Discord output]
+    Main --> Audit[Separate operator audit records]
+    Progress --> Audit
 ```
 
 ## Quick Start
 
 ```bash
-# GB10 (or any box with Ollama)
+# Python 3.11+; Ollama locally or an OpenAI-compatible endpoint
 pip install -r requirements.txt
-cp .env.example .env        # fill DISCORD_TOKEN, LLM_URL, V4_CHANNEL_IDS
-                            # (V4_* names kept for config stability)
+cp .env.example .env        # fill DISCORD_TOKEN and V4_CHANNEL_IDS
+# Edit agents.toml for provider/model choices; credentials stay in environment.
+set -a
+source .env
+set +a
 python bot.py
 
 # no-LLM test (proves the engine works standalone)
@@ -107,14 +114,17 @@ core/                   # the game engine (v6)
 ├── turn.py             # Game state: party, combat, inventory, slots
 ├── rules_core.py       # validate + resolve (the only write path)
 ├── ledger.py           # append-only facts with stable per-channel event IDs
-├── digestor.py         # 12b: freeform text → Intent JSON
-├── narrator.py         # 27b: facts + skeletons → prose
+├── digestor.py         # action role: freeform text → Intent JSON
+├── narrator.py         # narrator role: facts + skeletons → prose
 ├── templates.py        # deterministic prose skeletons
 ├── guards.py           # output defenses (placeholders, scrubbing, s2t)
 ├── service.py          # serialized commands, staged turns, commit before output
 ├── persistence.py      # SQLite snapshots, event appends, decision audit, narration
 ├── state.py            # complete state codec + legacy JSON import support
-├── memory.py           # bounded factual recall for director and narrator
+├── memory.py           # bounded factual recall with event references
+├── agent_config.py     # startup TOML validation and environment references
+├── model_gateway.py    # shared provider APIs, streaming, budgets, audit metadata
+├── operators.py        # main agent and validated specialist reports
 ├── director.py         # engine gate: prop/scene canonization
 ├── director_llm.py     # generative Director (unplanned places/finds)
 ├── plot.py             # plot spine: clocks + trigger-fired beats
@@ -139,18 +149,93 @@ legacy/                 # v3 code (archived, not imported)
 └── tools-v3/           # v3-era tools (seed_inv, playtest, status, ...)
 ```
 
-## Models
+## Models and centralized configuration
 
-| Role | Model | Purpose |
+`agents.toml` is loaded once when the bot starts and shared by every channel.
+Use `AGENT_CONFIG=/path/to/agents.toml` for a different file. Restart after edits.
+Invalid configuration fails startup with a nonzero exit status.
+
+| Role | Default model | Responsibility |
 |---|---|---|
-| Digestor | qwen2.5:7b-instruct | Player text → Intent JSON (<1s; 9/9 Cantonese routing bench) |
-| Narrator | qwen3.5:35b (think **off**) | Facts → streamed prose (2.5s warm; ~13× faster than the old gemma3:27b) |
-| Director | qwen2.5:7b-instruct | Unplanned scenes/items as typed JSON — the engine canonizes |
+| `main` | qwen2.5:7b-instruct | Select operators, reconcile intent, approve proposals and guidance |
+| `action` | qwen2.5:7b-instruct | Interpret freeform actions with confidence |
+| `progress` | qwen2.5:7b-instruct | Assess goals, stalls, and repeated actions from evidence |
+| `director` | qwen2.5:7b-instruct | Propose unplanned scenes or inert props |
+| `evaluator` | qwen2.5:7b-instruct | Optional relevance/consistency review for JEV |
+| `narrator` | qwen3.5:35b | Render committed facts and approved guidance |
 
-All optional — the game runs with zero LLM (`python core/cli.py selftest`).
-Note: qwen3.x are REASONING models — narrator requires `V4_NARR_THINK=off`
-or thinking consumes the whole token budget (and the OpenAI-compat endpoint
-ignores the flag; we use Ollama's native `/api/chat`).
+Each `[roles.<role>]` accepts `provider`, `model`, `temperature`, `max_tokens`,
+and `timeout` (seconds). Ollama roles also accept `think`; OpenAI-compatible
+roles accept `reasoning_effort`. Unsupported combinations are rejected.
+Thinking defaults off for Ollama so small output budgets remain available for
+answers. `reasoning_effort` uses `max_completion_tokens` and omits temperature.
+
+Providers support native Ollama `/api/chat` and OpenAI-compatible
+`/chat/completions`, including streaming. For a hosted narrator, add:
+
+```toml
+[providers.hosted]
+api = "openai"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+json_mode = true
+
+# Replace the existing narrator role table with this one:
+[roles.narrator]
+provider = "hosted"
+model = "your-provider-model-id"
+max_tokens = 400
+timeout = 180
+```
+
+Set `OPENAI_API_KEY` in the process environment or your untracked `.env`.
+`api_key_env` names a variable; **never put credential values in TOML**. The same
+option supports authenticated Ollama proxies. Set `json_mode = false` for an
+endpoint that does not implement JSON response-format parameters; responses
+still undergo local JSON/schema validation. OpenAI base URLs include the API
+prefix (usually `/v1`).
+
+Explicit TOML fields override legacy environment settings. Omitted base URLs
+inherit `LLM_URL`; omitted models inherit `V4_DIGEST_MODEL` / `V4_NARR_MODEL`;
+Ollama thinking inherits `V4_DIGEST_THINK` / `V4_NARR_THINK`; optional evaluation
+inherits `V4_DIRECTOR_EVALUATE`. Code defaults apply when these are absent.
+Discord token, channel IDs, and `DATA_DIR` remain environment settings.
+
+## Main-agent control and progress
+
+The main model selects a bounded set of action, memory, and director operators,
+then reviews their reports. It can accept an existing intent or request
+clarification; it cannot invent a mechanical result. Operators cannot call one
+another, write campaign state, or send Discord messages. The service hosts the
+controller and enforces ownership, confirmation, legality, and final verification.
+
+Every command allows at most **six model calls**, including failures, evaluation,
+and narration, with at most **three main-model calls**. Optional work reserves a
+final main decision and narration. There are no retries or delegation cycles.
+`[supervision].max_calls` can lower the limit to 4 or 5. Typed combat bypasses
+intent supervision; inventory and status remain immediate. If the main model
+fails, only a deterministic parsed action can proceed; otherwise the player is
+asked to clarify. Low-confidence movement, attack, and search require confirmation.
+
+The controller schedules progress review after explicit help, a scene change,
+a plot beat, combat completion, or every five accepted gameplay actions
+(`progress_interval`). Simultaneous triggers coalesce. The game commits first;
+the progress operator then reports to the main agent before narration. A budget
+shortage or failed review preserves pending triggers for a later turn or
+`/continue`, without replaying the action.
+
+Progress reports distinguish authored objectives from inferred goals and cite
+visible event IDs. They can flag stalls/repetition and recommend choices from
+current public state. They cannot complete objectives, move plot clocks, grant
+rewards, or add facts. Optional public authored objectives belong in `plot.json`:
+`"objectives": [{"id": "route", "text": "尋找航路", "public": true}]`.
+Unpublished objectives and future beats stay out of progress prompts. The main
+agent selects guidance from the report; only approved choices reach narration.
+
+`[supervision].enabled = false` retains the older direct interpretation/director
+flow while still using centralized providers and the shared call budget. Legacy
+Python callers using `V4Service(..., llm_url, ...)` also retain that flow unless
+an enabled `AgentConfig` or gateway is supplied.
 
 ## Director decisions and campaign memory
 
@@ -160,9 +245,10 @@ The model proposes one scene or inert item; the engine validates its types,
 limits, uniqueness, and item restrictions before staging it with the action.
 Rejected actions leave no generated world objects behind.
 
-Set `V4_DIRECTOR_EVALUATE=on` to add one advisory model call checking relevance
+Set `[supervision].director_evaluate = true` (or legacy
+`V4_DIRECTOR_EVALUATE=on`) to add one advisory model call checking relevance
 and consistency against canon, current state, and campaign history. It uses the
-digestor model and its thinking setting. Default: `off`. Invalid, unavailable,
+configured `evaluator` role. Default: `off`. Invalid, unavailable,
 or negative evaluations reject the proposal; no retries occur. Existing
 deterministic gameplay remains available. This is a decision workflow, not a
 trained new model; narrative consistency judgments remain fallible.
@@ -178,10 +264,18 @@ continues to be shared background in prompts.
 
 `DATA_DIR/campaigns.db` (default `data/campaigns.db`) is the authoritative store.
 It contains isolated channel snapshots, append-only events, director decision
-records, and narration status. Saves use SQLite transactions with WAL and full
+records, operator audit reports, progress scheduling state, and narration status. Saves use SQLite transactions with WAL and full
 synchronization. Each command stages its changes, commits the snapshot and new
 events, then sends the verdict and starts narration. Narration completion is
 saved separately, without rewriting the gameplay snapshot or past events.
+
+Database schema v2 migrates v1 transactionally and preserves existing events.
+Operator reports live in `operator_reports`, separate from the canonical ledger,
+with trace ID, provider/model, source revision, event references, status, latency,
+and call count. Stale reports are rejected before use. Audit appends share the
+corresponding state transaction. Approved guidance is saved with the narration
+job before streaming, and interrupted streams remain resumable. A restart uses
+that guidance without invoking action operators or resolving the action again.
 
 Snapshots include pending checks, player-bound confirmations, combat effects,
 plot progress, RNG state, and continuation references. `/confirm` and `/roll`

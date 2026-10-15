@@ -1,29 +1,22 @@
-"""v4 digestor: free-form player text → Intent JSON (gemma3:12b).
+"""Action operator: free-form player text → validated Intent JSON.
 
-The LLM only READS language here — its output is data the engine then
-validates. Any failure falls back to the deterministic command parser,
-and finally to a low-confidence 'talk' intent (a safe sink: facts only).
+The main controller uses strict mode: failures return no candidate. Legacy
+callers retain the deterministic parser / low-confidence talk fallback.
 """
 
-import json
-import re
-
-import httpx
+from .agent_config import legacy_config
+from .model_gateway import ModelGateway, json_object
 
 from .intent import ACTIONS, Intent, parse_command
 
 
 class Digestor:
-    def __init__(self, llm_url: str, model: str = "qwen3.5:35b",
-                 think: bool | None = False):
-        self.url = llm_url.rstrip("/")
-        self.model = model
-        # reasoning models MUST run with think off here or the budget
-        # is consumed before any JSON is emitted (None = model default)
-        self.think = think
+    def __init__(self, llm_url: str = "http://127.0.0.1:11434", model: str = "qwen2.5:7b-instruct",
+                 think: bool | None = False, *, gateway=None):
+        self.gateway = gateway or ModelGateway(legacy_config(llm_url, digest_model=model, digest_think=think))
 
     async def digest(self, text: str, party_names, scene_name: str = "",
-                     exits=(), known_targets=()) -> Intent:
+                     exits=(), known_targets=(), *, strict=False) -> Intent | None:
         tgt_line = (f"已知目標（盡量用這些精確名稱）: {'、'.join(known_targets)}\n"
                     if known_targets else "")
         prompt = (
@@ -76,7 +69,8 @@ class Digestor:
             f"（通道: {'、'.join(exits) if exits else '無'}）\n"
             + tgt_line +
             '欄位: {"paraphrase","action","actor","target","item",'
-            '"spell","destination","utterance","skill","wants_help"} — '
+            '"spell","destination","utterance","skill","wants_help","confidence"} — '
+            "confidence 係 0 到 1 的確定程度；拿不準就低於 0.7。"
             "paraphrase 係書面中文重述；skill 填英文技能名"
             "（stealth/insight/medicine/athletics/acrobatics/"
             "sleight of hand/survival/arcana/history/nature/religion/"
@@ -130,26 +124,21 @@ class Digestor:
             "拿不準時，偏向遊戲動作（玩家的行動不能被漏掉）。\n"
             f'玩家輸入:「{text}」→')
         try:
-            # native /api/chat (the OpenAI-compat endpoint ignores the
-            # think toggle that reasoning models require)
-            body = {
-                "model": self.model,
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": False,
-                "options": {"temperature": 0.1, "num_predict": 200}}
-            if self.think is not None:
-                body["think"] = self.think
-            async with httpx.AsyncClient(timeout=60) as c:
-                r = await c.post(f"{self.url}/api/chat", json=body)
-                r.raise_for_status()
-                out = r.json().get("message", {}).get("content") or ""
+            out = await self.gateway.complete("action", prompt, json_mode=True)
             try:
                 from opencc import OpenCC
                 out = OpenCC("s2t").convert(out)  # 剑 -> 劍 (item names!)
             except ImportError:
                 pass
-            m = re.search(r"\{.*\}", out, re.S)
-            data = json.loads(m.group(0))
+            data = json_object(out)
+            for key in ("actor", "target", "item", "spell", "destination", "utterance", "skill"):
+                if key in data and not isinstance(data[key], str):
+                    raise ValueError("Invalid intent field")
+            confidence = data.get("confidence", 0.8)
+            if type(confidence) not in (int, float) or not 0 <= confidence <= 1:
+                raise ValueError("Invalid confidence")
+            if "wants_help" in data and type(data["wants_help"]) is not bool:
+                raise ValueError("Invalid help flag")
             action = data.get("action", "")
             if action not in ACTIONS:
                 raise ValueError(f"bad action: {action}")
@@ -163,10 +152,12 @@ class Digestor:
                 utterance=(data.get("utterance") or "").strip(),
                 skill=(data.get("skill") or "").strip(),
                 raw=text,
-                confidence=max(0.0, min(1.0, float(data.get("confidence") or 0.8))),
+                confidence=float(confidence),
                 wants_help=str(data.get("wants_help", "")).strip().lower()
                 in ("true", "1", "yes", "係", "是"))
         except Exception:
+            if strict:
+                return None
             it = parse_command(text, party_names)
             if it is None:
                 it = Intent(action="talk", utterance=text, raw=text,

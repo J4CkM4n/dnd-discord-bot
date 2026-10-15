@@ -10,37 +10,19 @@ touches game state. Uses the small fast digestor model (~1s).
 import json
 import logging
 import re
-import time
-
-import httpx
+from .agent_config import legacy_config
+from .model_gateway import ModelGateway
 
 log = logging.getLogger("dnd-bot")
 
 
 class DirectorLLM:
-    def __init__(self, llm_url: str, model: str = "qwen2.5:7b-instruct",
-                 think: bool | None = None):
-        self.url = llm_url.rstrip("/")
-        self.model = model
-        self.think = think
+    def __init__(self, llm_url: str = "http://127.0.0.1:11434", model: str = "qwen2.5:7b-instruct",
+                 think: bool | None = None, *, gateway=None):
+        self.gateway = gateway or ModelGateway(legacy_config(llm_url, digest_model=model, digest_think=think))
 
-    async def _call(self, prompt: str, max_tokens: int = 200) -> str:
-        body = {
-            "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": False, "format": "json",
-            "options": {"temperature": 0.8, "num_predict": max_tokens}}
-        if self.think is not None:
-            body["think"] = self.think
-        started = time.monotonic()
-        try:
-            async with httpx.AsyncClient(timeout=30) as c:
-                r = await c.post(f"{self.url}/api/chat", json=body)
-                r.raise_for_status()
-                out = (r.json().get("message", {}).get("content") or "")
-        finally:
-            log.info("director call | model=%s ms=%.1f", self.model,
-                     (time.monotonic() - started) * 1000)
+    async def _call(self, prompt: str, max_tokens: int = 200, role="director") -> str:
+        out = await self.gateway.complete(role, prompt, json_mode=True, max_tokens=max_tokens)
         try:
             from opencc import OpenCC
             out = OpenCC("s2t").convert(out)   # names enter world state
@@ -82,7 +64,7 @@ class DirectorLLM:
                 return None
             return {"name": name, "description": desc, "npc": npc}
         except Exception as e:
-            log.warning("director gen_scene failed: %s", e)
+            log.warning("director gen_scene failed: %s", type(e).__name__)
             return None
 
     async def gen_item(self, tone: str, scene_name: str,
@@ -110,7 +92,7 @@ class DirectorLLM:
                 return None
             return {"name": name}
         except Exception as e:
-            log.warning("director gen_item failed: %s", e)
+            log.warning("director gen_item failed: %s", type(e).__name__)
             return None
 
     async def evaluate(self, proposal, context: str, action: str) -> tuple[bool, str]:
@@ -123,14 +105,14 @@ class DirectorLLM:
             "衝突、不相關或無法判斷時拒絕。只輸出一個 JSON："
             '{"relevant":true,"consistent":true,"reason":"簡短原因"}')
         try:
-            d = _object(await self._call(prompt, max_tokens=160))
+            d = _object(await self._call(prompt, max_tokens=160, role="evaluator"))
             if set(d) != {"relevant", "consistent", "reason"} or any(
                     type(d[k]) is not bool for k in ("relevant", "consistent")) \
                     or type(d["reason"]) is not str or len(d["reason"]) > 240:
                 return False, "invalid_evaluation"
             return d["relevant"] and d["consistent"], d["reason"]
         except Exception as exc:
-            log.warning("director evaluation unavailable: %s", exc)
+            log.warning("director evaluation unavailable: %s", type(exc).__name__)
             return False, "evaluation_unavailable"
 
 

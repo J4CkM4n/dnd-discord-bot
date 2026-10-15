@@ -24,10 +24,15 @@ async def main():
         sys.exit(1)
 
     from adapters.discord_bot import run_discord
+    from core.agent_config import ConfigError
     try:
         await run_discord(discord_token)
+    except ConfigError as e:
+        log.error("Invalid agent configuration: %s", e)
+        sys.exit(1)
     except Exception as e:
         log.error("discord adapter crashed: %s", e)
+        sys.exit(1)
     sys.exit(0)
 
 

@@ -76,6 +76,9 @@ from .turn import Game
 from .state import encode_game, decode_game, clone_game
 from .persistence import CampaignRepository, StorageError
 from .memory import build_memory
+from .agent_config import legacy_config
+from .model_gateway import ModelGateway, current_turn, turn_context
+from .operators import MainAgent
 
 # a narration that ends WITHOUT one of these was cut mid-sentence
 # (max_tokens cutoff / stream drop) -> /continue must finish it
@@ -96,9 +99,17 @@ def serialized(result="turn"):
                 stage._unfinished = deepcopy(self._unfinished)
                 stage._recent_narrations = self._recent_narrations.copy()
                 stage._decisions = []
+                stage._operator_state = deepcopy(self._operator_state)
+                stage._audit_cursor = 0
+                stage._supervised = None
                 stage._committed = False
                 try:
-                    return await fn(stage, *args, **kwargs)
+                    with turn_context(self.agent_config.max_calls, self._revision) as turn:
+                        outcome = await fn(stage, *args, **kwargs)
+                        # Also retain failures/clarifications that produce no game turn.
+                        if len(turn.records) > stage._audit_cursor:
+                            stage._save(narration_only=True)
+                        return outcome
                 except StorageError:
                     log.exception("campaign save failed | channel=%s", self.channel_id)
                     msg = ("⚠️ 行動已儲存；敘事尚未儲存，請用 `/continue`。"
@@ -113,13 +124,13 @@ def serialized(result="turn"):
 
 
 class V4Service:
-    def __init__(self, data_dir: str, llm_url: str,
+    def __init__(self, data_dir: str, llm_url: str = "http://127.0.0.1:11434",
                  digest_model: str = "qwen2.5:7b-instruct",
                  narr_model: str = "qwen3.5:35b",
                  channel_id: str = "",
                  narr_think: bool | None = False,
                  digest_think: bool | None = None,
-                 director_evaluate: bool = False):
+                 director_evaluate: bool = False, *, agent_config=None, gateway=None):
         fname = f"v4_state_{channel_id}.json" if channel_id else "v4_state.json"
         self.path = os.path.join(data_dir, fname)  # read-only legacy import source
         self.channel_id = channel_id
@@ -127,10 +138,16 @@ class V4Service:
         self.repository = CampaignRepository(os.path.join(data_dir, "campaigns.db"))
         self._revision = self._saved_count = 0
         self._decisions = []
-        self.digestor = Digestor(llm_url, digest_model, think=digest_think)
-        self.narrator = Narrator(llm_url, narr_model, think=narr_think)
-        self.director = DirectorLLM(llm_url, digest_model, think=digest_think)
-        self.director_evaluate = director_evaluate
+        self._audit_cursor = 0
+        self._operator_state = {"accepted_turns": 0, "pending_triggers": [], "last_reviewed_event": 0}
+        self._supervised = None
+        self.agent_config = agent_config or (gateway.config if gateway else legacy_config(
+            llm_url, digest_model, narr_model, digest_think, narr_think, director_evaluate))
+        self.gateway = gateway or ModelGateway(self.agent_config)
+        self.digestor = Digestor(gateway=self.gateway)
+        self.narrator = Narrator(gateway=self.gateway)
+        self.director = DirectorLLM(gateway=self.gateway)
+        self.director_evaluate = self.agent_config.director_evaluate
         self._unfinished = None
         self.pending = None
         self.pending_user_id = ""
@@ -165,14 +182,21 @@ class V4Service:
         published_plot = deepcopy(self.plot_state)
         published_pending = deepcopy(self.pending)
         published_unfinished = deepcopy(self._unfinished)
+        published_operators = deepcopy(self._operator_state)
+        turn = current_turn()
+        audits = turn.records[self._audit_cursor:] if turn else []
         revision = self.repository.commit(
             self.channel_id, self._revision,
             None if narration_only else self._snapshot(),
             [asdict(e) for e in self.game.ledger.entries[self._saved_count:]],
-            self._unfinished, self._decisions, imported_from=imported_from)
+            self._unfinished, self._decisions, imported_from=imported_from,
+            operator_records=audits, operator_state=self._operator_state)
         self._revision = revision
         self._saved_count = len(self.game.ledger.entries)
         self._decisions = []
+        if turn:
+            self._audit_cursor = len(turn.records)
+            turn.revision = revision
         self._committed = True
         owner = getattr(self, "_owner", self)
         owner.game = published_game
@@ -181,6 +205,7 @@ class V4Service:
         owner.pending_user_id = self.pending_user_id
         owner.pending_admin = self.pending_admin
         owner._unfinished = published_unfinished
+        owner._operator_state = published_operators
         owner._revision = revision
         owner._saved_count = self._saved_count
         owner._recent_narrations = self._recent_narrations.copy()
@@ -199,6 +224,7 @@ class V4Service:
             else:
                 blob, entries = record["snapshot"], record["entries"]
                 unfinished = record["unfinished"]
+                self._operator_state.update(record.get("operator_state", {}))
             g = decode_game(blob, entries)
             self.plot_state = blob.get("plot") or new_state(self.plot)
             self.pending = Intent(**blob["pending"]) if blob.get("pending") else None
@@ -250,11 +276,25 @@ class V4Service:
         t, was_scrubbed = scrub_input(t)
         if was_scrubbed:
             g.ledger.add(author or "?", "deny", "已過濾可疑指令文字", reason="injection")
+        probe = parse_command(t, party_names=list(g.party)) or Intent("meta", actor=next(
+            (n for n in g.party if t.startswith(n)), ""))
+        reason = self._authorize(probe, user_id, admin_actor)
+        if reason:
+            return self._deny(probe.actor, reason)
         if t.startswith(("((", "//")):
             it = Intent(action="chat", utterance=t.lstrip("(/ "), raw=t)
         else:
             it = parse_command(t, party_names=list(g.party)) if structured else None
-            if it is None:
+            if self.agent_config.enabled and (not structured or (it and it.action in ("move", "search"))):
+                parsed = it if structured else parse_command(t, party_names=list(g.party))
+                if self.pending and self.pending_user_id != str(user_id):
+                    return self._deny(probe.actor, "請先等提出行動的玩家確認待決行動。")
+                self._supervised = await self._main_agent().interpret(
+                    clone_game(g), self._revision, t, parsed, user_id=user_id,
+                    admin_actor=admin_actor, rules=deepcopy(self.rules),
+                    plot_state=deepcopy(self.plot_state), locked_intent=structured)
+                it = self._supervised.intent
+            elif it is None and not structured:
                 it = await self.digestor.digest(
                     t, list(g.party), g.world.here.name, list(g.world.here.exits.values()),
                     known_targets=list(g.enemies) + [n["name"] for n in g.world.here.npcs] + list(g.party))
@@ -276,6 +316,9 @@ class V4Service:
                 it.action, it.skill = "skill", skill
                 it.target = it.target or it.args.pop("to", "")
         return await self._execute(it, user_id, admin_actor, text, on_delta, on_resolved)
+
+    def _main_agent(self):
+        return MainAgent(self.gateway, self.digestor, self.director, self.narrator)
 
     def _authorize(self, it, user_id, admin_actor=""):
         g = self.game
@@ -313,6 +356,16 @@ class V4Service:
         it = deepcopy(self.pending)
         admin_actor = it.actor if self.pending_admin else ""
         it.args["confirmed"] = True
+        if self.agent_config.enabled:
+            reason = self._authorize(it, user_id, admin_actor)
+            if reason:
+                return self._deny(it.actor, reason)
+            self._supervised = await self._main_agent().interpret(
+                clone_game(self.game), self._revision, it.raw, it, user_id=user_id,
+                admin_actor=admin_actor, rules=deepcopy(self.rules),
+                plot_state=deepcopy(self.plot_state), locked_intent=True)
+            if self._supervised.intent is None:
+                return ["❓ 請再描述你想確認的行動。"], ""
         return await self._execute(it, user_id, admin_actor, it.raw, on_delta, on_resolved)
 
     async def _execute(self, it, user_id, admin_actor, text, on_delta, on_resolved):
@@ -342,7 +395,10 @@ class V4Service:
         baseline = clone_game(g)
         idx0 = len(g.ledger.entries)
         if not reason:
-            await self._direct(it)
+            if self.agent_config.enabled:
+                self._apply_supervised_proposal(it)
+            else:
+                await self._direct(it)
         r = resolve(g, it)
         if not r.accepted or r.confirm is not None:
             # No partially resolved mechanics or generated props may survive a denial.
@@ -379,9 +435,85 @@ class V4Service:
                        and len(g.ledger.entries) > idx0)
         if r.lines:
             self._unfinished = self._narration_job(idx0, player_input, it.wants_help) if narrate else None
+        self._queue_progress(idx0, baseline, accepted=r.accepted and r.confirm is None,
+                             wants_help=it.wants_help or bool(_HELP_RE.search(text)),
+                             gameplay=it.action not in ("meta", "chat"))
         self._save()
         return await self._deliver(r.lines, idx0, player_input, on_delta, on_resolved,
                                    narrate=narrate, wants_help=it.wants_help)
+
+    def _apply_supervised_proposal(self, it):
+        result = self._supervised
+        if not result or not result.director_decision:
+            return
+        decision, proposal = result.director_decision, result.proposal
+        if proposal:
+            reason = ("stale_revision" if result.source_revision != self._revision else
+                      verify_proposal(self.game, proposal) or validate(self.game, it, allow_unplanned_move=True))
+            if reason:
+                decision.reasons.append(reason)
+            elif proposal.kind == "scene":
+                decision.accepted = canonize_scene(self.game, proposal.content)
+                if decision.accepted:
+                    it.destination = next(sid for sid, scene in self.game.world.scenes.items()
+                                          if scene.name == proposal.content["name"].strip())
+            else:
+                name = proposal.content["name"].strip()
+                self.game.world.here.hidden_items.append((name, 1))
+                self.game.ledger.add("director", "materialize", f"搜索途中世界浮現了 {name}",
+                                     item=name, scene=self.game.world.current, visibility="private")
+                decision.accepted = True
+        self._decisions.append(asdict(decision))
+
+    def _queue_progress(self, idx0, baseline, *, accepted=True, wants_help=False, gameplay=True):
+        if not self.agent_config.enabled or not accepted:
+            return
+        state = self._operator_state
+        triggers = set(state["pending_triggers"])
+        if gameplay and self.game.ledger.turn > baseline.ledger.turn:
+            state["accepted_turns"] += 1
+            if state["accepted_turns"] % self.agent_config.progress_interval == 0:
+                triggers.add("interval")
+        if wants_help:
+            triggers.add("help")
+        if self.game.world.current != baseline.world.current:
+            triggers.add("scene")
+        if any(e.kind == "beat" for e in self.game.ledger.entries[idx0:]):
+            triggers.add("plot_beat")
+        if baseline.combat.active and not self.game.combat.active:
+            triggers.add("combat_complete")
+        state["pending_triggers"] = sorted(triggers)
+
+    async def _review_progress(self, player_input):
+        triggers = self._operator_state["pending_triggers"]
+        if not self.agent_config.enabled or not triggers or not self._unfinished:
+            return
+        guidance = await self._main_agent().review_progress(
+            clone_game(self.game), self._revision, triggers.copy(), deepcopy(self.plot),
+            player_input, self._unfinished.get("npc_name", ""))
+        if guidance and guidance["source_revision"] == self._revision:
+            self._unfinished["guidance"] = guidance
+            self._operator_state["pending_triggers"] = []
+            self._operator_state["last_reviewed_event"] = self._unfinished["end_event_id"]
+        # Durable before streaming, including deferred trigger and audit status.
+        self._save(narration_only=True)
+
+    def _guidance(self):
+        guidance = (self._unfinished or {}).get("guidance")
+        if not guidance or not guidance.get("options"):
+            return ""
+        last = next((e.event_id for e in reversed(self.game.ledger.entries)
+                     if e.kind not in ("narration", "guard")), 0)
+        if guidance.get("source_event_id") != last:
+            return ""
+        return ("主代理已審核的可選下一步（只是建議，不是已發生事件；"
+                "以 DM 身份提出，不能當作 NPC 的知識）：" + "；".join(guidance["options"]))
+
+    def _narrator_interrupted(self):
+        turn = current_turn()
+        last = next((r for r in reversed(turn.records) if r["role"] == "narrator"
+                     and r.get("kind") == "model_call"), None) if turn else None
+        return bool(last and last["status"] != "ok")
 
     async def _direct(self, it):
         g, s = self.game, self.game.world.here
@@ -438,7 +570,7 @@ class V4Service:
                                      item=name, scene=s.id, visibility="private")
                         decision.accepted = True
         except Exception as exc:
-            log.warning("director unavailable: %s", exc)
+            log.warning("director unavailable: %s", type(exc).__name__)
             decision.reasons.append("model_unavailable")
         self._decisions.append(asdict(decision))
         log.info("director decision | kind=%s accepted=%s evaluation=%s reasons=%s",
@@ -463,6 +595,7 @@ class V4Service:
             return lines, ""
         narration = ""
         if narrate:
+            await self._review_progress(player_input)
             try:
                 narration = await self._narrate(idx0, player_input, on_delta, wants_help=wants_help)
             except Exception:
@@ -685,6 +818,8 @@ class V4Service:
         # the DIGESTOR by meaning (wants_help); the regex only backstops
         # the deterministic no-LLM path
         help_bits = []
+        if self._guidance():
+            help_bits.append(self._guidance())
         reveals = [e for e in events
                    if e.kind == "reveal"]
         if reveals and npc_name:
@@ -727,7 +862,8 @@ class V4Service:
         scene_items = [n for n, _ in s.ground_items]
         party_inv = {ch: [n for n, _ in stacks]
                      for ch, stacks in g.inventory.items()}
-        narration = await self.narrator.narrate(
+        narrator = self._main_agent() if self.agent_config.enabled else self.narrator
+        narration = await narrator.narrate(
             safe_facts, g.world.here.name, safe_brief, hints=safe_hints,
             npc_knows=safe_knows, npc_name=npc_name,
             extra_directive=extra, on_delta=on_delta,
@@ -772,7 +908,7 @@ class V4Service:
         # punctuation = the prose was cut mid-sentence (max_tokens /
         # dropped stream) — both leave resumable state
         raw = narration.strip().rstrip("*").rstrip()
-        if not raw or raw[-1] not in _END_PUNCT:
+        if not raw or raw[-1] not in _END_PUNCT or self._narrator_interrupted():
             job = self._unfinished or self._narration_job(idx0, player_input, wants_help)
             self._unfinished = dict(job, text=narration)
         else:
@@ -815,6 +951,7 @@ class V4Service:
         if die is None:
             die = g.d20()
         idx0 = len(g.ledger.entries)
+        baseline = clone_game(g)
         ok, line = resolve_pending_check(g, die)
         lines = [f"🎲 **{pend['actor']}** d20 → **{die}**"]
         if line:
@@ -824,6 +961,7 @@ class V4Service:
         verdict = f"{pend['actor']} 擲骰 d20={die}：{'成功' if ok else '失敗'}"
         player_input = f"{pend.get('origin', '')}（{verdict}）"
         self._unfinished = self._narration_job(idx0, player_input, bool(pend.get("help")))
+        self._queue_progress(idx0, baseline, wants_help=bool(pend.get("help")))
         self._save()
         return await self._deliver(lines, idx0, player_input, on_delta, on_resolved,
                                    wants_help=bool(pend.get("help")))
@@ -844,6 +982,9 @@ class V4Service:
             self._unfinished = None
             self._save(narration_only=True)
             return False, ""
+        # Retry a deferred/failed review with this command's budget, never the action.
+        if not u.get("guidance"):
+            await self._review_progress(u.get("player_input", ""))
         from .guards import (make_restore_map, make_placeholder_map, map_out,
                              map_in, scrub_narration, is_chinese, validate_narration_items)
         if u["text"]:
@@ -851,10 +992,12 @@ class V4Service:
             npc_name = u.get("npc_name", "")
             context = world_block(self.rules) + "\n" + build_memory(
                 self.game, npc_name=npc_name).render()
+            context += "\n" + self._guidance()
             if npc_name:
                 context += f"\n{npc_name} 的對白只能引用當前狀態中該 NPC 的 facts，不能引用其他人的情報。"
             try:
-                cont = await self.narrator.continue_text(
+                narrator = self._main_agent() if self.agent_config.enabled else self.narrator
+                cont = await narrator.continue_text(
                     u["text"], on_delta, context=map_out(context, pmap))
             except Exception:
                 log.exception("continuation unavailable")
@@ -872,7 +1015,8 @@ class V4Service:
                 return False, ""
             full = u["text"] + cont
             raw = full.strip().rstrip("*").rstrip()
-            self._unfinished = dict(u, text=full) if not raw or raw[-1] not in _END_PUNCT else None
+            self._unfinished = (dict(u, text=full)
+                                if not raw or raw[-1] not in _END_PUNCT or self._narrator_interrupted() else None)
             text = map_in(cont, make_restore_map(list(self.game.party)))
             self.game.ledger.add("narrator", "narration", text)
             self._recent_narrations = (self._recent_narrations + [text])[-5:]

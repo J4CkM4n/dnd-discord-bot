@@ -1,0 +1,55 @@
+# Model settings are loaded once at startup. Restart after editing.
+# Explicit values here override legacy LLM_URL / V4_* environment settings.
+version = 1
+
+[supervision]
+enabled = true
+max_calls = 6  # hard maximum; may be reduced to 4 or 5
+progress_interval = 5
+# director_evaluate = false  # omitted: V4_DIRECTOR_EVALUATE or false
+
+[providers.local]
+api = "ollama"
+# base_url = "http://127.0.0.1:11434"  # omitted: LLM_URL or this default
+# api_key_env = "OLLAMA_API_KEY"      # optional authenticated proxy
+
+# Example hosted endpoint (uncomment and export the named secret):
+# [providers.hosted]
+# api = "openai"
+# base_url = "https://api.openai.com/v1"
+# api_key_env = "OPENAI_API_KEY"
+# json_mode = true
+
+# Each role independently selects a provider and model. Omitted model values
+# inherit V4_DIGEST_MODEL (small roles) / V4_NARR_MODEL (narrator), then defaults:
+# qwen2.5:7b-instruct / qwen3.5:35b. Optional keys: temperature, timeout,
+# max_tokens, think (Ollama only), reasoning_effort (OpenAI-compatible only).
+[roles.main]
+provider = "local"
+# model = "qwen2.5:7b-instruct"
+max_tokens = 600
+
+[roles.action]
+provider = "local"
+# model = "qwen2.5:7b-instruct"
+max_tokens = 240
+
+[roles.progress]
+provider = "local"
+# model = "qwen2.5:7b-instruct"
+max_tokens = 600
+
+[roles.director]
+provider = "local"
+# model = "qwen2.5:7b-instruct"
+max_tokens = 200
+
+[roles.evaluator]
+provider = "local"
+# model = "qwen2.5:7b-instruct"
+max_tokens = 200
+
+[roles.narrator]
+provider = "local"
+# model = "qwen3.5:35b"
+max_tokens = 400

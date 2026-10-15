@@ -26,9 +26,10 @@ class CampaignRepository:
             with self.connect() as conn:
                 conn.execute("PRAGMA journal_mode=WAL")
                 version = conn.execute("PRAGMA user_version").fetchone()[0]
-                if version not in (0, 1):
+                if version not in (0, 1, 2):
                     raise StorageError(f"Unsupported database version: {version}")
                 conn.executescript("""
+                    BEGIN IMMEDIATE;
                     CREATE TABLE IF NOT EXISTS channels (
                         channel_id TEXT PRIMARY KEY, revision INTEGER NOT NULL,
                         snapshot TEXT NOT NULL, last_event_id INTEGER NOT NULL,
@@ -48,7 +49,20 @@ class CampaignRepository:
                         channel_id TEXT PRIMARY KEY REFERENCES channels(channel_id),
                         status TEXT NOT NULL, payload TEXT
                     );
-                    PRAGMA user_version=1;
+                    CREATE TABLE IF NOT EXISTS operator_reports (
+                        id INTEGER PRIMARY KEY,
+                        channel_id TEXT NOT NULL REFERENCES channels(channel_id),
+                        revision INTEGER NOT NULL, source_revision INTEGER NOT NULL,
+                        role TEXT NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS operator_reports_channel
+                        ON operator_reports(channel_id, id);
+                    CREATE TABLE IF NOT EXISTS operator_state (
+                        channel_id TEXT PRIMARY KEY REFERENCES channels(channel_id),
+                        payload TEXT NOT NULL
+                    );
+                    PRAGMA user_version=2;
+                    COMMIT;
                 """)
         except (OSError, sqlite3.Error) as exc:
             raise StorageError(f"Cannot open campaign database: {exc}") from exc
@@ -80,15 +94,19 @@ class CampaignRepository:
                     raise StorageError("Campaign event history is incomplete")
                 narr = conn.execute("SELECT payload FROM narration WHERE channel_id=?",
                                     (channel_id,)).fetchone()
+                operators = conn.execute("SELECT payload FROM operator_state WHERE channel_id=?",
+                                         (channel_id,)).fetchone()
                 return {"revision": row[0], "snapshot": json.loads(row[1]),
                         "entries": events,
+                        "operator_state": json.loads(operators[0]) if operators else {},
                         "unfinished": json.loads(narr[0]) if narr and narr[0] else None}
         except (sqlite3.Error, ValueError, TypeError) as exc:
             raise StorageError(f"Cannot read campaign: {exc}") from exc
 
     def commit(self, channel_id: str, revision: int, snapshot: dict | None,
                events: list[dict], unfinished: dict | None,
-               decisions: list[dict] = (), imported_from: str | None = None) -> int:
+               decisions: list[dict] = (), imported_from: str | None = None, *,
+               operator_records: list[dict] = (), operator_state: dict | None = None) -> int:
         """snapshot=None commits narration only. Never rewrite previous events."""
         started = time.monotonic()
         try:
@@ -121,6 +139,13 @@ class CampaignRepository:
                 conn.executemany("INSERT INTO director_decisions(channel_id,revision,payload) "
                                  "VALUES (?,?,?)", [(channel_id, revision + 1, _json(d))
                                                     for d in decisions])
+                conn.executemany("INSERT INTO operator_reports"
+                                 "(channel_id,revision,source_revision,role,status,payload) VALUES (?,?,?,?,?,?)",
+                                 [(channel_id, revision + 1, r["source_revision"], r["role"],
+                                   r["status"], _json(r)) for r in operator_records])
+                if operator_state is not None:
+                    conn.execute("INSERT INTO operator_state VALUES (?,?) ON CONFLICT(channel_id) "
+                                 "DO UPDATE SET payload=excluded.payload", (channel_id, _json(operator_state)))
                 conn.execute("INSERT INTO narration VALUES (?,?,?) ON CONFLICT(channel_id) "
                              "DO UPDATE SET status=excluded.status,payload=excluded.payload",
                              (channel_id, "pending" if unfinished else "complete",
