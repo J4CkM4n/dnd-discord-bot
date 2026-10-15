@@ -28,6 +28,7 @@ _POTION = re.compile(r"治療藥水|治療药水|healing potion", re.I)
 _ORD_RE = re.compile(r"第?\s*([0-9一二三四五六七八九十]+)\s*[隻个個號号]")
 _ZH_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
            "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+_THROW_RE = re.compile(r"掟|擲|丟|抛|扔|撒|潑|噴|倒向|throw", re.I)
 
 
 def resolve_target(g: Game, target: str):
@@ -37,12 +38,12 @@ def resolve_target(g: Game, target: str):
     t = (target or "").strip()
     if not t:
         return None, None
-    for n, f in g.enemies.items():
-        if t == n or t in n or n in t:
-            return f, None
-    for n in g.party:
-        if t == n or t in n or n in t:
-            return None, n
+    # Preserve explicit identity, including corpses: callers must reject an
+    # invalid target rather than silently redirect a numbered attack.
+    if t in g.enemies:
+        return g.enemies[t], None
+    if t in g.party:
+        return None, t
     m = _ORD_RE.search(t)
     if m:
         raw = m.group(1)
@@ -52,10 +53,26 @@ def resolve_target(g: Game, target: str):
         for n, f in g.enemies.items():
             if n == want:
                 return f, None
+        return None, None
+    # An absent explicit ordinal must never fall through to a different foe.
+    if any(chr(0x2460 + i) in t for i in range(10)):
         for n, f in g.enemies.items():
-            if base and base in n:
+            if n in t and any(chr(0x2460 + i) in n for i in range(10)):
                 return f, None
+        return None, None
+    for n, f in g.enemies.items():
+        if not f.dead and f.hp > 0 and (t in n or n in t):
+            return f, None
+    for n in g.party:
+        if t in n or n in t:
+            return None, n
     return None, None
+
+
+def _defeated_target(foe):
+    if foe is not None and (foe.dead or foe.hp <= 0):
+        return f"{foe.name} 已倒下；請選擇仍存活的目標。"
+    return None
 
 
 class ResolveResult:
@@ -298,11 +315,18 @@ def validate(g: Game, it: Intent, *, allow_unplanned_move: bool = False) -> str 
     if it.action in ("use", "give") and actor:
         if not any(s[0] == it.item for s in g.inventory.get(actor, [])):
             return f"SLOT:item:{it.item}"  # fabrication -> snark + deny
+    if it.action == "observe" or (it.action == "creative"
+            and _THROW_RE.search(it.utterance or it.raw or "")):
+        foe, _ = resolve_target(g, it.target or it.utterance or it.raw)
+        if reason := _defeated_target(foe):
+            return reason
     if it.action == "attack":
         item = it.args.get("thrown_item")
         if item and not any(n == item and q > 0 for n, q in g.inventory.get(actor, [])):
             return f"沒有可投擲的「{item}」；不會改用普通攻擊。"
         foe, tgt_char = resolve_target(g, it.target)
+        if reason := _defeated_target(foe):
+            return reason
         if foe is None and tgt_char is None:
             # check scene NPCs — attacking one turns them hostile
             for n in g.world.here.npcs:
@@ -444,15 +468,17 @@ def _attack(g: Game, actor: str, target: str, move: str = "") -> ResolveResult:
     mv = next((m for m in moves if m["name"] == move), None) if move else None
     ability = mv["ability"] if mv else "STR"
     dmg_expr = mv["dmg"] if mv else "1d4"
+    # Validate before spending slots, dice or one-shot advantages.
+    foe, tgt_char = resolve_target(g, target)
+    if reason := _defeated_target(foe):
+        return ResolveResult([reason], accepted=False)
+    if foe is None and tgt_char is None:
+        return ResolveResult([f"找不到目標「{target}」"], accepted=False)
     # leveled-spell moves pay a slot first (v3 economy, engine-enforced)
     req = MOVE_SPELL_LEVEL.get(move, 0) if mv else 0
     if req and not g.spend_slot(actor, req):
         return ResolveResult([f"⚠️ {actor} 的 {req} 環法術格已用盡——改用其他招式。"],
                              accepted=False)
-    # target: enemy slot first, then party (ordinal-aware)
-    foe, tgt_char = resolve_target(g, target)
-    if foe is None and tgt_char is None:
-        return ResolveResult([f"找不到目標「{target}」"], accepted=False)
     ac = foe.ac if foe else g.ac_of(tgt_char)
     bonus = total_mod(g.party[actor], ability, kind="attack")
     # advantage sources: successful stealth (unseen attacker) or a
@@ -573,6 +599,9 @@ def _throw(g: Game, actor: str, it: Intent, utter: str) -> ResolveResult | None:
     name = it.item or _find_carried(g, actor, utter)
     if not name:
         return None  # not a throw of a thing
+    foe, tgt_char = resolve_target(g, it.target or utter)
+    if reason := _defeated_target(foe):
+        return ResolveResult([reason], accepted=False)
     # physics: anything CARRIED can be thrown (splash the potion!);
     # un-carried things only materialize if they're inert props
     if not g.take_item(actor, name, 1):
@@ -584,7 +613,6 @@ def _throw(g: Game, actor: str, it: Intent, utter: str) -> ResolveResult | None:
                 g.world.here.ground_items.remove((n, q))
                 break
     prepared = (getattr(g, "_prepared_items", None) or {}).pop(name, None)
-    foe, tgt_char = resolve_target(g, it.target or utter)
     if foe is not None or tgt_char:
         tname = foe.name if foe else tgt_char
         ac = foe.ac if foe else g.ac_of(tgt_char)
@@ -969,12 +997,11 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
             return resolve_improvisation(g, it.args["improvisation"])
         # v5 A1 affordances: creative actions with real consequences
         u = it.utterance or it.raw or ""
-        _THROW_RE = re.compile(r"掟|擲|丟|抛|扔|撒|潑|噴|倒向|throw", re.I)
         _FIRE_RE = re.compile(r"點燃|点火|放火|燒|烧|点燃|ignite|burn|set fire", re.I)
         if _THROW_RE.search(u):
             r = _throw(g, actor, it, u)
             if r is not None:
-                if g.combat.active:
+                if g.combat.active and r.accepted:
                     r.lines += _post_rotation(g, actor)
                 return r
         if _FIRE_RE.search(u):
@@ -1243,7 +1270,7 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
         # that target rolls with advantage (one-shot, like Help)
         foe, tgt_char = resolve_target(g, it.target)
         if foe is None:
-            foes = [f for f in g.enemies.values() if not f.dead]
+            foes = [f for f in g.enemies.values() if not f.dead and f.hp > 0]
             if not foes:
                 return ResolveResult(["❓ 沒有可觀察的目標"], accepted=False)
             foe = foes[0]

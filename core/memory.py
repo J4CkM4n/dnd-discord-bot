@@ -65,6 +65,8 @@ def build_memory(g, query: str = "", *, audience: str = "narrator",
     current = {"scene": s.name, "description": s.description, "exits": s.exits,
                "fire": s.fire, "ground_items": s.ground_items, "npcs": npcs,
                "inventory": g.inventory,
+               "enemies": {n: {"hp": f.hp, "hp_max": f.hp_max, "dead": f.dead or f.hp <= 0}
+                           for n, f in g.enemies.items()},
                "party": {n: {k: e.get(k) for k in ("hp_now", "hp_max", "conds")}
                          for n, e in g.party.items()}}
     if audience == "director":

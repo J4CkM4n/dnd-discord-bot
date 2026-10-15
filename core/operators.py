@@ -201,7 +201,8 @@ class MainAgent:
                 if turn:
                     turn.limit = config.creative_max_calls
                 data = {"intent": asdict(it), "context": build_memory(g, text).render(),
-                        "enemies": list(g.enemies), "skills": list(SKILL_ABILITY),
+                        "enemies": [n for n, f in g.enemies.items() if not f.dead and f.hp > 0],
+                        "skills": list(SKILL_ABILITY),
                         "difficulty_tiers": list(DIFFICULTIES), "effects": EFFECTS,
                         "rewards": REWARD_CATALOG, "canon": (rules or {}).get("world", {}).get("canon", [])}
                 with reserve_calls(3):
@@ -262,8 +263,7 @@ class MainAgent:
                 raise PlanError("尚有待定檢定，請先用 `/roll d20` 結算。")
             data = {"player_input": text[:1500], "actor": actor,
                     "scene": json.loads(build_memory(g).current),
-                    "visible_targets": [n for n, f in g.enemies.items() if not f.dead and f.hp > 0]
-                        + [n["name"] for n in g.world.here.npcs] + list(g.party),
+                    "visible_targets": g.target_names(),
                     "combat": {"active": g.combat.active, "acted": g.combat.acted, "round": g.combat.round},
                     "ground_items": g.world.here.ground_items,
                     "inventory": g.inventory.get(actor, [])}
@@ -386,8 +386,7 @@ class MainAgent:
                     reports["memory"] = report("memory", revision, {"context": memory.render()}, memory.event_ids)
                 if "action" in requested:
                     it = await self.digestor.digest(text, list(g.party), g.world.here.name,
-                        list(g.world.here.exits.values()), known_targets=list(g.enemies)
-                        + [n["name"] for n in g.world.here.npcs] + list(g.party), strict=True,
+                        list(g.world.here.exits.values()), known_targets=g.target_names(), strict=True,
                         conversation=conversation)
                     reports["action"] = report("action", revision, asdict(it) if it else None,
                                                status="ok" if it else "invalid", gateway=self.gateway)
@@ -436,7 +435,8 @@ class MainAgent:
                     '沒有可靠交談對象時，不要替玩家任選 NPC。'
                     '否定、假設、非致命或其他明確限制必須保留；有真實語意衝突才 clarify。',
                     {"candidates": {k: asdict(v) for k, v in candidates.items()},
-                     "current": json.loads(build_memory(g).current), "enemies": list(g.enemies),
+                     "current": json.loads(build_memory(g).current),
+                     "enemies": [n for n, f in g.enemies.items() if not f.dead and f.hp > 0],
                      "recent_conversation": conversation,
                      "checks": {k: review_candidate(g, v, user_id, admin_actor) for k, v in candidates.items()},
                      "reports": {k: v.read(revision, ids) for k, v in reports.items()}})

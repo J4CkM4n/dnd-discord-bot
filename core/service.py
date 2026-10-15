@@ -370,7 +370,7 @@ class V4Service:
             elif it is None and not structured:
                 it = await self.digestor.digest(
                     t, list(g.party), g.world.here.name, list(g.world.here.exits.values()),
-                    known_targets=list(g.enemies) + [n["name"] for n in g.world.here.npcs] + list(g.party),
+                    known_targets=g.target_names(),
                     conversation=recent_conversation(g, probe.actor))
             if structured and it is not None:
                 it.confidence = 1.0

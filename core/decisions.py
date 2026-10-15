@@ -46,15 +46,15 @@ def choice(instruction, options):
 
 
 def routing_questions(g):
-    targets = list(dict.fromkeys(list(g.enemies) + [n["name"] for n in g.world.here.npcs]
-                                + list(g.party)))[:250]
+    targets = g.target_names()[:250]
     exits = list(dict.fromkeys(g.world.here.exits.values()))[:250]
     questions = {
         "category": choice("What single game action is requested? Preserve negation and hypotheticals. "
                            "Explore is an attempt not yet reducible to move/search/observe.",
                            {a: a for a in (*ACTIONS, "explore", "unknown")}),
         "target": choice("Which visible entity is the intended target? none if no target is needed; "
-                         "unknown for ambiguous or absent entities.",
+                         "unknown for ambiguous or absent entities. Preserve explicit names and ordinals; "
+                         "never substitute a different entity for an absent numbered target.",
                          {"none": "No target", "unknown": "Unresolved target",
                           **{f"t{i}": name for i, name in enumerate(targets)}}),
         "destination": choice("Which existing exit is requested? none when not moving; "

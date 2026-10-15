@@ -34,6 +34,15 @@ class Combat:
 class Game:
     """Party + world + combat + inventory + ledger."""
 
+    def target_names(self) -> list[str]:
+        """Current action candidates; defeated enemies are history, not targets.
+
+        Keep downed party members available for healing and first aid.
+        """
+        return list(dict.fromkeys(
+            [n for n, f in self.enemies.items() if not f.dead and f.hp > 0]
+            + [n["name"] for n in self.world.here.npcs] + list(self.party)))
+
     def __init__(self, party: dict, world: World, encounters: dict = None):
         # party: {name: {occupation, stats, hp_now, hp_max, level, slots?}}
         self.party = party
