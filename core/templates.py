@@ -60,7 +60,7 @@ def render_hint(entry, game=None) -> str:
         return f"{target} 應聲倒地，不再動彈。"
 
     if kind == "heal":
-        return f"{actor} 的傷口在光芒中癒合，氣色好轉了些。"
+        return f"{target or actor} 的傷口在光芒中癒合，氣色好轉了些。"
 
     if kind == "item":
         return entry.text.lstrip("🎒 ")
@@ -89,18 +89,12 @@ def render_hint(entry, game=None) -> str:
         return "殺聲乍起，戰鬥爆發！"
 
     if kind == "deny" and d.get("snark"):
-        item = d.get("item", "那個東西")
-        return _pick([
-            f"{actor} 在背包裡翻了半天——「{item}」？這裡從來沒有這種東西。"
-            f"眾人一臉茫然地看著 {actor}。",
-            f"{actor} 神氣地伸手一掏……掏了個空。「{item}」大概存在於"
-            "某個平行宇宙的背包裡。",
-            f"全場安靜了三秒。{actor}，你要不要先看看自己有什麼？"
-            f"（提示：不是{item}。）",
-        ], actor + str(item))
+        return f"{actor} 的行動未執行：{d.get('reason', entry.text)}"
 
     if kind == "creative":
         u = d.get("utterance") or "大膽的嘗試"
+        if "ok" in d and d["ok"] is None:
+            return f"{actor} 正嘗試{u}；等待檢定，尚未決定成敗。"
         if d.get("ok"):
             return _pick([
                 f"{actor} 靈機一動——{u}——居然真的奏效了！",
@@ -183,6 +177,9 @@ def conversation_next_step(g) -> str:
         return f"👉 等待 {g._pending_check['actor']} 用 `/roll d20` 完成待定檢定。"
     if g.combat.active:
         return "👉 可以用 `/attack`、`/defend` 或 `/skill` 處理眼前的戰鬥。"
+    from .campaign import objective_hint
+    if hint := objective_hint(g):
+        return hint
     exits = list(g.world.here.exits.values())[:2]
     choices = [f"前往「{name}」" for name in exits] + ["搜索目前場景"]
     return "👉 可以" + "，或".join(choices) + "（用 `/explore` 描述行動）。"
@@ -204,20 +201,26 @@ def scene_header(g) -> str:
 def suggested_actions(g, actor: str = "") -> list[str]:
     """3-5 concrete next-step options, scene-aware, story-driving."""
     s = g.world.here
+    if pending := getattr(g, "_pending_check", None):
+        return [f"🎲 等待 {pending['actor']} 用 `/roll d20`；原玩家或管理員可用 `/plan cancel` 取消。",
+                "可用 `/scene`、`/inventory` 或檢查物品；其他行動請在檢定結束後重新提出。"]
     opts = []
     # downed companions are the top priority — show the way to save them
     for n, e in g.party.items():
         if isinstance(e, dict) and int(e.get("hp_now", 1) or 0) <= 0:
             opts.append(f"🩹 **救 {n}**：`/explore 用醫藥救{n}`"
                         "（DC 10）或 `/explore 餵{n}治療藥水`")
-    # NPCs first (they're the story drivers)
+    from .campaign import objective_hint
+    if hint := objective_hint(g):
+        opts.append(hint)
+    # Only conversations with new information should compete with the objective.
     for n in s.npcs:
         knows = n.get("knows", [])
         seen = n.get("disclosed", [])
         disp = n.get("disposition", "neutral")
         if knows:
             if len(seen) >= len(knows):
-                opts.append(f"和 **{n['name']}** 閒聊（情報已全部問出）")
+                continue
             else:
                 opts.append(f"向 **{n['name']}** 打聽"
                             f"（已問出 {len(seen)}/{len(knows)}）")

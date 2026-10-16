@@ -93,7 +93,16 @@ def serialized(result="turn"):
     def decorate(fn):
         @wraps(fn)
         async def call(self, *args, **kwargs):
+            request_id = str(kwargs.pop("request_id", "") or "")
+            arguments = inspect.signature(fn).bind(self, *args, **kwargs).arguments
+            request_key = f"{fn.__name__}:{arguments.get('user_id', '')}:{request_id}" if request_id else ""
             async with self._lock:
+                previous = self._operator_state.get("requests", {}).get(request_key) if request_key else None
+                if previous is not None:
+                    if previous.get("result") is not None:
+                        return previous["result"] if result == "text" else tuple(previous["result"])
+                    msg = "✅ 這個請求已儲存，不會重複執行；可用 `/continue` 查看敘事或下一步。"
+                    return msg if result == "text" else (True, msg) if result == "continue" else ([msg], "")
                 stage = copy(self)
                 stage._owner = self
                 stage.game = clone_game(self.game)
@@ -103,6 +112,13 @@ def serialized(result="turn"):
                 stage._recent_narrations = self._recent_narrations.copy()
                 stage._decisions = []
                 stage._operator_state = deepcopy(self._operator_state)
+                if request_key:
+                    requests = stage._operator_state.setdefault("requests", {})
+                    # The receipt is committed with the mechanics. A process
+                    # interruption before prose completes can never rerun them.
+                    requests[request_key] = {"result": None}
+                    while len(requests) > 128:
+                        del requests[next(iter(requests))]
                 stage._audit_cursor = 0
                 stage._supervised = None
                 stage._committed = False
@@ -116,12 +132,13 @@ def serialized(result="turn"):
                         if self.debug_capture.enabled:
                             arguments = bound.arguments
                             capture("command_start", method=fn.__name__, channel_id=self.channel_id,
-                                arguments={k: v for k, v in arguments.items() if k != "self" and not callable(v)},
+                                arguments={**{k: v for k, v in arguments.items() if k != "self" and not callable(v)},
+                                           **({"request_id": request_id} if request_id else {})},
                                 streaming=callable(arguments.get("on_delta")),
                                 resolved_callback=callable(arguments.get("on_resolved")),
                                 config=replay_config(self.agent_config), snapshot=stage._snapshot(),
                                 entries=[asdict(e) for e in stage.game.ledger.entries],
-                                revision=stage._revision, operator_state=stage._operator_state,
+                                revision=stage._revision, operator_state=self._operator_state,
                                 unfinished=stage._unfinished, plot=stage.plot, rules=stage.rules)
                             original_delta = arguments.get("on_delta")
                             if callable(original_delta):
@@ -133,6 +150,9 @@ def serialized(result="turn"):
                                  turn.trace_id, self.channel_id, fn.__name__, self._revision,
                                  self.agent_config.enabled, turn.limit)
                         outcome = await fn(*bound.args, **bound.kwargs)
+                        if request_key:
+                            stage._operator_state["requests"][request_key]["result"] = outcome
+                            stage._save(narration_only=True)
                         if stage._attempt and not stage._hint_checked:
                             stage._add_stall_hint(outcome[0])
                             stage._save(narration_only=True)
@@ -194,6 +214,16 @@ class V4Service:
         self.plot_state = new_state(self.plot)
         self.game = self._load() or build_starter_game()
         repaired_knowledge = seed_starter_knowledge(self.game)
+        from .campaign import sync_starter
+        repaired_story = sync_starter(self.game)
+        repaired_combat = self.game.check_end()
+        check = getattr(self.game, "_pending_check", None)
+        expired_check = bool(check and (check.get("actor") not in self.game.party
+                             or check.get("scene", self.game.world.current) != self.game.world.current))
+        if expired_check:
+            self.game._pending_check = None
+            self._unfinished = None
+            self.game.ledger.add("engine", "check_expired", "待定檢定的角色或場景已不再有效；檢定已取消，沒有結算效果。")
         # Only recognizable, unowned seed characters are demo data. A player
         # choosing the same name must never lose their character on restart.
         demos = [name for name, template in DEMO_PARTY.items()
@@ -206,7 +236,7 @@ class V4Service:
             self.game.retired_demo_names = sorted(set(self.game.retired_demo_names) | set(demos))
             self._operator_state = {"accepted_turns": 0, "pending_triggers": [], "last_reviewed_event": 0}
             log.info("removed unowned demo characters | channel=%s count=%d", channel_id, len(demos))
-        if self._revision == 0 or repaired_knowledge or demos:
+        if self._revision == 0 or repaired_knowledge or repaired_story or repaired_combat or expired_check or demos:
             self._save()
 
     # ---------- persistence ----------
@@ -332,6 +362,10 @@ class V4Service:
             g.ledger.add(author or "?", "deny", "已過濾可疑指令文字", reason="injection")
         probe = parse_command(t, party_names=list(g.party)) or Intent("meta", actor=next(
             (n for n in g.party if t.startswith(n)), ""))
+        from .objects import object_intent
+        object_action = object_intent(g, t)
+        if object_action:
+            probe = object_action
         turn = current_turn()
         log.debug("action input | trace=%s text=%s", turn.trace_id if turn else "-", self.gateway.diagnostic(t))
         log.info("action route | trace=%s mode=%s parsed=%s",
@@ -344,6 +378,9 @@ class V4Service:
         if self.agent_config.routing.enabled:
             self._attempt = {"before": progress_key(g, self.plot_state),
                              "eligible": not g.combat.active, "wants_help": bool(_HELP_RE.search(t))}
+        if object_action:
+            object_action.actor = probe.actor
+            return await self._execute(object_action, user_id, admin_actor, text, on_delta, on_resolved)
         if not structured:
             clarification = robbery_clarification(t, list(g.party),
                 [n["name"] for n in g.world.here.npcs])
@@ -410,23 +447,22 @@ class V4Service:
             log.warning("action stopped | trace=%s reason=model_failure role=%s status=%s error=%s http=%s",
                         turn.trace_id, failure["role"], failure["status"],
                         failure.get("error_code", "schema_validation"), failure.get("http_status", ""))
-            role = "主代理" if failure["role"] == "main" else "行動解析器"
             if failure.get("http_status") in (401, 403):
-                detail = "模型服務拒絕認證，請管理員檢查 API key 與存取權限。"
+                detail = "服務認證未能完成，請通知管理員檢查服務設定。"
             elif failure.get("http_status") == 404:
-                detail = "找不到模型或 API 路徑，請管理員檢查模型名稱與服務網址。"
+                detail = "暫時找不到所需服務，請通知管理員檢查服務設定。"
             elif failure.get("error_code") == "invalid_response" or failure.get("kind") == "report":
-                detail = "模型回覆格式未通過驗證，請管理員查看 bot 日誌。"
+                detail = "回覆格式未通過驗證，請稍後重試。"
             elif failure.get("error_code") == "timeout":
-                detail = "模型服務逾時，請稍後重試。"
+                detail = "服務逾時，請稍後重試。"
             else:
-                detail = "模型服務未能完成請求，請管理員查看 bot 日誌與模型設定。"
-            return (f"⚠️ {role}暫時無法解析自由描述。{detail}"
+                detail = "服務未能完成請求，請稍後重試或通知管理員。"
+            return (f"⚠️ 暫時無法解析自由描述。{detail}"
                     "行動未執行。可先用明確指令，例如 `/explore 搜索`、`/defend` 或 `/status`。")
         log.info("action stopped | trace=%s reason=clarification_required candidate=%s",
                  turn.trace_id if turn else "-", parsed.action if parsed else "none")
         if parsed and parsed.action == "attack" and parsed.target:
-            return (f"❓ 已識別你想與「{parsed.target}」戰鬥，但主代理要求澄清，行動尚未執行。"
+            return (f"❓ 已識別你想與「{parsed.target}」戰鬥，仍需確認目標，行動尚未執行。"
                     "如確定要按一般戰鬥規則攻擊，可用 `/attack` 並填入目標名稱；"
                     "如果只是切磋，請說明規則。")
         return ("❓ 請說明要做甚麼、對誰，以及使用的方法；行動尚未執行。"
@@ -468,7 +504,7 @@ class V4Service:
             return
         self._hint_checked = True
         attempt = self._attempt
-        eligible = attempt["eligible"] and (it is None or it.action not in ("rest", "meta", "chat", "observe"))
+        eligible = attempt["eligible"] and (it is None or it.action not in ("rest", "meta", "chat", "observe", "inspect"))
         hint = track_attempt(self._operator_state, self.game, self.agent_config.hints,
                              before=attempt["before"], plot=self.plot_state, eligible=eligible,
                              wants_help=attempt["wants_help"] or bool(it and it.wants_help))
@@ -506,19 +542,34 @@ class V4Service:
         return await self._execute(it, user_id, admin_actor, it.raw, on_delta, on_resolved)
 
     @serialized()
-    async def action_plan(self, action="status", user_id="", on_delta=None, on_resolved=None):
+    async def action_plan(self, action="status", user_id="", on_delta=None, on_resolved=None, *, admin=False):
         """Explicit status/resume/cancel; narration continuation never runs steps."""
         from .action_plans import plans, plan_status
         probe = Intent("meta")
+        pend = getattr(self.game, "_pending_check", None)
         reason = self._authorize(probe, user_id)
+        if admin and action == "cancel" and pend:
+            reason, probe.actor = None, pend["actor"]
         if reason:
             return self._deny(probe.actor, reason)
         if action == "status":
+            if pend:
+                return [f"🎲 待定檢定：{pend['actor']}（{pend.get('origin', '先前行動')}）。"
+                        "由該玩家用 `/roll d20` 結算，或 `/plan cancel` 取消。"], ""
             return plan_status(self.game, probe.actor), ""
         if action == "resume":
             return await self._resume_plan(user_id, on_delta, on_resolved)
         if action != "cancel":
             return ["請選擇 status、resume 或 cancel。"], ""
+        if pend and pend.get("actor") == probe.actor:
+            self.game._pending_check = None
+            self._unfinished = None
+            self.game.ledger.add(probe.actor, "check_cancel", "玩家取消待定檢定；沒有結算效果，已付出的行動或材料不退還。")
+            plan = plans(self.game).get(probe.actor)
+            if plan and plan["status"] not in ("completed", "failed", "cancelled"):
+                plan.update(status="cancelled", stop_reason="玩家取消待定檢定；剩餘步驟不會執行。")
+            self._save()
+            return ["📋 已取消待定檢定；沒有結算效果，已付出的行動或材料不退還。可重新提出行動。"], ""
         plan = plans(self.game).get(probe.actor)
         if not plan or plan["status"] in ("completed", "failed", "cancelled"):
             return ["（沒有可取消的行動計畫）"], ""
@@ -558,14 +609,19 @@ class V4Service:
         reason = self._authorize(it, user_id, admin_actor)
         if reason:
             return self._deny(it.actor, reason)
-        if self.pending and self.pending_user_id != str(user_id):
+        reading = it.action in ("inspect", "meta", "chat")
+        if self.pending and self.pending_user_id != str(user_id) and not reading:
             return self._deny(it.actor, "請先等提出行動的玩家確認待決行動。")
         # A new action by the same player cancels their prior confirmation.
-        self.pending = None
-        self.pending_user_id = ""
-        self.pending_admin = False
-        if getattr(g, "_pending_check", None) and it.action not in ("help", "meta", "chat"):
-            return self._deny(it.actor, "尚有待定檢定，請由該角色的玩家用 `/roll d20` 結算。")
+        if not reading:
+            self.pending = None
+            self.pending_user_id = ""
+            self.pending_admin = False
+        if getattr(g, "_pending_check", None) and not reading:
+            p = g._pending_check
+            return self._deny(it.actor, f"尚有待定檢定：{p['actor']}（{p.get('origin', '先前行動')}）。"
+                              "請由該玩家用 `/roll d20` 結算，或 `/plan cancel` 取消；"
+                              "你這次的行動未執行，結算後請重新提出。仍可查看 `/scene`、`/inventory` 或檢查物品。")
         if "linked_plan" in it.args:
             approved = (self._supervised and self._supervised.linked_plan == it.args["linked_plan"]
                         and self._supervised.source_revision == self._revision)
@@ -610,11 +666,17 @@ class V4Service:
                 self.pending = r.confirm
                 self.pending_user_id = str(user_id)
                 self.pending_admin = bool(admin_actor)
+        if r.accepted and r.confirm is None and not reading:
+            from .campaign import sync_starter
+            r.lines += sync_starter(g)
         if r.accepted and r.confirm is None and g.ledger.turn > baseline.ledger.turn and self.plot:
             beat_lines, _ = plot_tick(g, self.plot, self.plot_state)
             r.lines += beat_lines
+            if self.plot_state.get("ended") == "queen_alliance":
+                g._starter_progress = dict(getattr(g, "_starter_progress", None) or {}, completed=True)
+                sync_starter(g)
         pend = getattr(g, "_pending_check", None)
-        if pend is not None and "user_id" not in pend:
+        if pend is not None and "user_id" not in pend and not reading:
             pend["user_id"] = str(g.party[pend["actor"]].get("owner_id", "")) or str(user_id)
             pend["scene"] = g.world.current
             pend.setdefault("event_id", g.ledger.entries[-1].event_id)
@@ -631,10 +693,10 @@ class V4Service:
         # engine. It needs no second dialogue bubble or narration retry job.
         speech_only = all(e.kind == "talk" and not e.data.get("npc")
                           for e in g.ledger.entries[idx0:])
-        narrate = bool(r.lines and self.pending is None and not rotation_only
+        narrate = bool(r.accepted and it.action != "inspect" and r.lines and self.pending is None and not rotation_only
                        and not speech_only
                        and len(g.ledger.entries) > idx0)
-        if r.lines:
+        if r.lines and it.action != "inspect":
             self._unfinished = self._narration_job(idx0, player_input, it.wants_help) if narrate else None
             if self._unfinished and it.narrative:
                 self._unfinished["narrative"] = it.narrative
@@ -721,6 +783,7 @@ class V4Service:
         return bool(last and last["status"] != "ok")
 
     async def _direct(self, it):
+        from .director import search_available
         g, s = self.game, self.game.world.here
         kind = ""
         if it.action == "move" and not g.world.find_exit(it.destination):
@@ -728,7 +791,7 @@ class V4Service:
                 self._decisions.append(asdict(DirectorDecision("scene", s.id, reasons=["scene_limit"])))
                 return
             kind = "scene"
-        elif it.action == "search" and not s.hidden_items:
+        elif it.action == "search" and not s.hidden_items and search_available(g):
             if not scan_prop(f"{it.raw} {it.utterance} {it.item}") and g._random.random() < 0.35:
                 kind = "item"
         if not kind:
@@ -957,31 +1020,22 @@ class V4Service:
         return f"🗑️ 已刪除 {name}。"
 
     @serialized("text")
-    async def transfer_item(self, user_id: str, item: str, to: str = "") -> str:
+    async def transfer_item(self, user_id: str, item: str, to: str = "", qty: int = 1) -> str:
         g = self.game
         giver = next((n for n, e in g.party.items() if str(e.get("owner_id", "")) == str(user_id)), "")
         if not giver:
             return "❓ 找不到你的角色。"
-        if to and to not in g.party:
-            return f"❓ 沒有角色「{to}」"
-        if not g.take_item(giver, item):
-            return f"🚫 {giver} 沒有「{item}」"
-        if to:
-            g.give_item(to, item)
-            text = f"🎒 {giver} → {to}：{item}×1"
-        else:
-            g.world.here.ground_items.append((item, 1))
-            text = f"🎒 {giver} 把 {item} 放在地上（{g.world.here.name}）——之後可以拾回"
-        g.ledger.add(giver, "item", text, item=item, target=to, scene=g.world.current)
-        self._save()
-        return text
+        lines, _ = await self._execute(Intent("give", actor=giver, item=item, qty=qty,
+            args={"to": to, "drop": not to}), user_id, "", "", None, None)
+        return "\n".join(lines)
 
     @serialized("text")
     async def admin_give(self, char: str, item: str, qty: int = 1) -> str:
         g = self.game
         if char not in g.party:
             return f"❓ 沒有角色「{char}」"
-        qty = max(1, int(qty or 1))
+        if type(qty) is not int or qty <= 0:
+            return "❓ 數量必須是正整數；尚未給予物品。"
         g.give_item(char, item, qty)
         g.ledger.add("admin", "item", f"管理員給了 {char} {item}×{qty}", item=item, target=char)
         self._save()
@@ -1134,17 +1188,19 @@ class V4Service:
             anti_open = (f"你最近的敘述開頭是 {opens}——"
                          "這次禁止再用相同或相近的開頭，換全新的第一句。")
         directives = [d for d in (rep_hint, anti_open, *help_bits) if d]
-        extra = "\n· ".join(directives) if directives else None
+        extra = map_out("\n· ".join(directives), pmap) if directives else None
         # item inventory: what the narrator may mention
         s = g.world.here
-        scene_items = [n for n, _ in s.ground_items]
-        party_inv = {ch: [n for n, _ in stacks]
+        scene_items = [map_out(n, pmap) for n, _ in s.ground_items]
+        party_inv = {map_out(ch, pmap): [map_out(n, pmap) for n, _ in stacks]
                      for ch, stacks in g.inventory.items()}
         narrator = self._main_agent() if self.agent_config.enabled else self.narrator
-        stream_delta = (lambda text: on_delta(map_stream_in(text, rmap))) if on_delta else None
+        # Deliver prose only after all guards. Streaming unguarded drafts
+        # previously exposed rejected content before the authoritative edit.
+        stream_delta = (lambda text: None) if on_delta else None
         narration = await narrator.narrate(
-            safe_facts, g.world.here.name, safe_brief, hints=safe_hints,
-            npc_knows=safe_knows, npc_name=npc_name,
+            safe_facts, map_out(g.world.here.name, pmap), safe_brief, hints=safe_hints,
+            npc_knows=safe_knows, npc_name=map_out(npc_name, pmap),
             extra_directive=extra, on_delta=stream_delta,
             player_input=map_out(player_input, pmap),
             scene_items=scene_items, party_inventory=party_inv,
@@ -1186,7 +1242,7 @@ class V4Service:
         statements = [map_out(text, pmap) for e in events if e.kind == "talk"
                       and (u := e.data.get("utterance"))
                       for text in (u, e.text, f"{e.actor}：{u}")]
-        if narration and is_dialogue_echo(narration, statements):
+        if narration and (is_dialogue_echo(narration, statements) or is_repetition(map_in(narration, rmap), self._recent_narrations)):
             log.info("narration rejected | trace=%s reason=dialogue_echo", turn.trace_id if turn else "-")
             narration = ""
         # /continue bookkeeping on the SAFE (placeholder) text the LLM
@@ -1210,6 +1266,8 @@ class V4Service:
             # v5 seed 5: persist the narration into the ledger — replays
             # are complete and #dnd-health reviews full prose
             g.ledger.add("narrator", "narration", narration)
+            if on_delta:
+                on_delta(narration)
         return narration
 
     @serialized()
@@ -1244,6 +1302,11 @@ class V4Service:
         lines = [f"🎲 **{pend['actor']}** d20 → **{die}**"]
         if line:
             lines.append(line)
+        from .campaign import sync_starter
+        lines += sync_starter(g)
+        if self.plot:
+            beat_lines, _ = plot_tick(g, self.plot, self.plot_state)
+            lines += beat_lines
         from .templates import render_turn_context
         lines += ["", render_turn_context(g, pend["actor"])]
         verdict = f"{pend['actor']} 擲骰 d20={die}：{'成功' if ok else '失敗'}"
@@ -1281,7 +1344,7 @@ class V4Service:
         if u["text"]:
             pmap = make_placeholder_map(list(self.game.party))
             rmap = make_restore_map(list(self.game.party))
-            stream_delta = (lambda text: on_delta(map_stream_in(text, rmap))) if on_delta else None
+            stream_delta = (lambda text: None) if on_delta else None
             npc_name = u.get("npc_name", "")
             context = world_block(self.rules) + "\n" + build_memory(
                 self.game, npc_name=npc_name).render()
@@ -1314,6 +1377,8 @@ class V4Service:
             self.game.ledger.add("narrator", "narration", text)
             self._recent_narrations = (self._recent_narrations + [text])[-5:]
             self._save(narration_only=True)
+            if on_delta:
+                on_delta(text)
             return True, text
         idx0 = next(i for i, e in enumerate(self.game.ledger.entries)
                     if e.event_id == u["start_event_id"])
@@ -1333,10 +1398,12 @@ class V4Service:
             p = self.pending
             return f"❓ 待確認：{p.actor} {p.action} {p.target or p.destination}——用 `/confirm`。"
         if getattr(self.game, "_pending_check", None):
-            return f"🎲 等待 {self.game._pending_check['actor']} 的 `/roll d20`。"
+            return f"🎲 等待 {self.game._pending_check['actor']} 的 `/roll d20`；原玩家或管理員可用 `/plan cancel` 取消。"
         from .action_plans import current_plan, describe
         active = [describe(plan) for name in self.game.party
                   if (plan := current_plan(self.game, name))]
         if active:
             return "\n".join(active) + "\n用 `/plan status` 查看、`/confirm` 繼續或 `/plan cancel` 取消。"
-        return render_turn_context(self.game, "") if self.game.party else "❓ 先用 `/pc` 建立角色。"
+        from .campaign import objective_hint
+        hint = objective_hint(self.game)
+        return ((hint + "\n" if hint else "") + render_turn_context(self.game, "")) if self.game.party else "❓ 先用 `/pc` 建立角色。"

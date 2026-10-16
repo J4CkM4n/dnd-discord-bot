@@ -43,7 +43,7 @@ def classify(name: str) -> str:
     """"prop" if the item is safe to materialize, "blocked" if it
     carries mechanical weight（dice/value/plot）."""
     t = (name or "").strip()
-    if not t or len(t) > MAX_NAME or _NON_PROP.search(t):
+    if len(t) < 2 or len(t) > MAX_NAME or _NON_PROP.search(t) or t in ("出木塞", "起", "出"):
         return "blocked"
     return "blocked" if _BLOCKED.search(t) else "prop"
 
@@ -58,6 +58,8 @@ def try_materialize(g, actor: str, name: str) -> bool:
     if any(name == n or name in n or n in name for n, _ in
            s.ground_items + s.hidden_items):
         return True
+    if sum(e.kind == "materialize" and e.data.get("scene") == s.id for e in g.ledger.entries) >= 3:
+        return False
     s.ground_items.append((name, 1))
     g.ledger.add("director", "materialize",
                  f"世界補上了 {name}（回應 {actor} 的互動）",
@@ -82,11 +84,17 @@ _AMBIENT_PROPS = (
 _REAL_FINDS = ("治療藥水", "火把", "繩索", "匕首", "草藥包")
 
 
+def search_available(g):
+    """One generated search find per scene, durable even after it is consumed."""
+    return not any(e.kind == "materialize" and e.data.get("scene") == g.world.current
+                   and "搜索途中" in e.text for e in g.ledger.entries)
+
+
 def ambient_find(g) -> str | None:
     """~30% chance to hide one find in the current scene for the search
     to reveal: mostly flavour props, sometimes a genuinely useful item.
     Ledgered as a materialization."""
-    if g._random.random() > 0.3:
+    if not search_available(g) or g._random.random() > 0.3:
         return None
     if g._random.random() < 0.15:
         name = g._random.choice(_REAL_FINDS)
@@ -107,7 +115,7 @@ def named_find(g, name: str) -> bool:
     """A search that NAMES what it's looking for（「我搵下有冇魚鉤」）:
     ~50% the thing is actually there — intent beats blind RNG when the
     story needs a specific mundane item."""
-    if classify(name) != "prop":
+    if classify(name) != "prop" or not search_available(g):
         return False
     s = g.world.here
     if any(name in n or n in name for n, _ in
@@ -189,6 +197,8 @@ def verify_proposal(g, proposal: DirectorProposal) -> str | None:
                                         for n in s.npcs)):
             return "duplicate_npc"
     elif proposal.kind == "item":
+        if not search_available(g):
+            return "search_limit"
         if not 1 < len(name) <= MAX_NAME or classify(name) != "prop":
             return "blocked_item"
         if any(name in n or n in name for n, _ in

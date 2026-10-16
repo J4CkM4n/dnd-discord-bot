@@ -9,7 +9,7 @@ from .world import Enemy, Scene, World
 
 STATE_VERSION = 9
 TRANSIENT_FIELDS = ("_pending_check", "_aid", "_dodge", "_stealth", "_help_check", "_improv_rewards",
-                    "_action_plans", "_prepared_items")
+                    "_action_plans", "_prepared_items", "_starter_progress")
 
 
 def clone_game(game: Game) -> Game:

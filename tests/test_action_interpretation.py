@@ -59,8 +59,8 @@ def test_explicit_method_still_goes_through_main_review(tmp_path):
 
 @pytest.mark.parametrize("response,expected", [
     (httpx.Response(401, text="DO-NOT-PRINT"), "認證"),
-    (httpx.Response(404, text="DO-NOT-PRINT"), "模型或 API 路徑"),
-    (httpx.Response(503, text="DO-NOT-PRINT"), "模型服務"),
+    (httpx.Response(404, text="DO-NOT-PRINT"), "服務設定"),
+    (httpx.Response(503, text="DO-NOT-PRINT"), "服務未能完成"),
     ("not-json", "格式未通過驗證"),
     ({"wrong": "shape"}, "格式未通過驗證"),
 ])
@@ -70,27 +70,29 @@ def test_model_failure_is_not_blame_on_player_and_does_not_mutate(tmp_path, resp
     before = encode_game(s.game)
     lines, prose = run(s.handle("把那位的東西據為己有", user_id="u1"))
     reply = "\n".join(lines)
-    assert expected in reply and "主代理" in reply and "行動未執行" in reply
+    assert expected in reply and "暫時無法解析" in reply and "行動未執行" in reply
+    assert "主代理" not in reply and "API key" not in reply
     assert "DO-NOT-PRINT" not in reply and "未能理解" not in reply
     assert not prose and encode_game(s.game) == before
     assert any(r["status"] == "fallback" for r in audits(s))
     assert "DO-NOT-PRINT" not in repr(audits(s))
 
 
-def test_action_endpoint_failure_names_action_role(tmp_path):
+def test_action_endpoint_failure_preserves_role_in_audit(tmp_path):
     endpoint = Endpoint(main=[{"consult": ["action"]},
         {"decision": "clarify", "intent": "action", "director": False}],
         action=[httpx.Response(503)])
     s = supervised(tmp_path, endpoint)
     before = encode_game(s.game)
     lines, _ = run(s.handle("嘗試弄走他身上的東西", user_id="u1"))
-    assert "行動解析器" in lines[0] and "模型服務" in lines[0]
+    assert "服務未能完成" in lines[0] and "行動未執行" in lines[0]
+    assert any(r["role"] == "action" and r["status"] == "unavailable" for r in audits(s))
     assert encode_game(s.game) == before
 
 
 @pytest.mark.parametrize("exception,expected", [
     (httpx.ReadTimeout("DO-NOT-PRINT"), "逾時"),
-    (httpx.ConnectError("DO-NOT-PRINT"), "模型服務"),
+    (httpx.ConnectError("DO-NOT-PRINT"), "服務未能完成"),
 ])
 def test_transport_failures_have_safe_actionable_messages(tmp_path, exception, expected):
     def fail(_):

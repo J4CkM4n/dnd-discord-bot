@@ -3,12 +3,15 @@ import json
 
 
 def progress_key(game, plot):
-    scene = game.world.here
-    return json.dumps({"scene": scene.id, "exits": scene.exits,
-        "inventory": game.inventory, "items": scene.ground_items, "fire": scene.fire,
-        "npcs": [(n["name"], n.get("disposition"), n.get("disclosed", [])) for n in scene.npcs],
-        "party": [(n, p.get("hp_now"), p.get("conds")) for n, p in game.party.items()],
-        "plot": plot, "aid": getattr(game, "_aid", {}), "dodge": getattr(game, "_dodge", {})},
+    # Walking in circles, collecting decorative junk and advancing clocks
+    # must not disguise a stalled objective.
+    from .director import classify
+    return json.dumps({"milestones": getattr(game, "_starter_progress", None),
+        "inventory": {ch: [(n, q) for n, q in stacks if classify(n) != "prop"] for ch, stacks in game.inventory.items()},
+        "npcs": [(n["name"], n.get("disclosed", [])) for s in game.world.scenes.values() for n in s.npcs],
+        "deaths": [e.data.get("target") for e in game.ledger.entries if e.kind == "death"],
+        "checks": [e.event_id for e in game.ledger.entries if e.kind == "check"],
+        "plot": {k: plot.get(k) for k in ("fired", "ended")}},
         ensure_ascii=False, sort_keys=True)
 
 
@@ -19,6 +22,9 @@ def public_hint(game):
     elif game.combat.active:
         options = ["用 `/attack` 選擇眼前的敵人", "用 `/defend` 找好掩護"]
     else:
+        from .campaign import objective_hint
+        if hint := objective_hint(game):
+            return "💡 " + hint
         options = [f"用 `/explore 前往{label}` 試試這條路" for label in game.world.here.exits.values()][:1]
         options += [f"用 `/explore 和{n['name']}交談` 問問眼前的人" for n in game.world.here.npcs][:1]
         if not options:
@@ -31,7 +37,7 @@ def track_attempt(state, game, config, *, before, plot, eligible, wants_help=Fal
     stalled = state.setdefault("stalls", {"scene": game.world.current, "count": 0,
                                          "attempts": 0, "last_hint": -config.cooldown})
     progressed = before != progress_key(game, plot)
-    if progressed or stalled["scene"] != game.world.current:
+    if progressed:
         stalled.update(scene=game.world.current, count=0)
     if eligible:
         stalled["attempts"] += 1

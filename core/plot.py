@@ -71,6 +71,15 @@ def _cond_met(g, cond: dict) -> bool:
 
 
 def _apply_effect(g, eff: dict, out: list):
+    if "consume_item" in eff:
+        spec = eff["consume_item"]
+        for name in g.party:
+            if g.take_item(name, spec["name"], spec.get("qty", 1)):
+                text = f"{name} 交出了 {spec['name']}×{spec.get('qty', 1)}"
+                g.ledger.add(name, "item", text, item=spec["name"], source=name, qty=spec.get("qty", 1))
+                out.append("🎒 " + text)
+                break
+        return
     if "npc_move" in eff:
         spec = eff["npc_move"]
         target = _scene_by(g, spec.get("to_scene", ""))
@@ -164,6 +173,7 @@ def tick(g, plot: dict, state: dict) -> tuple[list[str], bool]:
         if (cid in state["clocks"]
                 and state["clocks"][cid] >= int(c.get("max", 10**9))
                 and c.get("on_expire")
+                and _beat_ready(g, plot, c["on_expire"])
                 and c["on_expire"] not in state["fired"]):
             state["fired"].append(c["on_expire"])
             _fire(g, plot, state, c["on_expire"], out)
@@ -171,11 +181,30 @@ def tick(g, plot: dict, state: dict) -> tuple[list[str], bool]:
     # condition triggers
     for t in plot.get("triggers", []):
         if (t.get("beat") not in state["fired"]
+                and _beat_ready(g, plot, t.get("beat"))
                 and _cond_met(g, t.get("when", {}))):
             state["fired"].append(t["beat"])
             _fire(g, plot, state, t["beat"], out)
             changed = True
     return out, changed
+
+
+def _beat_ready(g, plot, beat_id):
+    """A beat with a missing destination waits instead of losing its effect."""
+    beat = (plot.get("beats") or {}).get(beat_id)
+    if not isinstance(beat, dict):
+        return False
+    for effect in beat.get("effects", []):
+        if "consume_item" in effect:
+            spec = effect["consume_item"]
+            qty = spec.get("qty", 1)
+            if type(qty) is not int or qty <= 0 or not any(
+                    sum(q for n, q in stacks if n == spec.get("name")) >= qty for stacks in g.inventory.values()):
+                return False
+        for key, field in (("spawn", "scene"), ("npc_spawn", "scene"), ("npc_move", "to_scene")):
+            if key in effect and _scene_by(g, effect[key].get(field, "")) is None:
+                return False
+    return True
 
 
 def _fire(g, plot: dict, state: dict, beat_id: str, out: list):

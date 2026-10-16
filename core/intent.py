@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 ACTIONS = ("attack", "move", "use", "cast", "talk", "search",
            "rest", "give", "check", "pass", "creative", "chat",
            "take", "claim", "meta", "skill", "defend", "escape",
-           "observe", "help")
+           "observe", "help", "inspect")
 
 _VERBS = {
     "attack": ("攻擊", "打", "劈", "斬", "砍", "揼", "踢", "篤", "射",
@@ -112,7 +112,7 @@ def _action_text(text: str, party_names=()) -> tuple[str, str]:
             actor = name
             t = t[len(name):].lstrip(" ：:,，,")
             break
-    t = re.sub(r"^我(?:(?:想要|想|要|嘗試|尝试|試下|試吓)\s*)?用?", "", t).lstrip()
+    t = re.sub(r"^我(?:(?:想要|想|要|嘗試|尝试|試下|試吓)\s*)?", "", t).lstrip()
     return actor, t
 
 
@@ -140,6 +140,9 @@ def parse_command(text: str, party_names=()) -> Intent | None:
     actor, t = _action_text(text, party_names)
     if not t:
         return None
+    from .objects import parse_object_command
+    if obj := parse_object_command(text, party_names):
+        return obj
     from .pickups import parse_pickup, parse_corpse_search
     if collection := parse_pickup(text, party_names) or parse_corpse_search(text, party_names):
         return collection

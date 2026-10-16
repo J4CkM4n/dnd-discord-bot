@@ -92,7 +92,11 @@ def public_options(g):
         return [f"等待 {pending['actor']} 用 /roll d20 完成待定檢定。"]
     if g.combat.active:
         return ["選擇 /attack、/defend 或 /skill，按當前戰鬥規則行動。"]
-    options = [f"與 {n['name']} 交談。" for n in g.world.here.npcs]
+    from .campaign import objective_hint
+    hint = objective_hint(g)
+    options = [hint] if hint else []
+    options += [f"與 {n['name']} 交談。" for n in g.world.here.npcs
+                if not n.get("knows") or any(f not in n.get("disclosed", []) for f in n["knows"])]
     options += [f"考慮前往「{name}」。" for name in g.world.here.exits.values()]
     options += ["搜索當前場景。", "檢查隊伍狀態與背包，再決定下一步。"]
     return options[:8]
@@ -107,7 +111,7 @@ def review_candidate(g, intent, user_id="", admin_actor=""):
     authorized = actor in g.party and bool(admin_actor or not user_id
         or str(g.party[actor].get("owner_id", "")) == str(user_id))
     reason = validate(g, checked, allow_unplanned_move=True) if authorized else "角色未獲授權"
-    if not reason and getattr(g, "_pending_check", None) and checked.action not in ("help", "meta", "chat"):
+    if not reason and getattr(g, "_pending_check", None) and checked.action not in ("inspect", "meta", "chat"):
         reason = "尚有待定檢定，請先用 /roll d20 結算"
     return {"actor": actor, "authorized": authorized, "reason": reason,
             "needs_confirmation": checked.confidence < .7 and not checked.args.get("confirmed", False)}
@@ -127,6 +131,10 @@ def progress_input(g, plot, query, npc_name=""):
     objectives = {o["id"]: o["text"] for o in (plot.get("objectives") or [])
                   if isinstance(o, dict) and o.get("public") is True
                   and isinstance(o.get("id"), str) and isinstance(o.get("text"), str)}
+    if "starter" in objectives:
+        from .campaign import objective
+        if current := objective(g)[0]:
+            objectives["starter"] = current
     return {"memory": memory.render(), "actions": actions,
             "latest_player_input": query[:500],
             "authored_objectives": objectives, "options": public_options(g)}, evidence
@@ -158,7 +166,8 @@ class MainAgent:
         # An exact collection grammar is one engine action, even if a router
         # mistakes a noun list (or a single pickup) for dependent actions.
         from .pickups import parse_pickup, parse_corpse_search
-        if collection := parse_pickup(text, list(g.party)) or parse_corpse_search(text, list(g.party)):
+        from .objects import object_intent
+        if collection := object_intent(g, text) or parse_pickup(text, list(g.party)) or parse_corpse_search(text, list(g.party)):
             report("action", revision, asdict(collection), gateway=self.gateway)
             return ActionDecision(collection, revision)
         if route.choice("compound") == "yes" or route.choice("linked") == "yes":
@@ -353,9 +362,10 @@ class MainAgent:
                         plot_state=None, locked_intent=False):
         """g is a detached command snapshot, not the service's live game."""
         from .pickups import parse_pickup, parse_corpse_search
+        from .objects import object_intent
         collection = None
         if not locked_intent:
-            collection = parse_pickup(text, list(g.party)) or parse_corpse_search(text, list(g.party))
+            collection = object_intent(g, text) or parse_pickup(text, list(g.party)) or parse_corpse_search(text, list(g.party))
         elif parsed and parsed.args.get("corpse_search"):
             collection = deepcopy(parsed)
         if collection:
@@ -491,11 +501,12 @@ class MainAgent:
             return fallback
 
     async def propose(self, g, it, rules, plot_state, *, evaluate=False):
+        from .director import search_available
         kind = ""
         s = g.world.here
         if it.action == "move" and not g.world.find_exit(it.destination):
             kind = "scene"
-        elif it.action == "search" and not s.hidden_items and not scan_prop(f"{it.raw} {it.utterance} {it.item}"):
+        elif it.action == "search" and not s.hidden_items and search_available(g) and not scan_prop(f"{it.raw} {it.utterance} {it.item}"):
             kind = "item"
         if not kind:
             return None, None
@@ -588,19 +599,19 @@ class MainAgent:
         if "combat_requires_flee" in reasons:
             detail = "目前仍在戰鬥中，不能靠補出新出口直接脫離；請先用 `/flee`。"
         elif "repair_budget_exhausted" in reasons:
-            detail = "本回合模型呼叫額度不足以完成導演及 JEV 審查，請管理員檢查 max_calls 設定。"
+            detail = "這次未能完成路線檢查，請稍後再試；也可用 `/scene` 選擇現有出口。"
         elif "evaluation_unavailable" in reasons:
-            detail = "JEV 評估服務暫時無法完成審查，請稍後重試或請管理員查看 bot 日誌。"
+            detail = "故事銜接的評估服務暫時無法使用，請稍後重試。"
         elif "invalid_evaluation" in reasons:
-            detail = "JEV 評估回覆格式未通過驗證，請管理員查看 bot 日誌。"
+            detail = "故事銜接的回覆格式未通過驗證，請稍後重試。"
         elif "main_unavailable" in reasons:
-            detail = "主代理暫時無法完成最後審核，請稍後重試。"
+            detail = "這次未能確認路線，請稍後重試。"
         elif decision and decision.evaluation == "rejected":
-            detail = "JEV 未批准這個場景延伸，請確認目的地與如何從目前位置到達。"
+            detail = "這個場景延伸未批准，請確認目的地與如何從目前位置到達。"
         elif "scene_limit" in reasons:
             detail = "此遊戲已達新增場景上限；可用 `/scene` 查看現有出口。"
         else:
-            detail = "導演尚未提出可採用的故事延伸，或主代理未批准。請補充要前往的地方與路徑。"
+            detail = "目前還找不到可用的通路，請補充目的地與路徑，或用 `/scene` 查看現有出口。"
         return "❓ 已嘗試修復故事銜接。" + detail + "行動尚未執行。"
 
     async def review_progress(self, g, revision, triggers, plot, query="", npc_name=""):

@@ -144,7 +144,7 @@ def test_small_budget_defers_whole_repair_without_unjudged_world_changes(tmp_pat
     s = supervised(tmp_path, endpoint, max_calls=limit)
     before = encode_game(s.game)
     lines, prose = run(s.handle(BOARD, user_id="u1"))
-    assert "額度不足" in lines[0] and not prose and encode_game(s.game) == before
+    assert "未能完成路線檢查" in lines[0] and not prose and encode_game(s.game) == before
     assert roles(endpoint) == ["main", "action", "main"]
 
 

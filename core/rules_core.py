@@ -266,8 +266,19 @@ def validate(g: Game, it: Intent, *, allow_unplanned_move: bool = False) -> str 
     actor = it.actor
     if actor and actor not in g.party:
         return f"沒有角色「{actor}」"
-    if actor and not g.alive(actor):
+    if actor and not g.alive(actor) and it.action not in ("inspect", "meta", "chat"):
         return f"{actor} 已倒地（HP 0），無法行動"
+    if getattr(g, "_pending_check", None) and it.action not in ("inspect", "meta", "chat"):
+        return "尚有待定檢定；請先用 `/roll d20`，或由原玩家用 `/plan cancel` 取消。"
+    if it.action in ("use", "give", "inspect"):
+        from .objects import inventory_request, visible_item, carried, ObjectError
+        try:
+            if it.action == "inspect":
+                (carried if it.args.get("take_out") else visible_item)(g, actor, it.item or it.target)
+            else:
+                inventory_request(g, it)
+        except ObjectError as exc:
+            return str(exc)
     if "linked_plan" in it.args or "linked_plan_id" in it.args:
         if it.action != "creative":
             return "行動計畫與引擎行動不一致。"
@@ -304,7 +315,7 @@ def validate(g: Game, it: Intent, *, allow_unplanned_move: bool = False) -> str 
         if reason:
             return "花招條件不成立：" + reason
     if g.combat.active and any(not f.dead and f.hp > 0 for f in g.enemies.values()) \
-            and it.action not in ("pass", "chat") and actor in g.combat.acted:
+            and it.action not in ("pass", "chat", "inspect", "meta") and actor in g.combat.acted:
         waiting = [n for n in g.party if g.alive(n) and n not in g.combat.acted]
         return (f"{actor} 本回合已行動" + (f"——等待 {'、'.join(waiting)}" if waiting else ""))
     if it.action == "move" and not allow_unplanned_move:
@@ -312,9 +323,6 @@ def validate(g: Game, it: Intent, *, allow_unplanned_move: bool = False) -> str 
             here = g.world.here
             return (f"沒有通往「{it.destination}」的路。"
                     f"目前通道：{'、'.join(here.exits.values()) or '無'}")
-    if it.action in ("use", "give") and actor:
-        if not any(s[0] == it.item for s in g.inventory.get(actor, [])):
-            return f"SLOT:item:{it.item}"  # fabrication -> snark + deny
     if it.action == "take":
         from .pickups import preflight, PickupError
         try:
@@ -754,6 +762,17 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
         # v3 lesson: never ignore the player silently — the narrator
         # must answer what the player said even when the engine denies it
         return ResolveResult([f"🚫 {reason}"], accepted=False)
+    if it.action == "inspect":
+        from .objects import carried, visible_item
+        name = (carried if it.args.get("take_out") else visible_item)(g, it.actor, it.item or it.target)
+        from engine.itemlib import affordances
+        labels = {"throwable": "可投擲", "flammable": "可燃", "light": "可照明", "liquid": "液體", "absorbent": "可吸水"}
+        detail = "、".join(labels[a] for a in sorted(affordances(name)) if a in labels)
+        text = f"{it.actor} {'拿出' if it.args.get('take_out') else '查看'} {name}。物品保留，數量不變。"
+        if detail:
+            text += f" 可用特性：{detail}。"
+        g.ledger.add(it.actor, "inspect", text, item=name)
+        return ResolveResult(["🔎 " + text])
     if it.action == "chat":
         # player-to-player table talk: remembered for context (ledger +
         # narrator), but the DM stays out of it — no reply, no turn spent
@@ -789,7 +808,7 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
             return ResolveResult(
                 ["🏁 **戰場已清空——戰鬥結束。**",
                  f"📍 場景：{g.world.here.name}"])
-    if g.combat.active and it.action not in ("pass", "chat"):
+    if g.combat.active and it.action not in ("pass", "chat", "inspect", "meta"):
         if actor in g.combat.acted:
             waiting = [n for n in g.party
                        if g.alive(n) and n not in g.combat.acted]
@@ -858,8 +877,7 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
         if s.exits:
             lines.append("通道：" + "、".join(s.exits.values()))
         # an encounter here springs automatically (engine-owned)
-        if g.world.current in g.encounters and not g.combat.active \
-                and g.encounters[g.world.current]:
+        if not g.combat.active and any(not f.dead and f.hp > 0 for f in g.encounters.get(g.world.current, [])):
             order = g.start_encounter()
             lines.append("⚔️ **戰鬥開始！** 先攻：" + " → ".join(
                 o["name"] + ("（敵）" if o["npc"] else "") for o in order))
@@ -870,50 +888,39 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
     if it.action == "use":
         # 5e: you can administer a potion to a companion — including a
         # DOWNED one（餵藥）. The ACTOR must be alive; the target need not.
-        target = (it.args.get("to") or it.target or "").strip()
-        tgt = ""
-        for n in g.party:
-            if target and (n == target or n in target or target in n):
-                tgt = n
-                break
+        from .objects import inventory_request
+        name, targets = inventory_request(g, it)
+        it.item = name
         if _POTION.search(it.item):
-            heal_who = tgt or actor
-            if (g.party[heal_who].get("death") or {}).get("dead"):
-                return ResolveResult(
-                    [f"🪦 {heal_who} 已經死了——藥水救不回來。"],
-                    accepted=False)
-            dmg, det = g.roll("2d4+2")
-            e = g.party[heal_who]
-            before = int(e["hp_now"])
-            e["hp_now"] = min(int(e["hp_max"]), before + dmg)
-            e["death"] = {}   # revived: death counters reset
-            g.take_item(actor, it.item, 1)
-            if heal_who == actor:
-                g.ledger.add(actor, "heal", f"{actor} 喝下治療藥水，回復 "
-                             f"{e['hp_now'] - before} HP", item=it.item)
-                return ResolveResult([
-                    f"💚 {actor} 使用 {it.item}（{det} = {dmg}）→ "
-                    f"HP {before} → **{e['hp_now']}/{e['hp_max']}**"])
-            g.ledger.add(actor, "heal",
-                         f"{actor} 餵 {heal_who} 喝下治療藥水，回復 "
-                         f"{e['hp_now'] - before} HP", item=it.item,
-                         target=heal_who)
-            woke = "，甦醒過來！" if before <= 0 else ""
-            return ResolveResult([
-                f"💚 {actor} 餵 {heal_who} 喝下 {it.item}"
-                f"（{det} = {dmg}）→ HP {before} → "
-                f"**{e['hp_now']}/{e['hp_max']}**{woke}"])
-        g.take_item(actor, it.item, 1)
-        g.ledger.add(actor, "item", f"{actor} 使用了 {it.item}", item=it.item)
-        return ResolveResult([f"🎒 {actor} 使用了 {it.item}（無機械效果）"])
+            lines = []
+            for heal_who in targets:
+                for _ in range(it.qty):
+                    dmg, det = g.roll("2d4+2")
+                    e = g.party[heal_who]
+                    before = int(e["hp_now"])
+                    e["hp_now"] = min(int(e["hp_max"]), before + dmg)
+                    e["death"] = {}
+                    g.take_item(actor, name)
+                    text = f"{actor} 用 {name} 治療 {heal_who}，回復 {e['hp_now'] - before} HP"
+                    g.ledger.add(actor, "heal", text, item=name, target=heal_who)
+                    lines.append(f"💚 {text}（{det}）→ HP **{e['hp_now']}/{e['hp_max']}**")
+            return ResolveResult(lines + (_post_rotation(g, actor) if g.combat.active else []))
+        g.ledger.add(actor, "item", f"{actor} 展示／使用 {name}；沒有可結算的消耗效果，物品保留。", item=name)
+        return ResolveResult([f"🎒 {name} 沒有可結算的消耗效果，物品保留；交給別人請用 `/give`。"]
+                             + (_post_rotation(g, actor) if g.combat.active else []))
 
     if it.action == "give":
-        to = it.args.get("to", "")
-        if to not in g.party or not g.take_item(actor, it.item, 1):
-            return ResolveResult([f"🚫 無法轉移 {it.item}"], accepted=False)
-        g.give_item(to, it.item, 1)
-        g.ledger.add(actor, "item", f"{actor} 把 {it.item} 給了 {to}")
-        return ResolveResult([f"🎒 {actor} → {to}：{it.item}×1"])
+        from .objects import inventory_request
+        name, targets = inventory_request(g, it)
+        to = targets[0] if targets else ""
+        g.take_item(actor, name, it.qty)
+        if to:
+            g.give_item(to, name, it.qty)
+        else:
+            g.world.here.ground_items.append((name, it.qty))
+        text = f"{actor} → {to or '地上'}：{name}×{it.qty}"
+        g.ledger.add(actor, "item", text, item=name, target=to, qty=it.qty, source=actor)
+        return ResolveResult(["🎒 " + text] + (_post_rotation(g, actor) if g.combat.active else []))
 
     if it.action == "take":
         # Preflight every item before moving any stack. Hidden items require
@@ -1048,7 +1055,7 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
                                  effect=tactic)
         g.ledger.add(actor, "creative",
                      f"{actor} 的花招（{it.utterance[:60]}）——"
-                     + ("成功" if ok else "失敗"),
+                     + ("等待檢定" if ok is None else "成功" if ok else "失敗"),
                      utterance=it.utterance[:120], ok=ok)
         return ResolveResult([line])
 
@@ -1422,9 +1429,10 @@ def resolve(g: Game, it: Intent) -> ResolveResult:
     — there is no enemy 'slot' to auto-resolve on entry anymore.
     A pending check remembers the player's originating words so the
     /roll settle narration can answer THEM, not just the die."""
+    previous_pending = getattr(g, "_pending_check", None)
     r = _resolve_inner(g, it)
     p = getattr(g, "_pending_check", None)
-    if p is not None and not p.get("origin"):
+    if p is not None and p is not previous_pending and not p.get("origin"):
         p["origin"] = (it.utterance or it.raw or "")[:120]
         p["help"] = bool(getattr(it, "wants_help", False))
         p["narrative"] = it.narrative

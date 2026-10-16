@@ -128,6 +128,8 @@ class Game:
         return out
 
     def give_item(self, char: str, item: str, qty: int = 1) -> None:
+        if type(qty) is not int or qty <= 0:
+            raise ValueError("Item quantity must be a positive integer")
         for stack in self.inventory[char]:
             if stack[0] == item:
                 stack[1] += qty
@@ -135,13 +137,19 @@ class Game:
         self.inventory[char].append([item, qty])
 
     def take_item(self, char: str, item: str, qty: int = 1) -> bool:
-        for stack in self.inventory[char]:
-            if stack[0] == item and stack[1] >= qty:
-                stack[1] -= qty
-                if stack[1] <= 0:
-                    self.inventory[char].remove(stack)
-                return True
-        return False
+        if type(qty) is not int or qty <= 0:
+            return False
+        stacks = self.inventory[char]
+        if sum(q for n, q in stacks if n == item) < qty:
+            return False
+        for stack in list(stacks):
+            if stack[0] == item and qty:
+                amount = min(qty, stack[1])
+                stack[1] -= amount
+                qty -= amount
+                if stack[1] == 0:
+                    stacks.remove(stack)
+        return True
 
     def max_slot(self, char: str) -> int:
         mx = slots_for(self.party[char].get("occupation", ""),
@@ -204,7 +212,7 @@ class Game:
 
     def check_end(self) -> bool:
         """All enemies down -> auto end. Returns True if combat ended."""
-        if self.enemies and all(f.dead or f.hp <= 0 for f in self.enemies.values()):
+        if self.combat.active and all(f.dead or f.hp <= 0 for f in self.enemies.values()):
             self.end_combat()
             return True
         return False

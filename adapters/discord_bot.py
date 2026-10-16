@@ -545,12 +545,12 @@ class DiscordBot(discord.Client):
                                on="給誰用（留空＝自己，可餵倒地隊友）")
         @app_commands.autocomplete(item=own_item_ac, on=ally_ac)
         async def use_cmd(interaction: discord.Interaction,
-                          item: str, on: str = ""):
+                          item: str, on: str = "", qty: app_commands.Range[int, 1, 20] = 1):
             char = await _caller_char(interaction)
             if not char:
                 await interaction.response.send_message("❓ 找不到你的角色。")
                 return
-            text = f"{char} 使用 {item}" + (f" {on}" if on else "")
+            text = f"{char} 使用 {item} ×{qty}" + (f" {on}" if on else "")
             await self._v4_turn(interaction, text, structured=True)
 
         @self.tree.command(name="skill",
@@ -706,10 +706,10 @@ class DiscordBot(discord.Client):
         @app_commands.describe(item="物品名", to="給誰（角色名）")
         @app_commands.autocomplete(item=item_ac)
         async def give_cmd(interaction: discord.Interaction,
-                           item: str, to: str = ""):
+                           item: str, to: str = "", qty: app_commands.Range[int, 1, 20] = 1):
             await interaction.response.defer(thinking=True)
             text = await svc._v4_service(str(interaction.channel_id)).transfer_item(
-                str(interaction.user.id), item, to)
+                str(interaction.user.id), item, to, qty, request_id=str(interaction.id))
             await interaction.followup.send(_clip(text))
 
         # ---- /rules (SRD retrieval, zero LLM) ----
@@ -1082,22 +1082,23 @@ class DiscordBot(discord.Client):
                 service = self._v4_service(str(interaction.channel_id))
                 if plan_action:
                     lines, narration = await service.action_plan(
-                        plan_action, str(interaction.user.id), on_delta=stream, on_resolved=on_resolved)
+                        plan_action, str(interaction.user.id), on_delta=stream, on_resolved=on_resolved,
+                        admin=interaction.user.guild_permissions.manage_guild, request_id=str(interaction.id))
                 elif confirmation:
                     lines, narration = await service.confirm(
                         str(interaction.user.id), on_delta=stream, on_resolved=on_resolved,
-                        admin=interaction.user.guild_permissions.manage_guild)
+                        admin=interaction.user.guild_permissions.manage_guild, request_id=str(interaction.id))
                 else:
                     lines, narration = await service.handle(
                         text, interaction.user.display_name,
                         user_id=str(interaction.user.id), structured=structured,
-                        on_delta=stream, on_resolved=on_resolved)
+                        on_delta=stream, on_resolved=on_resolved, request_id=str(interaction.id))
         except Exception as e:
             log.exception("v4 turn failed")
             if narr_msg[0] is not None:
-                await narr_msg[0].edit(content=f"⚠️ {e}")
+                await narr_msg[0].edit(content="⚠️ 回覆中斷。請用 `/status` 查看結果，或 `/continue` 取得敘事與下一步。")
             else:
-                await interaction.followup.send(f"⚠️ {e}")
+                await interaction.followup.send("⚠️ 回覆中斷。請用 `/status` 查看結果，或 `/continue` 取得敘事與下一步。")
             return
 
         # finalize the streamed message: guards may have scrubbed
@@ -1155,13 +1156,13 @@ class DiscordBot(discord.Client):
                 lines, narration = await v4svc.settle_roll(
                     on_delta=stream, on_resolved=on_resolved,
                     user_id=str(interaction.user.id), admin=admin, actor=actor,
-                    expected_event_id=expected_event_id)
+                    expected_event_id=expected_event_id, request_id=str(interaction.id))
         except Exception as e:
             log.exception("v4 roll settle failed")
             if narr_msg[0] is not None:
-                await narr_msg[0].edit(content=f"⚠️ {e}")
+                await narr_msg[0].edit(content="⚠️ 回覆中斷。請用 `/status` 查看結果，或 `/continue` 取得敘事與下一步。")
             else:
-                await interaction.followup.send(f"⚠️ {e}")
+                await interaction.followup.send("⚠️ 回覆中斷。請用 `/status` 查看結果，或 `/continue` 取得敘事與下一步。")
             return True
         await self._finalize_narr(narr_msg[0], narration)
         if not narr_msg[0] and lines:
@@ -1202,13 +1203,13 @@ class DiscordBot(discord.Client):
                     text, f"{interaction.user.display_name} (admin)",
                     structured=structured, admin_actor=character,
                     user_id=str(interaction.user.id),
-                    on_delta=stream, on_resolved=on_resolved)
+                    on_delta=stream, on_resolved=on_resolved, request_id=str(interaction.id))
         except Exception as e:
             log.exception("v4 admin turn failed")
             if narr_msg[0] is not None:
-                await narr_msg[0].edit(content=f"⚠️ {e}")
+                await narr_msg[0].edit(content="⚠️ 回覆中斷。請用 `/status` 查看結果，或 `/continue` 取得敘事與下一步。")
             else:
-                await interaction.followup.send(f"⚠️ {e}")
+                await interaction.followup.send("⚠️ 回覆中斷。請用 `/status` 查看結果，或 `/continue` 取得敘事與下一步。")
             return
         await self._finalize_narr(narr_msg[0], narration)
         if not narr_msg[0] and lines:

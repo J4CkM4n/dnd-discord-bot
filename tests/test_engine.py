@@ -211,8 +211,14 @@ def test_plot_enemy_dead_ledger_only():
     g.ledger.add("大力蕉", "death", "巴鐸的護衛 倒下",
                  target="巴鐸的護衛")
     assert not g.enemies  # the fallback path is the ONLY path
+    # Missing destinations defer the whole beat instead of recording a
+    # narrative whose promised world mutation never happened.
+    assert plot_tick(g, plot, st)[0] == []
+    assert "bador_flees" not in st["fired"]
+    g.world.add_scene(Scene("altar", "海底祭壇"))
     lines, _ = plot_tick(g, plot, st)
     assert any("巴鐸" in x for x in lines)
+    assert g.world.scenes["altar"].npcs[0]["name"] == "巴鐸"
 
 
 # ---------- service-level (seeds 4/5) ----------

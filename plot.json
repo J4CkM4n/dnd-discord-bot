@@ -1,5 +1,6 @@
 {
   "version": 1,
+  "objectives": [{"id": "starter", "text": "調查被哥布林佔據的破舊酒館及角落的酒窖門。", "public": true}],
   "title": "霧錨鎮與沉沒之城 — 劇情脊柱",
   "description": "預生成的是處境，不是劇本：時鐘倒數、觸發器待命，劇情主動找上玩家。beat 由引擎點火（ledger kind=beat），narrator 只負責渲染。改這裡即改劇情。",
   "clocks": [
@@ -70,7 +71,7 @@
     },
     "ending_alliance": {
       "text": "👑 項鍊回到女王頸上的一刻，海面平靜了。她履行承諾：族人得釋，泉水現址——這片海域多了一位盟友。",
-      "effects": [],
+      "effects": [{"consume_item": {"name": "海妖女王的項鍊", "qty": 1}}],
       "ending": "queen_alliance"
     }
   }

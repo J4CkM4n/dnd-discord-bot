@@ -23,7 +23,8 @@ class Digestor:
     async def digest(self, text: str, party_names, scene_name: str = "",
                      exits=(), known_targets=(), *, strict=False, conversation=None, constraints="") -> Intent | None:
         from .pickups import parse_pickup, parse_corpse_search
-        if collection := parse_pickup(text, party_names) or parse_corpse_search(text, party_names):
+        from .objects import parse_object_command
+        if collection := parse_object_command(text, party_names) or parse_pickup(text, party_names) or parse_corpse_search(text, party_names):
             return collection
         tgt_line = (f"已知目標（盡量用這些精確名稱）: {'、'.join(known_targets)}\n"
                     if known_targets else "")
@@ -61,7 +62,9 @@ class Digestor:
             "洗劫／搶劫／打劫不是獨立 action；按描述的方法解析。偷偷扒竊用 "
             "skill=sleight of hand，威嚇交出財物用 skill=intimidation；"
             "明確揮刀傷人才用 attack。不能把搶劫當成 take，不能宣稱已取得財物。\n"
-            "search ＝搜索、調查周圍環境。\n"
+            "search ＝搜索、調查周圍環境。檢查／觀察某件物品用 inspect，item 填該物品，不能搜索別的物品。\n"
+            "inspect ＝查看物品或拿出已擁有的物品，不消耗、不創造物品。\n"
+            "give ＝把物品交給同伴，item 填物品，target 填收件人，qty 填正整數。不能變成 use。\n"
             "use    ＝使用身上嘅物品（只限物品——技能名稱例如醫藥／潛行／"
             "洞察係 skill，唔好用 use。餵隊友食藥／藥水都算 use："
             "target 填隊友名——隊友暈咗都可以餵）。\n"
@@ -175,6 +178,7 @@ class Digestor:
                 actor=(data.get("actor") or "").strip(),
                 target=(data.get("target") or "").strip(),
                 item=(data.get("item") or "").strip(),
+                qty=data.get("qty", 1),
                 spell=(data.get("spell") or "").strip(),
                 destination=(data.get("destination") or "").strip(),
                 utterance=(data.get("utterance") or "").strip(),

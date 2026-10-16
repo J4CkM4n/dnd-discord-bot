@@ -110,7 +110,9 @@ def test_streamed_command_records_delivered_text_and_replays_offline(tmp_path, p
     rows = next(iter(read_traces(tmp_path / "debug").values()))
     callbacks = [r["payload"]["text"] for r in rows if r["kind"] == "delivery"
                  and r["payload"]["phase"] == "stream"]
-    assert callbacks == delivered and len(delivered) == 2
+    # Only the guarded final draft reaches Discord; model chunks stay private.
+    assert callbacks == delivered and len(delivered) == 1
+    assert delivered[0] == "霧裡有鹽味，木板在腳下呻吟。"
     report = run(replay(rows))
     assert report["output_matches"] and report["snapshot_matches"] and report["all_calls_consumed"]
     assert not report["request_mismatches"]
@@ -125,6 +127,17 @@ def test_committed_verdict_delivery_failure_replays_without_narrating(tmp_path):
     run(s.handle("搜索", user_id="u1", on_resolved=fail_delivery))
     rows = next(iter(read_traces(tmp_path / "debug").values()))
     assert s._unfinished
+    report = run(replay(rows))
+    assert report["output_matches"] and report["snapshot_matches"] and report["all_calls_consumed"]
+    assert not report["request_mismatches"]
+
+
+def test_interaction_receipt_does_not_short_circuit_offline_replay(tmp_path):
+    s, _ = routed(tmp_path, Endpoint(), native=True)
+    s.game.world.here.hidden_items = [("破紙", 1)]
+    s.debug_capture = DebugCapture(tmp_path, s.agent_config, enabled=True)
+    run(s.handle("搜索", user_id="u1", request_id="discord-search-1"))
+    rows = next(iter(read_traces(tmp_path / "debug").values()))
     report = run(replay(rows))
     assert report["output_matches"] and report["snapshot_matches"] and report["all_calls_consumed"]
     assert not report["request_mismatches"]

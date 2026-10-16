@@ -97,6 +97,7 @@ def test_health_reader_still_handles_unimported_json(tmp_path):
 
 def interaction():
     return SimpleNamespace(
+        id=123456789,
         channel_id=123,
         user=SimpleNamespace(id=1, display_name="player",
                              guild_permissions=SimpleNamespace(manage_guild=False)),
@@ -174,7 +175,7 @@ def test_discord_final_output_waits_for_delayed_stream_edit(path, outcome):
         elif outcome == "empty" or path == "continue":
             assert history[-1] == "deleted"
         else:
-            assert history[-1] == "⚠️ narration failed"
+            assert history[-1] == "⚠️ 回覆中斷。請用 `/status` 查看結果，或 `/continue` 取得敘事與下一步。"
         callbacks[0](final)  # A late callback cannot restart a closed stream.
         await asyncio.sleep(0)
         assert len(history) == 2

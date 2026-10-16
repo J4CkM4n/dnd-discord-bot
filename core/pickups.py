@@ -5,7 +5,7 @@ import re
 from .intent import Intent, _action_text
 
 MAX_ITEMS = 20
-_VERB = re.compile(r"^(?:撿起|捡起|拾起|執起|拿起|攞起|撿|捡|拾|執|攞|拿|pick\s+up\b|take\b)\s*(.+)$", re.I)
+_VERB = re.compile(r"^(?:撿起|捡起|拾起|執起|拿起|攞起|撿|捡|拾|執|攞|拿|pick\s+up\b|take\b)\s*(.*)$", re.I)
 _GROUND = re.compile(r"^(?:(?:地上面?|地下|地面上?|眼前)(?:的|嘅)?|(?:the\s+)?(?:items?\s+)?on\s+the\s+ground\s*)\s*", re.I)
 _ALL = re.compile(r"(?:全部|所有|一切)(?:散落(?:的|嘅)?)?(?:物品|東西|东西|物資|物资|道具)?|everything|all(?:\s+(?:the\s+)?(?:scattered\s+)?(?:items?|loot|things?))?", re.I)
 _SEPARATOR = re.compile(r"\s*(?:[、，,]|以及|同埋|和|與|及|\band\b)\s*", re.I)
@@ -41,6 +41,10 @@ def parse_pickup(text, party_names=()):
     match = _VERB.fullmatch(action.rstrip("。.!！"))
     if not match:
         return None
+    if action.startswith(("拿出", "取出", "攞出")) or re.match(r"take\s+out\b", action, re.I):
+        return None
+    if not match[1].strip():
+        return Intent("take", actor=actor, raw=text)
     try:
         names = selection(match[1])
     except PickupError:
@@ -95,11 +99,16 @@ def preflight(g, value):
     Hidden items never satisfy pickup requests. A single untracked inert prop
     retains the existing director behavior; collections cannot create props.
     """
-    names = selection(value)
     ground = Counter()
     for name, qty in g.world.here.ground_items:
         if qty > 0:
             ground[name] += qty
+    if not (value or "").strip():
+        if len(ground) == 1:
+            return list(ground.items()), ""
+        options = "、".join(ground) or "沒有物品"
+        raise PickupError(f"想拾起哪一件？地上：{options}。請指定名稱或「拾起地上所有物品」。")
+    names = selection(value)
     if names is None:
         if not ground:
             raise PickupError("地上沒有可拾取的物品；可以先搜索這裡。")
@@ -115,6 +124,8 @@ def preflight(g, value):
             from .director import classify
             hidden = any(name == n or name in n or n in name for n, _ in g.world.here.hidden_items)
             if len(names) == 1 and not hidden and classify(name) == "prop":
+                if sum(e.kind == "materialize" and e.data.get("scene") == g.world.current for e in g.ledger.entries) >= 3:
+                    raise PickupError("這裡已沒有其他可補充的道具；請選擇地上現有的物品或沿出口繼續目前目標。")
                 return [(name, 1)], name
             raise PickupError(f"地上看不到可拾取的「{name}」；尚未拾取任何物品，可以先搜索這裡。")
         if matches[0] not in actual:

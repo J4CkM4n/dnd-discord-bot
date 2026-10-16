@@ -73,7 +73,7 @@ def test_explicit_main_clarification_stops_duel_with_specific_reply(tmp_path):
     s = supervised(tmp_path, endpoint)
     before, plot = encode_game(s.game), deepcopy(s.plot_state)
     lines, prose = run(s.handle("與船長決鬥", user_id="u1"))
-    assert "船長" in lines[0] and "主代理要求澄清" in lines[0] and "/attack" in lines[0]
+    assert "船長" in lines[0] and "仍需確認目標" in lines[0] and "/attack" in lines[0]
     assert not prose and encode_game(s.game) == before and s.plot_state == plot
     assert roles(endpoint) == ["main", "main"]
 
