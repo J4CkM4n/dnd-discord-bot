@@ -27,6 +27,9 @@ class Enemy:
     initiative: int = 0
     dead: bool = False
     loot: list = field(default_factory=list)   # guaranteed drops (quest items)
+    loot_fixed: bool = False  # an emptied authored inventory stays empty
+    npc: dict = field(default_factory=dict)  # identity retained after hostility
+    spawned: bool = False  # encounter scaling runs once, never on return
 
     @classmethod
     def make(cls, name: str, hp: int, ac: int, attack_bonus: int = 3,

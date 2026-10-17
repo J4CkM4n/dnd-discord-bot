@@ -71,7 +71,9 @@ def routing_questions(g):
         "compound": "Are multiple mechanical actions or preparation steps requested? Speech or stylistic "
                     "details accompanying one action do not count as extra actions. Picking up a list of "
                     "ground items or all ground items is ONE take action, not a compound plan. "
-                    "Opening/searching a corpse for loot is ONE search attempt; unknown loot names are expected.",
+                    "Opening/searching a corpse for loot is ONE search attempt; unknown loot names are expected. "
+                    "Observing an NPC THEN asking a question is TWO actions. Stealing WHILE companions distract "
+                    "is one conditional theft attempt; it does not authorize actions by those companions.",
         "linked": "Do preparation steps serve one explicit final goal, such as picking up ingredients, "
                   "mixing them, then attacking one target, or picking up a potion to heal an ally? "
                   "Independent goals, alternatives, hypotheticals and negated requests are not linked plans.",

@@ -62,7 +62,7 @@ def verify_improvisation(g, plan, *, revision=None, settling=False):
         return "invalid_effect_count"
     if sum(isinstance(e, dict) and e.get("kind") in ("damage", "heal", "reward", "scene") for e in success) > 1:
         return "effect_budget_exceeded"
-    npcs = {n["name"] for n in g.world.here.npcs}
+    npcs = {n["name"] for n in g.scene_npcs()}
     for effect in success + failure:
         if type(effect) is not dict or type(effect.get("kind")) is not str or effect["kind"] not in EFFECTS:
             return "unknown_effect"
@@ -135,7 +135,7 @@ def apply_effects(g, actor, plan, ok, lines):
             lines.append(f"✨ {target}：" + ("下一次受到攻擊時，攻擊者有優勢。" if kind == "advantage" else "下次行動前，攻擊此角色有劣勢。"))
             g.ledger.add(actor, "tactic", lines[-1], target=target, effect=kind)
         elif kind == "npc_reaction":
-            npc = next(n for n in g.world.here.npcs if n["name"] == target)
+            npc = next(n for n in g.scene_npcs() if n["name"] == target)
             npc["disposition"] = _dispo_step(npc.get("disposition", "neutral"), 1 if ok else -1)
             lines.append(f"🤝 {target} 的態度{'軟化了' if ok else '變得警惕'}。")
             g.ledger.add(actor, "talk", lines[-1], npc=target, disposition=npc["disposition"], ok=ok)

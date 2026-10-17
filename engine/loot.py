@@ -29,7 +29,7 @@ _LOOT_ITEMS = [(n, w) for n, w in LOOT_TABLE]
 
 def drop_for(foe, rng=None):
     """(name, qty) list this enemy leaves behind."""
-    if getattr(foe, "loot", None):
+    if getattr(foe, "loot", None) or getattr(foe, "loot_fixed", False):
         return [(n, 1) for n in foe.loot]        # authored = guaranteed
     roll = (rng or random).choices([n for n, _ in _LOOT_ITEMS],
                           weights=[w for _, w in _LOOT_ITEMS], k=1)[0]

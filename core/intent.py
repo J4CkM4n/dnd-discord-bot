@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 ACTIONS = ("attack", "move", "use", "cast", "talk", "search",
            "rest", "give", "check", "pass", "creative", "chat",
            "take", "claim", "meta", "skill", "defend", "escape",
-           "observe", "help", "inspect")
+           "observe", "help", "inspect", "steal")
 
 _VERBS = {
     "attack": ("攻擊", "打", "劈", "斬", "砍", "揼", "踢", "篤", "射",
@@ -140,6 +140,9 @@ def parse_command(text: str, party_names=()) -> Intent | None:
     actor, t = _action_text(text, party_names)
     if not t:
         return None
+    from .theft import parse_theft
+    if theft := parse_theft(text, party_names):
+        return theft
     from .objects import parse_object_command
     if obj := parse_object_command(text, party_names):
         return obj
@@ -159,6 +162,8 @@ def parse_command(text: str, party_names=()) -> Intent | None:
     for skill, verbs in _SKILL_VERBS.items():
         for verb in verbs:
             if t.startswith(verb):
+                if skill == "sleight of hand":
+                    return None  # Qualified theft must not become a plain check.
                 return Intent("skill", actor=actor, skill=skill,
                               target=t[len(verb):].lstrip(" ：:,，,"), raw=text)
     hit = _starts_with_verb(t)

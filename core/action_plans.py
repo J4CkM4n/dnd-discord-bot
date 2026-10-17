@@ -1,6 +1,6 @@
 """Bounded, engine-owned linked plans. Models propose attempts, never results.
 
-v1 supports one pickup, optional preparation, then an attack or item use.
+Supports pickup/preparation then attack/use, or observation then conversation.
 Pickup is one object interaction; preparation and the final action each cost
 an action. Remaining steps require an explicit player command.
 """
@@ -48,17 +48,21 @@ def parse_plan(raw, g, actor, revision, text):
     if relationship not in ("linked", "single"):
         raise PlanError("未能確認行動關係，行動尚未執行。")
     steps = raw["steps"]
-    if type(steps) is not list or not 1 <= len(steps) <= 3:
+    if type(steps) is not list or not steps:
+        raise PlanError("未能解析出可執行的步驟；請說明行動的先後次序。")
+    if len(steps) > 3:
         raise PlanError("一次計畫最多三個相依步驟；請縮短到一個主要目的。")
     if (relationship == "single" and len(steps) != 1) or (relationship == "linked" and len(steps) < 2):
         raise PlanError("步驟數與行動關係不一致，沒有執行部分行動。")
     goal = raw["goal"]
-    if goal not in ("attack", "use"):
-        raise PlanError("目前連續計畫支援拾取、製作後攻擊，或拾取後使用物品；其他行動請分開提出。")
+    if goal not in ("attack", "use", "talk"):
+        raise PlanError("目前計畫支援拾取、製作後攻擊、拾取後使用物品，或觀察後交談；其他行動請分開提出。")
     expected = {"take": {"action", "item"},
                 "prepare": {"action", "method", "materials"},
                 "attack": {"action", "target", "item"},
-                "use": {"action", "target", "item"}}
+                "use": {"action", "target", "item"},
+                "observe": {"action", "target"},
+                "talk": {"action", "target", "utterance"}}
     steps = deepcopy(steps)
     for step in steps:
         if type(step) is not dict or type(step.get("action")) is not str \
@@ -74,6 +78,12 @@ def parse_plan(raw, g, actor, revision, text):
                 raise PlanError("製作需要一至兩種明確材料，每種消耗一份。")
             if any(n not in text for n in materials):
                 raise PlanError("製作提案加入了玩家未指定的材料，行動尚未執行。")
+        elif action in ("observe", "talk"):
+            step["target"] = _text(step["target"], "對象", 100)
+            if action == "talk":
+                step["utterance"] = _text(step["utterance"], "要說的話", 500)
+                if step["utterance"] not in text:
+                    raise PlanError("交談內容必須保留玩家原話，不能新增問題或承諾。")
         else:
             if type(step["item"]) is not str or len(step["item"]) > 100:
                 raise PlanError("請指定要使用或拾取的物品。")
@@ -86,7 +96,10 @@ def parse_plan(raw, g, actor, revision, text):
                     raise PlanError("提案使用了玩家未指定的物品，行動尚未執行。")
     actions = [s["action"] for s in steps]
     # Exactly one final goal, with a strictly ordered dependency chain.
-    if actions[-1] != goal or any(a not in ("take", "prepare") for a in actions[:-1]) \
+    if goal == "talk":
+        if actions != ["observe", "talk"] or steps[0]["target"] != steps[1]["target"]:
+            raise PlanError("觀察後交談必須保持同一對象與原本次序；沒有執行部分行動。")
+    elif actions[-1] != goal or any(a not in ("take", "prepare") for a in actions[:-1]) \
             or actions.count("take") > 1 or actions.count("prepare") > 1 \
             or ("take" in actions and actions[0] != "take"):
         raise PlanError("請保留一個主要目的及其必要前置步驟，不會自動挑其中一個行動執行。")
@@ -98,7 +111,7 @@ def parse_plan(raw, g, actor, revision, text):
             raise PlanError("製作物必須用於這次攻擊，不能改成一般攻擊或其他效果。")
         if pickup and pickup not in preparation["materials"]:
             raise PlanError("拾取物品與製作沒有依賴關係，請先選一個目的。")
-    elif final["item"] == "$prepared" or (pickup and final["item"] != pickup):
+    elif final.get("item") == "$prepared" or (pickup and final.get("item") != pickup):
         raise PlanError("拾取物品必須用於最後的行動，不能省略指定的方法。")
     if goal == "use" and not final["item"]:
         raise PlanError("請指定要使用的物品。")
@@ -141,10 +154,13 @@ def preflight(g, plan):
     final = plan["steps"][-1]
     target = final["target"]
     if plan["goal"] == "attack":
-        foe = g.enemies.get(target)
-        npc = next((n for n in g.world.here.npcs if n["name"] == target), None)
+        foe = g.scene_enemies().get(target)
+        npc = next((n for n in g.scene_npcs() if n["name"] == target), None)
         if not (foe and not foe.dead and foe.hp > 0) and npc is None:
             raise PlanError(f"目前場景找不到可攻擊的「{target}」；尚未攻擊。請重新選擇目標。")
+    elif plan["goal"] == "talk":
+        if target not in {n["name"] for n in g.scene_npcs()}:
+            raise PlanError(f"目前場景找不到交談對象「{target}」；原計畫暫停。")
     elif target and target not in g.party:
         raise PlanError(f"找不到使用物品的隊友「{target}」。")
     available = Counter({n: q for n, q in g.inventory.get(actor, [])})
@@ -161,7 +177,7 @@ def preflight(g, plan):
                     raise PlanError(f"缺少材料「{item}」；尚未製作或攻擊。要改變方法，請提出新的行動。")
                 available[item] -= 1
             available["$prepared"] += 1
-        elif step["item"]:
+        elif step.get("item"):
             item = plan["prepared_item"] if step["item"] == "$prepared" and plan["prepared_item"] else step["item"]
             if available[item] < 1:
                 raise PlanError(f"沒有可使用的「{item}」；不會改用普通攻擊。")
@@ -172,6 +188,8 @@ def describe(plan):
     for i, step in enumerate(plan["steps"]):
         action = step["action"]
         label = (f"拾取 {step['item']}" if action == "take" else step["method"] if action == "prepare"
+                 else f"觀察 {step['target']}" if action == "observe"
+                 else f"向 {step['target']} 問：{step['utterance']}" if action == "talk"
                  else f"{'攻擊' if action == 'attack' else '使用物品於'} {step['target'] or plan['actor']}")
         mark = "✓" if i < plan["next_step"] else "…"
         labels.append(f"{mark} {label}")
@@ -246,13 +264,14 @@ def resolve_plan(g, plan, *, resume=False):
         if g.combat.active:
             lines += _post_rotation(g, actor)
         return ResolveResult(lines)
-    item = plan["prepared_item"] if step["item"] == "$prepared" else step["item"]
+    item = plan["prepared_item"] if step.get("item") == "$prepared" else step.get("item", "")
     if step["action"] == "attack" and item:
         # The standard engine throw owns AC, DEX, dice, death, loot and rotation.
         it = Intent("attack", actor=actor, target=step["target"],
                     args={"thrown_item": item})
     else:
-        it = Intent(step["action"], actor=actor, target=step["target"], item=item)
+        it = Intent(step["action"], actor=actor, target=step["target"], item=item,
+                    utterance=step.get("utterance", ""))
     result = resolve(g, it)
     if not result.accepted:
         # The caller's staged transaction rolls back the pickup as well.
@@ -262,6 +281,10 @@ def resolve_plan(g, plan, *, resume=False):
         # action; never let pickup/healing chains bypass the per-round slot.
         result.lines += _post_rotation(g, actor)
     plan["next_step"] += 1
+    if plan["next_step"] < len(plan["steps"]):
+        plan["status"] = "ready"
+        _event(g, plan, "觀察完成，等待玩家繼續交談。")
+        return ResolveResult(lines + result.lines + ["尚未交談；用 `/confirm` 或 `/plan resume` 繼續，`/plan cancel` 取消。"])
     plan["status"] = "completed"
     _event(g, plan, "計畫最後一步已執行。")
     return ResolveResult(lines + result.lines)

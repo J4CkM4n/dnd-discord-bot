@@ -79,7 +79,7 @@ from .persistence import CampaignRepository, StorageError
 from .memory import build_memory, recent_conversation
 from .agent_config import legacy_config
 from .model_gateway import ModelGateway, current_turn, turn_context
-from .operators import MainAgent
+from .operators import MainAgent, ActionDecision
 from .debug_capture import DebugCapture, capture_context, capture, replay_config
 from .hints import progress_key, track_attempt
 
@@ -385,9 +385,27 @@ class V4Service:
         if object_action:
             object_action.actor = probe.actor
             return await self._execute(object_action, user_id, admin_actor, text, on_delta, on_resolved)
+        from .theft import parse_theft
+        from .npc_actions import observation_plan, return_to_npc
+        if exact := parse_theft(t, g.party):
+            if "盗む" in t:
+                exact.actor = probe.actor
+                return await self._execute(exact, user_id, admin_actor, text, on_delta, on_resolved)
+        if raw_plan := observation_plan(g, t):
+            from .action_plans import parse_plan, PlanError
+            try:
+                plan = parse_plan(raw_plan, g, probe.actor, self._revision, t)
+            except PlanError as exc:
+                return ["❓ " + str(exc)], ""
+            it = Intent("creative", actor=probe.actor, raw=t, args={"linked_plan": plan})
+            self._supervised = ActionDecision(it, self._revision, linked_plan=plan)
+            return await self._execute(it, user_id, admin_actor, text, on_delta, on_resolved)
+        if returned := return_to_npc(g, t):
+            returned.actor = probe.actor
+            return await self._execute(returned, user_id, admin_actor, text, on_delta, on_resolved)
         if not structured:
             clarification = robbery_clarification(t, list(g.party),
-                [n["name"] for n in g.world.here.npcs])
+                [n["name"] for n in g.scene_npcs()])
             if clarification:
                 log.info("action stopped | trace=%s reason=robbery_method_required", turn.trace_id if turn else "-")
                 return [clarification], ""
@@ -936,12 +954,14 @@ class V4Service:
         lines = [f"📍 **{s.name}**", s.description]
         if s.fire:
             lines.append("🔥 場景正在燃燒。")
-        lines.append("👥 人物：" + ("、".join(n["name"] for n in s.npcs) or "無"))
+        names = list(dict.fromkeys([n["name"] for n in g.scene_npcs()] +
+                     [n for n, f in g.scene_enemies().items() if not f.dead and f.hp > 0]))
+        lines.append("👥 人物：" + ("、".join(names) or "無"))
         lines.append("🚪 出口：" + ("、".join(s.exits.values()) or "無"))
         lines.append("📦 地上物品：" + ("、".join(f"{n} ×{q}" for n, q in s.ground_items) or "無"))
         if g.combat.active:
             lines.append(f"⚔️ 戰鬥 R{g.combat.round}")
-            lines.extend(f"👹 {n} {f.hp}/{f.hp_max}HP" for n, f in g.enemies.items() if not f.dead)
+        lines.extend(f"👹 {n}（敵對）{f.hp}/{f.hp_max}HP" for n, f in g.scene_enemies().items() if not f.dead and f.hp > 0)
         if not g.party:
             lines.append("👉 請先用 `/pc` 建立角色，再用 `/explore` 行動。")
         return "\n".join(lines)
@@ -1119,7 +1139,7 @@ class V4Service:
                 if e.kind == "reveal":
                     npc_knows = [e.data["fact"]]
                     break
-                for n in g.world.here.npcs:
+                for n in g.scene_npcs():
                     if n["name"] == npc_name:
                         npc_knows = n.get("disclosed", [])
                         break
@@ -1207,14 +1227,19 @@ class V4Service:
         # Deliver prose only after all guards. Streaming unguarded drafts
         # previously exposed rejected content before the authoritative edit.
         stream_delta = (lambda text: None) if on_delta else None
-        narration = await narrator.narrate(
-            safe_facts, map_out(g.world.here.name, pmap), safe_brief, hints=safe_hints,
-            npc_knows=safe_knows, npc_name=map_out(npc_name, pmap),
-            extra_directive=extra, on_delta=stream_delta,
-            player_input=map_out(player_input, pmap),
-            scene_items=scene_items, party_inventory=party_inv,
-            world=map_out(world_block(self.rules), pmap),
-            memory=map_out(build_memory(g, player_input, npc_name=npc_name).render(), pmap))
+        if any(e.kind in ("theft", "theft_attempt") for e in events):
+            # Ownership and injuries must be exact. These bounded outcomes use
+            # engine prose, including pending/failure, without a model draft.
+            narration = "\n".join(safe_hints)
+        else:
+            narration = await narrator.narrate(
+                safe_facts, map_out(g.world.here.name, pmap), safe_brief, hints=safe_hints,
+                npc_knows=safe_knows, npc_name=map_out(npc_name, pmap),
+                extra_directive=extra, on_delta=stream_delta,
+                player_input=map_out(player_input, pmap),
+                scene_items=scene_items, party_inventory=party_inv,
+                world=map_out(world_block(self.rules), pmap),
+                memory=map_out(build_memory(g, player_input, npc_name=npc_name).render(), pmap))
         # review trail: log the pair so output quality is auditable
         turn = current_turn()
         log.debug("narrate | trace=%s in=%s hints=%d out=%s",
@@ -1256,7 +1281,7 @@ class V4Service:
             narration = ""
         from .guards import narration_identity_valid
         if narration and not narration_identity_valid(map_in(narration, rmap), events, list(g.party),
-                                                       [n["name"] for n in g.world.here.npcs]):
+                                                       [n["name"] for n in g.scene_npcs()]):
             log.info("narration rejected | trace=%s reason=actor_mismatch", turn.trace_id if turn else "-")
             narration = "\n".join(safe_hints)
         # /continue bookkeeping on the SAFE (placeholder) text the LLM
@@ -1388,8 +1413,12 @@ class V4Service:
                       if u["start_event_id"] <= e.event_id <= u["end_event_id"]
                       and e.kind not in ("table", "narration", "guard")
                       and e.data.get("visibility") != "private"]
+            if any(e.kind in ("theft", "theft_attempt") for e in events):
+                # Theft prose is complete and engine-owned, including after
+                # restoring an older unfinished narration job.
+                return False, ""
             if not narration_identity_valid(map_in(u["text"] + cont, rmap), events, list(self.game.party),
-                                             [n["name"] for n in self.game.world.here.npcs]):
+                                             [n["name"] for n in self.game.scene_npcs()]):
                 log.info("continuation rejected | reason=actor_mismatch")
                 return False, ""
             full = u["text"] + cont

@@ -34,14 +34,31 @@ class Combat:
 class Game:
     """Party + world + combat + inventory + ledger."""
 
+    def scene_enemies(self, scene_id=None) -> dict[str, Enemy]:
+        """Encounter identities remain present after fleeing, including corpses."""
+        sid = self.world.current if scene_id is None else scene_id
+        foes = {f.name: f for f in self.encounters.get(sid, [])}
+        if sid == self.world.current:
+            foes.update(self.enemies)
+        return foes
+
+    def scene_npcs(self, scene_id=None) -> list[dict]:
+        """The same NPC metadata before, during and after a hostile encounter."""
+        sid = self.world.current if scene_id is None else scene_id
+        foes = self.scene_enemies(sid)
+        npcs = {n["name"]: n for n in self.world.scenes[sid].npcs}
+        npcs.update({f.name: f.npc for f in foes.values() if f.npc})
+        return [n for name, n in npcs.items()
+                if name not in foes or (not foes[name].dead and foes[name].hp > 0)]
+
     def target_names(self) -> list[str]:
         """Current action candidates; defeated enemies are history, not targets.
 
         Keep downed party members available for healing and first aid.
         """
         return list(dict.fromkeys(
-            [n for n, f in self.enemies.items() if not f.dead and f.hp > 0]
-            + [n["name"] for n in self.world.here.npcs] + list(self.party)))
+            [n for n, f in self.scene_enemies().items() if not f.dead and f.hp > 0]
+            + [n["name"] for n in self.scene_npcs()] + list(self.party)))
 
     def __init__(self, party: dict, world: World, encounters: dict = None):
         # party: {name: {occupation, stats, hp_now, hp_max, level, slots?}}
@@ -176,7 +193,7 @@ class Game:
         foes = [f for f in self.encounters.get(scene, [])
                 if not f.dead and f.hp > 0]
         if not foes:
-            self.encounters.pop(scene, None)   # consumed / all dead
+            # Keep identity/history; a cleared encounter never respawns.
             return self.combat.order
         if self.combat.active:
             return self.combat.order
@@ -187,7 +204,12 @@ class Game:
             order.append({"name": name, "init": rng.randint(1, 20) + (dex - 10) // 2,
                           "npc": False})
         for foe in foes:
-            scale_for_party(foe, self.party)
+            if not foe.spawned:
+                # Older saves lack the marker; injuries still prove this is
+                # an existing combatant and must never be scaled into healing.
+                if foe.hp >= foe.hp_max:
+                    scale_for_party(foe, self.party)
+                foe.spawned = True
             foe.initiative = rng.randint(1, 20) + 2
             self.enemies[foe.name] = foe
             order.append({"name": foe.name, "init": foe.initiative, "npc": True})

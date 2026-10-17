@@ -194,8 +194,13 @@ def verify_proposal(g, proposal: DirectorProposal) -> str | None:
         if any(scene_key(name) == scene_key(s.name) for s in g.world.scenes.values()):
             return "duplicate_scene"
         npc = d.get("npc", "").strip()
-        if npc and (npc in g.party or any(npc == n["name"] for s in g.world.scenes.values()
-                                        for n in s.npcs)):
+        known = set(g.party) | {n["name"] for s in g.world.scenes.values() for n in s.npcs}
+        known.update(f.name for foes in g.encounters.values() for f in foes)
+        known.update(g.enemies)
+        known.update(e.data["target"] for e in g.ledger.entries
+                     if e.kind == "death" and e.data.get("target"))
+        if npc and any(scene_key(npc) in scene_key(n) or scene_key(n) in scene_key(npc)
+                       for n in known if scene_key(n)):
             return "duplicate_npc"
     elif proposal.kind == "item":
         if not search_available(g):

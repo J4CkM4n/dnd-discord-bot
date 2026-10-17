@@ -10,7 +10,7 @@ MAX_CHARS = 3000
 # These entries describe resolved, public outcomes. Player utterances, attempted
 # actions, unrevealed materializations, and arbitrary prose are deliberately absent.
 PUBLIC_KINDS = {"scene", "scene_fire", "item", "loot", "death", "combat",
-                "heal", "damage", "xp", "reveal", "beat", "rest"}
+                "heal", "damage", "xp", "reveal", "beat", "rest", "theft"}
 
 
 def retired_demo_event(g, event) -> bool:
@@ -27,7 +27,7 @@ def recent_conversation(g, actor: str) -> dict | None:
     """
     if actor not in g.party:
         return None
-    present = {n["name"] for n in g.world.here.npcs}
+    present = {n["name"] for n in g.scene_npcs()}
     for event in reversed(g.ledger.entries):
         if g.ledger.turn - event.turn > 3 or event.kind == "scene":
             break
@@ -61,18 +61,18 @@ def build_memory(g, query: str = "", *, audience: str = "narrator",
     npcs = [{"name": n["name"], "disposition": n.get("disposition", "neutral"),
              "facts": n.get("knows", []) if audience == "director"
                       else n.get("disclosed", []) if not npc_name or n["name"] == npc_name
-                      else []} for n in s.npcs]
+                      else []} for n in g.scene_npcs()]
     current = {"scene": s.name, "description": s.description, "exits": s.exits,
                "fire": s.fire, "ground_items": s.ground_items, "npcs": npcs,
                "inventory": g.inventory,
                "enemies": {n: {"hp": f.hp, "hp_max": f.hp_max, "dead": f.dead or f.hp <= 0}
-                           for n, f in g.enemies.items()},
+                           for n, f in g.scene_enemies().items()},
                "party": {n: {k: e.get(k) for k in ("hp_now", "hp_max", "conds")}
                          for n, e in g.party.items()}}
     if audience == "director":
         current["hidden_items"] = s.hidden_items
         current["plot"] = plot_state or {}
-    names = list(g.party) + [n["name"] for n in s.npcs] + list(g.enemies)
+    names = list(g.party) + [n["name"] for n in g.scene_npcs()] + list(g.enemies)
     mentioned = [name for name in names if name in query or name == npc_name]
     ranked = []
     for e in g.ledger.entries:

@@ -71,7 +71,7 @@ def sync_starter(g):
         if not defeated(g, "巴鐸的護衛") and not any(f.name == "巴鐸的護衛" for foes in g.encounters.values() for f in foes):
             g.encounters.setdefault("cellar", []).append(Enemy.make("巴鐸的護衛", 8, 12, 2, "1d4", loot=["潮汐航路圖"]))
         progress["guard_seeded"] = True
-    for npc in dock.npcs:
+    for npc in g.scene_npcs("dock"):
         if npc.get("name") == "老船長":
             fact = "酒館的哥布林已被你們清除。酒窖通往走私海洞；巴鐸的護衛守著航路圖。"
             if progress.get("guard") or defeated(g, "巴鐸的護衛"):

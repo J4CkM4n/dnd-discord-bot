@@ -24,7 +24,8 @@ class Digestor:
                      exits=(), known_targets=(), *, strict=False, conversation=None, constraints="") -> Intent | None:
         from .pickups import parse_pickup, parse_corpse_search
         from .objects import parse_object_command
-        if collection := parse_object_command(text, party_names) or parse_pickup(text, party_names) or parse_corpse_search(text, party_names):
+        from .theft import parse_theft
+        if collection := parse_object_command(text, party_names) or parse_pickup(text, party_names) or parse_corpse_search(text, party_names) or parse_theft(text, party_names):
             return collection
         tgt_line = (f"已知目標（盡量用這些精確名稱）: {'、'.join(known_targets)}\n"
                     if known_targets else "")
@@ -59,8 +60,10 @@ class Digestor:
             "對 NPC 的抱怨、責問或辱罵仍是 talk，不是玩家之間的 chat；"
             "承接最近對話且沒有改換對象時，可把代稱解析為該 NPC 的精確名字。"
             "無法確定對象時 target 留空，不能任選場上 NPC；辱罵不自動等於恐嚇或攻擊。\n"
-            "洗劫／搶劫／打劫不是獨立 action；按描述的方法解析。偷偷扒竊用 "
-            "skill=sleight of hand，威嚇交出財物用 skill=intimidation；"
+            "steal ＝嘗試偷取 NPC 或敵人身上已記錄的一件物品；target 填物主，item 填指定物品。"
+            "例如「船長の武器を盗む」是 steal、target=船長、item=武器。"
+            "由引擎核對持有物、作手技檢定及轉移，不能創造匕首或替同伴分散注意力。"
+            "洗劫／搶劫／打劫按描述的方法解析。偷偷扒竊用 steal，威嚇交出財物用 skill=intimidation；"
             "明確揮刀傷人才用 attack。不能把搶劫當成 take，不能宣稱已取得財物。\n"
             "search ＝搜索、調查周圍環境。檢查／觀察某件物品用 inspect，item 填該物品，不能搜索別的物品。\n"
             "inspect ＝查看物品或拿出已擁有的物品，不消耗、不創造物品。\n"
@@ -73,8 +76,8 @@ class Digestor:
             "         匿埋／收埋／靜靜雞＝stealth；睇穿佢講大話／睇下佢想"
             "點＝insight；幫佢包紮／急救／救返佢／救醒佢／救助暈低嘅隊友＝"
             "medicine；爬牆／爆門／游水＝"
-            "athletics；平衡／翻滾／跳＝acrobatics；偷嘢／解鎖＝sleight of "
-            "hand；跟蹤跡／搵食搵水＝survival；研究符文／魔法物件＝arcana；"
+            "athletics；平衡／翻滾／跳＝acrobatics；解鎖或純手技表演＝sleight of "
+            "hand；偷嘢用 steal；跟蹤跡／搵食搵水＝survival；研究符文／魔法物件＝arcana；"
             "回想背景＝history；認動植物＝nature；認神祇儀式＝religion；"
             "安撫動物＝animal handling；留意四周＝perception；搜證推理＝"
             "investigation；講大話呃人＝deception；惡言威嚇＝intimidation；"

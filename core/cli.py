@@ -63,7 +63,7 @@ def build_starter_game() -> Game:
         "dock", "霧錨鎮碼頭",
         "漁船靜靜泊在霧中，空氣裡有海藻與焦油的味道。北邊的小路通往酒館。",
         exits={}, npcs=[{"name": "老船長", "desc": "獨眼，正在補網",
-                         "disposition": "friendly"}]))
+                         "disposition": "friendly", "loot": ["匕首"]}]))
     world.add_scene(Scene(
         "tavern", "破舊酒館",
         "哥布林佔據的酒館，桌椅翻倒，角落有可疑的酒窖門。",

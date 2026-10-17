@@ -44,7 +44,8 @@ def test_explicit_method_survives_main_outage_without_free_loot(tmp_path, text, 
     pending = s.game._pending_check
     assert pending["actor"] == "依思" and pending["skill"] == skill
     assert s.game.inventory == before
-    assert roles(endpoint) == ["main", "narrator"]
+    # Ownership-sensitive theft prose is rendered by the engine.
+    assert roles(endpoint) == (["main"] if skill == "sleight of hand" else ["main", "narrator"])
 
 
 def test_explicit_method_still_goes_through_main_review(tmp_path):
@@ -54,7 +55,7 @@ def test_explicit_method_still_goes_through_main_review(tmp_path):
     lines, _ = run(s.handle("偷偷扒竊老船長", user_id="u1"))
     assert "檢定" in "\n".join(lines)
     assert s.game._pending_check["skill"] == "sleight of hand"
-    assert roles(endpoint) == ["main", "main", "narrator"]
+    assert roles(endpoint) == ["main", "main"]
 
 
 @pytest.mark.parametrize("response,expected", [

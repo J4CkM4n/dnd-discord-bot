@@ -31,6 +31,8 @@ def render_hint(entry, game=None) -> str:
         return f"情況已經改變，{actor} 原先的花招沒有生效。"
     if kind == "check_pending":
         return f"{actor} 準備嘗試，結果仍待擲骰決定。"
+    if kind in ("theft", "theft_attempt"):
+        return entry.text
     if kind == "tactic":
         return f"{actor} 的機智為接下來的交鋒創造了機會。"
 
@@ -84,9 +86,14 @@ def render_hint(entry, game=None) -> str:
                       f"{actor} 的嘗試落了空。"], actor)
 
     if kind == "combat":
-        if "結束" in entry.text:
+        outcome = d.get("outcome", "")
+        if outcome == "escaped" or (not outcome and "脫離戰鬥" in entry.text):
+            return f"{actor} 帶領隊伍成功脫離戰鬥，眼前的交鋒暫時停止。"
+        if outcome in ("ended", "defeat") or (not outcome and "結束" in entry.text):
             return "塵埃落定，戰鬥結束了。"
-        return "殺聲乍起，戰鬥爆發！"
+        if outcome == "started" or (not outcome and any(s in entry.text for s in ("開始", "變得敵對"))):
+            return "殺聲乍起，戰鬥爆發！"
+        return entry.text
 
     if kind == "deny" and d.get("snark"):
         return f"{actor} 的行動未執行：{d.get('reason', entry.text)}"
@@ -153,6 +160,8 @@ def render_hint(entry, game=None) -> str:
         return entry.text  # beats ARE prose directives from the spine
 
     if kind == "observe":
+        if d.get("description"):
+            return entry.text
         return f"{actor} 眯起眼睛盯著 {target}，不放過任何一絲破綻。"
 
     if kind == "skill":
@@ -191,8 +200,8 @@ def scene_header(g) -> str:
     lines = [f"📍 {s.name}" + (" 🔥**火海中**" if s.fire else "")]
     if s.description:
         lines.append(f"   {s.description[:80]}")
-    if s.npcs:
-        lines.append(f"   👥 {'、'.join(n['name'] for n in s.npcs)}")
+    if g.scene_npcs():
+        lines.append(f"   👥 {'、'.join(n['name'] for n in g.scene_npcs())}")
     if s.exits:
         lines.append(f"   🚪 {'、'.join(s.exits.values())}")
     return "\n".join(lines)
@@ -214,7 +223,7 @@ def suggested_actions(g, actor: str = "") -> list[str]:
     if hint := objective_hint(g):
         opts.append(hint)
     # Only conversations with new information should compete with the objective.
-    for n in s.npcs:
+    for n in g.scene_npcs():
         knows = n.get("knows", [])
         seen = n.get("disclosed", [])
         disp = n.get("disposition", "neutral")

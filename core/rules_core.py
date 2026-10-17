@@ -40,8 +40,9 @@ def resolve_target(g: Game, target: str):
         return None, None
     # Preserve explicit identity, including corpses: callers must reject an
     # invalid target rather than silently redirect a numbered attack.
-    if t in g.enemies:
-        return g.enemies[t], None
+    enemies = g.scene_enemies()
+    if t in enemies:
+        return enemies[t], None
     if t in g.party:
         return None, t
     m = _ORD_RE.search(t)
@@ -50,17 +51,17 @@ def resolve_target(g: Game, target: str):
         num = _ZH_NUM.get(raw, int(raw) if raw.isdigit() else 1)
         base = (t[:m.start()] + t[m.end():]).strip()
         want = base + (chr(0x2460 + num - 1) if 1 <= num <= 10 else "")
-        for n, f in g.enemies.items():
+        for n, f in enemies.items():
             if n == want:
                 return f, None
         return None, None
     # An absent explicit ordinal must never fall through to a different foe.
     if any(chr(0x2460 + i) in t for i in range(10)):
-        for n, f in g.enemies.items():
+        for n, f in enemies.items():
             if n in t and any(chr(0x2460 + i) in n for i in range(10)):
                 return f, None
         return None, None
-    for n, f in g.enemies.items():
+    for n, f in enemies.items():
         if not f.dead and f.hp > 0 and (t in n or n in t):
             return f, None
     for n in g.party:
@@ -100,7 +101,7 @@ def _find_npc(g: Game, target: str):
     t = (target or "").strip()
     if not t:
         return None
-    for n in g.world.here.npcs:
+    for n in g.scene_npcs():
         if t in n["name"] or n["name"] in t:
             return n
     return None
@@ -113,7 +114,7 @@ def _find_npc_in_text(g: Game, text: str):
     t = (text or "").strip()
     if not t:
         return None
-    for n in g.world.here.npcs:
+    for n in g.scene_npcs():
         name = n["name"]
         if name in t:
             return n
@@ -167,6 +168,10 @@ def _apply_check_effect(g: Game, actor: str, effect: dict | None,
     if effect and effect.get("kind") == "improvisation":
         from .improvisation import apply_effects
         apply_effects(g, actor, effect["plan"], ok, lines)
+        return
+    if effect and effect.get("kind") == "theft":
+        from .theft import settle
+        settle(g, actor, effect, ok, lines)
         return
     if not effect or not ok:
         return
@@ -270,6 +275,12 @@ def validate(g: Game, it: Intent, *, allow_unplanned_move: bool = False) -> str 
         return f"{actor} 已倒地（HP 0），無法行動"
     if getattr(g, "_pending_check", None) and it.action not in ("inspect", "meta", "chat"):
         return "尚有待定檢定；請先用 `/roll d20`，或由原玩家用 `/plan cancel` 取消。"
+    if it.action == "steal":
+        from .theft import preflight, TheftError
+        try:
+            preflight(g, it)
+        except TheftError as exc:
+            return str(exc)
     if it.action == "skill":
         _, skill = normalize_skill(it.skill or it.spell or it.utterance)
         if it.target and skill in (*_SOCIAL, "medicine", "insight", "animal handling"):
@@ -362,7 +373,7 @@ def validate(g: Game, it: Intent, *, allow_unplanned_move: bool = False) -> str 
             return reason
         if foe is None and tgt_char is None:
             # check scene NPCs — attacking one turns them hostile
-            for n in g.world.here.npcs:
+            for n in g.scene_npcs():
                 if it.target and (it.target in n["name"]
                                   or n["name"] in it.target):
                     return None  # valid: NPC target (handled in resolve)
@@ -582,7 +593,7 @@ def _attack(g: Game, actor: str, target: str, move: str = "", weapon_item: str =
             g.ledger.add(actor, "death", f"{foe.name} 倒下", target=foe.name)
         if g.check_end():
             lines.append("🏁 **戰鬥結束——敵人全滅！**")
-            g.ledger.add(actor, "combat", "戰鬥結束（敵人全滅）")
+            g.ledger.add(actor, "combat", "戰鬥結束（敵人全滅）", outcome="ended")
     else:
         e = g.party[tgt_char]
         e["hp_now"] = max(0, int(e["hp_now"]) - dmg_total)
@@ -681,7 +692,7 @@ def _throw(g: Game, actor: str, it: Intent, utter: str) -> ResolveResult | None:
                                  target=foe.name)
                 if g.check_end():
                     lines.append("🏁 **戰鬥結束——敵人全滅！**")
-                    g.ledger.add(actor, "combat", "戰鬥結束（敵人全滅）")
+                    g.ledger.add(actor, "combat", "戰鬥結束（敵人全滅）", outcome="ended")
             elif tgt_char:
                 e = g.party[tgt_char]
                 e["hp_now"] = max(0, int(e["hp_now"]) - dmg)
@@ -786,6 +797,14 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
     if it.action == "meta" and it.args.get("inventory"):
         from .objects import inventory_text
         return ResolveResult([inventory_text(g, it.actor)])
+    if it.action == "meta" and it.args.get("locate_npc"):
+        name, sid = it.args["locate_npc"], it.args["location"]
+        scene = g.world.scenes[sid]
+        foe = g.scene_enemies(sid).get(name)
+        state = (f"（{'已倒下' if foe.dead or foe.hp <= 0 else '敵對'}，{foe.hp}/{foe.hp_max}HP）"
+                 if foe else "")
+        detail = "仍在這裡" if sid == g.world.current else f"位於「{scene.name}」；請沿現有出口返回"
+        return ResolveResult([f"📍 {name}{detail}{state}。"])
     if it.action == "inspect":
         from .objects import carried, visible_item
         name = (carried if it.args.get("take_out") else visible_item)(g, it.actor, it.item or it.target)
@@ -847,6 +866,16 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
     if isinstance(getattr(g, "_dodge", None), dict):
         g._dodge.pop(actor, None)
 
+    if it.action == "steal":
+        from .theft import preflight
+        target, item, _ = preflight(g, it)
+        effect = {"kind": "theft", "target": target, "item": item, "scene": g.world.current}
+        g.ledger.add(actor, "theft_attempt", f"{actor} 嘗試從 {target} 身上偷取 {item}；尚未取得物品。",
+                     target=target, item=item, outcome="pending", recipient=actor, scene=g.world.current)
+        in_combat = g.combat.active
+        _, line = ability_check(g, actor, "DEX", 13, "sleight of hand", auto=in_combat, effect=effect)
+        return ResolveResult([line] + (_post_rotation(g, actor) if in_combat else []))
+
     if it.action == "attack":
         # confirm only when the digestor is genuinely uncertain (freeform
         # /explore with ambiguous phrasing); /combat always sets confidence=1
@@ -866,13 +895,20 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
                     from .world import Enemy
                     enemy = Enemy.make(n["name"], 8, 13, 3, "1d6",
                                     loot=list(n.get("loot", [])))
+                    enemy.npc = n
+                    enemy.npc["disposition"] = "hostile"
+                    enemy.loot_fixed = "loot" in n or n.get("loot_fixed", False)
+                    enemy.npc.pop("loot", None)  # Encounter inventory becomes authoritative.
                     g.encounters.setdefault(g.world.current, []).append(
                         enemy)
                     if not g.combat.active:
                         g.start_encounter()
                         g.ledger.add(actor, "combat",
                                      f"{actor} 攻擊 {n['name']}——"
-                                     f"{n['name']} 變得敵對！")
+                                     f"{n['name']} 變得敵對！", outcome="started")
+                    else:
+                        g.enemies[enemy.name] = enemy
+                        g.combat.order.append({"name": enemy.name, "init": 0, "npc": True})
                     # remove the NPC from the friendly list
                     g.world.here.npcs = [
                         x for x in g.world.here.npcs
@@ -880,6 +916,9 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
                     # re-resolve target (now in g.enemies)
                     foe, tgt_char = resolve_target(g, it.target)
                     break
+        elif foe is not None and not g.combat.active:
+            g.start_encounter()
+            g.ledger.add(actor, "combat", f"{actor} 再次與 {foe.name} 交戰", outcome="started")
         if it.args.get("thrown_item"):
             from .objects import carried
             item = carried(g, actor, it.args["thrown_item"])
@@ -908,7 +947,7 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
             order = g.start_encounter()
             lines.append("⚔️ **戰鬥開始！** 先攻：" + " → ".join(
                 o["name"] + ("（敵）" if o["npc"] else "") for o in order))
-            g.ledger.add(actor, "combat", "戰鬥開始",
+            g.ledger.add(actor, "combat", "戰鬥開始", outcome="started",
                          order=[o["name"] for o in order])
         return ResolveResult(lines)
 
@@ -1180,7 +1219,7 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
             if npc is None:
                 return ResolveResult(
                     [f"❓ 洞悉需要一個對象——這裡的 NPC："
-                     + ("、".join(n["name"] for n in g.world.here.npcs)
+                     + ("、".join(n["name"] for n in g.scene_npcs())
                         or "無")], accepted=False)
             target = npc["name"]
             effect = {"kind": "insight", "target": npc["name"]}
@@ -1222,7 +1261,7 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
             if npc is None:
                 return ResolveResult(
                     [f"❓ 馴獸需要一個動物對象——這裡的 NPC："
-                     + ("、".join(n["name"] for n in g.world.here.npcs)
+                     + ("、".join(n["name"] for n in g.scene_npcs())
                         or "無")], accepted=False)
             target = npc["name"]
             effect = {"kind": "animal", "target": npc["name"]}
@@ -1230,12 +1269,12 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
             # standalone social ploy without a talk utterance
             _, char = resolve_target(g, target)
             npc = _find_npc(g, target) if target else (
-                g.world.here.npcs[0] if len(g.world.here.npcs) == 1 else None)
+                g.scene_npcs()[0] if len(g.scene_npcs()) == 1 else None)
             if char:
                 target = char  # a PC check grants no NPC information or forced response
             elif npc is None:
                 return ResolveResult(
-                    ["❓ 請指定交涉對象：" + ("、".join(n["name"] for n in g.world.here.npcs) or "這裡沒有 NPC")], accepted=False)
+                    ["❓ 請指定交涉對象：" + ("、".join(n["name"] for n in g.scene_npcs()) or "這裡沒有 NPC")], accepted=False)
             else:
                 target = npc["name"]
                 effect = {"kind": "social", "target": npc["name"], "skill": sk}
@@ -1279,7 +1318,7 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
         if not isinstance(getattr(g, "_help_check", None), dict):
             g._help_check = {}
         g._help_check[hit] = True
-        g.ledger.add(actor, "help", f"{actor} 協助 {hit}", target=hit)
+        g.ledger.add(actor, "help", f"{actor} 協助 {hit}", target=hit, scene=g.world.current)
         lines = [f"🤝 {actor} 幫 {hit} 打下手——"
                  f"{hit} 的下一次檢定擲兩顆取高"]
         if g.combat.active:
@@ -1312,7 +1351,7 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
         lines = [line]
         if ok:
             g.end_combat()
-            g.ledger.add(actor, "combat", f"{actor} 帶領隊伍脫離戰鬥")
+            g.ledger.add(actor, "combat", f"{actor} 帶領隊伍脫離戰鬥", outcome="escaped")
             lines.append("🏃 **隊伍趁亂脫離戰鬥！**")
         else:
             lines.append(f"❌ {actor} 被攔住了——戰鬥繼續")
@@ -1324,6 +1363,14 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
         # that target rolls with advantage (one-shot, like Help)
         foe, tgt_char = resolve_target(g, it.target)
         if foe is None:
+            npc = _find_npc(g, it.target)
+            if npc:
+                desc = npc.get("desc", "沒有更多公開的外貌細節")
+                text = f"{actor} 觀察 {npc['name']}：{desc}。"
+                g.ledger.add(actor, "observe", text, target=npc["name"], description=desc)
+                return ResolveResult(["👁 " + text] + _post_rotation(g, actor))
+            if it.target:
+                return ResolveResult([f"❓ 找不到可觀察的目標「{it.target}」"], accepted=False)
             foes = [f for f in g.enemies.values() if not f.dead and f.hp > 0]
             if not foes:
                 return ResolveResult(["❓ 沒有可觀察的目標"], accepted=False)
@@ -1408,12 +1455,12 @@ def _post_rotation(g: Game, actor: str = "") -> list[str]:
             g.ledger.add(foe.name, "auto", line)
     if not any(g.alive(n) for n in g.party):
         out.append("🏴 **全隊倒地——戰鬥結束（敗北）**")
-        g.ledger.add("engine", "combat", "全隊倒地——戰鬥結束（敗北）")
+        g.ledger.add("engine", "combat", "全隊倒地——戰鬥結束（敗北）", outcome="defeat")
         g.end_combat()
         return out
     if g.check_end():
         out.append("🏁 **戰鬥結束——敵人全滅！**")
-        g.ledger.add("engine", "combat", "戰鬥結束（敵人全滅）")
+        g.ledger.add("engine", "combat", "戰鬥結束（敵人全滅）", outcome="ended")
         return out
     g.combat.round += 1
     g.combat.acted = []
@@ -1438,7 +1485,7 @@ def _post_rotation(g: Game, actor: str = "") -> list[str]:
                     _on_foe_death(g, foe, out)
         if g.check_end():
             out.append("🏁 **戰鬥結束——敵人全滅！**")
-            g.ledger.add("engine", "combat", "戰鬥結束（敵人全滅）")
+            g.ledger.add("engine", "combat", "戰鬥結束（敵人全滅）", outcome="ended")
     return out
 
 

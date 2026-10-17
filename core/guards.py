@@ -183,6 +183,11 @@ def narration_identity_valid(text: str, events: list, party_names: list, npc_nam
     This is a conservative delivery guard, not a semantic verdict: a rejected
     draft falls back to the engine's prose skeletons without replaying mechanics.
     """
+    combat = [e for e in events if e.kind == "combat"]
+    if any(e.data.get("outcome") == "escaped" or "脫離戰鬥" in e.text for e in combat) \
+            and not any(e.data.get("outcome") == "started" for e in combat) \
+            and re.search(r"戰鬥(?:開始|爆發)|(?:開始|爆發)(?:了)?戰鬥|殺聲乍起", text):
+        return False
     verbs = {
         "search": r"搜索|搜尋|搜遍|搜查|翻找|尋找|搜到",
         "observe": r"觀察|盯著|尋找破綻",
