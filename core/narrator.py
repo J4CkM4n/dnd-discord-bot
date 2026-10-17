@@ -1,12 +1,13 @@
 """v4 narrator: ledger facts → 繁中 prose (gemma3:27b).
 
-Decoration only — the engine's lines are already the complete truth of the
-turn; this adds novel-flavoured rendering on top. Any failure returns ""
-and the game loses nothing (degraded mode by construction).
+The engine owns action outcomes. New physical details travel in a typed header
+and enter the engine inventory before the prose is delivered. Any provider
+failure returns "" and leaves the engine's outcome intact.
 """
 
 from .agent_config import legacy_config
 from .model_gateway import ModelGateway
+from .narrated_items import ITEM_INSTRUCTIONS, parse_narration
 
 
 class Narrator:
@@ -32,14 +33,18 @@ class Narrator:
             "請從中斷處自然地續寫下去，完成這段敘事：\n"
             "· 直接續寫——不要重複已有文字、不要重新開頭、不要總結\n"
             "· 約 60~120 字，只完成已發生事件；可用現有出口或目標收尾\n"
-            "· 不能新增線索、房間、敵人、道具或未結算行動\n"
+            "· 不能新增線索、房間、敵人或未結算行動；實體物品須列入 items\n"
             "· 絕不寫出骰子數值或判定結果，不給予物品或傷害\n"
             "· 繁體中文，絕不使用簡體字\n"
             "=== 最後指示（最高優先）===\n"
-            "· 從「」內文字的斷點直接繼續，第一個字就是下一個字\n")
+            "· 從「」內文字的斷點直接繼續，第一個字就是下一個字\n"
+            + ITEM_INSTRUCTIONS
+            + "items 只記錄這次續寫確認的實物；evidence 可包含上方斷點前的文字。\n")
         try:
-            return (await self._stream(prompt, on_delta,
-                                       max_tokens=220)).strip()
+            draft = parse_narration(await self._stream(prompt, None, max_tokens=360))
+            if on_delta and draft:
+                on_delta(str(draft))
+            return draft
         except Exception:
             return ""
 
@@ -56,7 +61,8 @@ class Narrator:
         reveal; extra_directive = turn-level hard rule; on_delta = streaming
         callback; player_input = the player's own words — the first sentence
         must respond to it; scene_items = items physically present in the
-        scene (the narrator may ONLY mention these); party_inventory =
+        scene; additional physical details are returned as typed items and
+        committed by the engine before delivery; party_inventory =
         {char: [item names]} the party currently carries; world = tone +
         canon block distilled from gamerules.json (must never be
         contradicted).
@@ -79,12 +85,12 @@ class Narrator:
                 "絕不得透露不在清單上的資訊（不得給予地點、物品、"
                 "攻略建議、劇情推測）；可以閒聊、可以拒絕回答、"
                 "可以要求交換條件。\n")
-        # item inventory: the narrator may ONLY mention items that exist
+        # Existing inventory stays authoritative; new details use the header.
         items_block = ""
-        if scene_items or party_inventory:
+        if scene_items is not None or party_inventory is not None:
             lines = []
             if scene_items:
-                lines.append(f"場景中存在的物品（僅限這些）："
+                lines.append(f"場景中已記錄的物品："
                              f"{'、'.join(scene_items)}")
             else:
                 lines.append("場景中沒有可拾取的物品。")
@@ -93,9 +99,9 @@ class Narrator:
                     if items:
                         lines.append(f"{ch} 攜帶：{'、'.join(items)}")
             lines.append(
-                "⚠️ 絕不提及不在以上清單中的任何物品名稱——"
-                "如果你描述的場景需要一件道具，用泛稱"
-                "（「某件工具」「雜物」），不要發明具體物品名。"
+                "⚠️ 以上物品須沿用引擎記錄；可補充現場實體細節，"
+                "但新增的物品必須在開頭 JSON 的 items 列出所在位置及數量。"
+                "NPC 已公開的持有物亦以當前引擎狀態為準，不得補回已移走的物品。"
                 "提及清單中的物品時用粗體：**治療藥水**。")
             items_block = "\n".join(lines) + "\n"
 
@@ -136,7 +142,7 @@ class Narrator:
             "你可以做的事（DM 的創意空間）：\n"
             "· 描述環境變化（光線、聲音、氣味、天氣）\n"
             "· 讓 NPC 做出反應（表情、動作、情緒）\n"
-            "· 描述已公開細節，不加入可互動但引擎沒有追蹤的新事物\n"
+            "· 補充可互動的實體細節時，在 items 記錄，交由引擎保存後再公開\n"
             "· 讓世界感覺活著、有反應\n\n"
             "你不可以做的事（引擎管轄）：\n"
             "· 決定成敗（骰子結果由引擎決定）\n"
@@ -144,12 +150,15 @@ class Narrator:
             "· 替玩家角色行動或說話\n"
             "· 直接傳送角色到新地點\n\n"
             "有可行下一步時可以用它收尾；事件已完成時可以自然結束。"
-            + tail)
+            + tail + ITEM_INSTRUCTIONS)
         try:
             if on_delta:
-                # streaming: on_delta receives the growing text (v3 UX)
-                return (await self._stream(prompt, on_delta)).strip()
-            # non-streaming (CLI, tests)
-            return await self._call(prompt, 400)
+                # Buffer the internal header; callbacks receive prose only.
+                draft = parse_narration(await self._stream(prompt, None, max_tokens=650))
+            else:
+                draft = parse_narration(await self._call(prompt, 650))
+            if on_delta and draft:
+                on_delta(str(draft))
+            return draft
         except Exception:
             return ""  # degraded mode: engine lines stand alone

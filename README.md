@@ -279,10 +279,10 @@ find hidden items · social skills → move NPC disposition up the ladder.
 
 ## Design Principles
 
-1. **Engine decides, model narrates** — the LLM has no write path to game
-   state; it reads facts and writes prose
+1. **Engine decides, model narrates** — the engine validates action outcomes
+   and commits typed physical details proposed by narration
 2. **Predict the narration** — the engine renders prose skeletons from its
-   own data; the narrator only adds atmosphere
+   own data; the narrator adds atmosphere and recorded physical details
 3. **NPC knowledge is data** — each NPC has a `knows` list; the narrator
    receives only the facts the engine has disclosed
 4. **No LLM required** — the CLI proves the full game (combat, items,
@@ -493,6 +493,20 @@ cancellation, restart and replay use the same durable engine flow. See
 [the architecture](ARCHITECTURE.md#narration-and-individual-improvisations) for the
 bounded item and condition templates.
 
+Physical objects introduced by narration, including coins and keys, are recorded
+before the prose is delivered. The narrator supplies a private JSON header with
+each item's name, quantity, scene or NPC/enemy owner, and supporting prose. The
+engine stores ground items in the scene and carried items in the owner's loot;
+later pickup, theft, combat loot, and restarts use those same records. There is no
+additional model call. Plain-text coin/key assertions are also recognized. On
+upgrade, the last three saved DM narrations in the current scene, within five
+turns, can recover details such as the captain's pockets; player messages and
+other scenes are excluded. Unspecified quantities such as
+"a few coins" become one portion; explicit quantities are preserved. Repeated
+mentions do not replenish removed items. A new key has no automatic lock-opening
+effect, and narration cannot resolve a player's acquisition or contradict an
+established absence. `/continue` uses the same recording and persistence rules.
+
 Picking up ground loot is one collection action. These requests work through
 `/explore` without an attack or healing goal:
 
@@ -606,7 +620,9 @@ It contains isolated channel snapshots, append-only events, director decision
 records, operator audit reports, progress scheduling state, and narration status. Saves use SQLite transactions with WAL and full
 synchronization. Each command stages its changes, commits the snapshot and new
 events, then sends the verdict and starts narration. Narration completion is
-saved separately, without rewriting the gameplay snapshot or past events.
+saved separately. When prose establishes new physical objects, their inventory
+changes and narration commit together before delivery; otherwise the narration
+append leaves the gameplay snapshot unchanged. Past events are never rewritten.
 
 Database schema v2 migrates v1 transactionally and preserves existing events.
 Operator reports live in `operator_reports`, separate from the canonical ledger,

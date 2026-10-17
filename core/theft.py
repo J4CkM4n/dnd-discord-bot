@@ -36,6 +36,8 @@ def parse_theft(text, party_names=()):
         target, item = hit["target"], hit["item"]
     elif hit := re.fullmatch(r"(?:偷偷扒竊|偷偷扒窃|扒竊|扒窃|偷竊|偷窃|偷取)\s*(?P<target>.+?)(?:的(?P<item>.+))?", body):
         target, item = hit["target"], hit["item"] or ""
+    elif hit := re.fullmatch(r"偷\s*(?P<target>.+?)的(?P<item>.+)", body):
+        target, item = hit["target"], hit["item"]
     else:
         return None
     if distraction and distraction["target"].strip() != target.strip():
@@ -78,6 +80,10 @@ def possession(g, target, item):
         request = ""
     else:
         request = "" if item.casefold() in _GENERIC else item
+        # An indefinite narrated lot (e.g. 幾枚硬幣) is one recorded portion.
+        # Exact inventory names still win, including names with a classifier.
+        if request not in names:
+            request = re.sub(r"^(?:一|1|幾|几|數|数)\s*(?:枚|把|個|件|顆|張|條)\s*", "", request)
     if not request:
         if len(names) != 1:
             raise TheftError(f"請指定{name}身上的一件實際物品：{'、'.join(names) or '沒有可偷取的武器'}。尚未擲骰。")

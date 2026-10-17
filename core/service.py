@@ -60,8 +60,8 @@ def world_block(rules: dict) -> str:
         bits.append(
             "⚠️ 世界事實只是背景知識——不代表那些人／物在當前場景！"
             "劇情物品（項鍊、寶物、武器、藥水等）的位置由引擎決定："
-            "絕不得讓它們在敘事中出現、掉落、滾出、或看似可被取得——"
-            "玩家因此撲空＝敘事的錯。")
+            "不能把已存在的物品移到另一處、補回已取走的物品或代玩家取得。"
+            "補充新的現場實體細節時須在 items 登記，由引擎保存後才公開。")
     return "\n".join(bits)
 
 from .cli import META, DEMO_PARTY, build_starter_game, seed_starter_knowledge
@@ -254,7 +254,9 @@ class V4Service:
             self.game.retired_demo_names = sorted(set(self.game.retired_demo_names) | set(demos))
             self._operator_state = {"accepted_turns": 0, "pending_triggers": [], "last_reviewed_event": 0}
             log.info("removed unowned demo characters | channel=%s count=%d", channel_id, len(demos))
-        if self._revision == 0 or repaired_knowledge or repaired_story or repaired_combat or expired_check or demos:
+        from .narrated_items import repair_prior_narration
+        repaired_narration = repair_prior_narration(self.game)
+        if self._revision == 0 or repaired_knowledge or repaired_story or repaired_combat or expired_check or demos or repaired_narration:
             self._save()
 
     # ---------- persistence ----------
@@ -928,7 +930,13 @@ class V4Service:
             except Exception:
                 log.exception("narrator failed; committed narration remains resumable")
                 return lines, ""
-            self._save(narration_only=True)
+            self._save(narration_only=not self._narration_items_added)
+            if on_delta and narration:
+                try:
+                    on_delta(narration)
+                except Exception:
+                    log.exception("narration delivery failed; narration and items are committed")
+                    return lines, ""
         return lines, narration
 
     # ---------- non-turn mutations: same lock and transaction boundary ----------
@@ -1158,12 +1166,25 @@ class V4Service:
 
     # ---------- narration (shared by turns and roll settles) ----------
 
+    def _record_narrated_items(self, text, items, rmap):
+        from .guards import map_in
+        from .narrated_items import canonize_narrated_items, prepare_narrated_items
+        try:
+            from opencc import OpenCC
+            convert = OpenCC("s2t").convert
+        except ImportError:
+            convert = lambda value: value
+        items = prepare_narrated_items(self.game, text, items,
+                                      lambda value: map_in(convert(value), rmap))
+        return canonize_narrated_items(self.game, text, items)
+
     async def _narrate(self, idx0: int, player_input: str = "",
                        on_delta=None, wants_help: bool = False) -> str:
         """Turn the ledger entries since idx0 into guarded prose.
         wants_help comes from the digestor's intent judgement; the
         keyword regex is only the no-LLM fallback."""
         g = self.game
+        self._narration_items_added = False
         from .templates import render_hint
         from .guards import (make_placeholder_map, make_restore_map,
                              map_out, map_in, map_stream_in, scrub_narration,
@@ -1288,6 +1309,8 @@ class V4Service:
                 scene_items=scene_items, party_inventory=party_inv,
                 world=map_out(world_block(self.rules), pmap),
                 memory=map_out(build_memory(g, player_input, npc_name=npc_name).render(), pmap))
+        proposed_items = getattr(narration, "items", None)
+        narration = str(narration)
         # review trail: log the pair so output quality is auditable
         turn = current_turn()
         log.debug("narrate | trace=%s in=%s hints=%d out=%s",
@@ -1332,6 +1355,14 @@ class V4Service:
                                                        [n["name"] for n in g.scene_npcs()]):
             log.info("narration rejected | trace=%s reason=actor_mismatch", turn.trace_id if turn else "-")
             narration = "\n".join(safe_hints)
+            proposed_items = []
+        if narration:
+            public_text = map_in(narration, rmap)
+            try:
+                self._narration_items_added = bool(self._record_narrated_items(public_text, proposed_items, rmap))
+            except ValueError:
+                log.info("narration rejected | reason=item_conflict")
+                narration = "\n".join(safe_hints)
         # /continue bookkeeping on the SAFE (placeholder) text the LLM
         # actually produced: empty = it never spoke; no terminal
         # punctuation = the prose was cut mid-sentence (max_tokens /
@@ -1353,8 +1384,6 @@ class V4Service:
             # v5 seed 5: persist the narration into the ledger — replays
             # are complete and #dnd-health reviews full prose
             g.ledger.add("narrator", "narration", narration)
-            if on_delta:
-                on_delta(narration)
         return narration
 
     @serialized()
@@ -1445,6 +1474,8 @@ class V4Service:
             except Exception:
                 log.exception("continuation unavailable")
                 return False, ""
+            proposed_items = getattr(cont, "items", None)
+            cont = str(cont)
             try:
                 from opencc import OpenCC
                 cont = OpenCC("s2t").convert(cont)
@@ -1471,13 +1502,19 @@ class V4Service:
                 log.info("continuation rejected | reason=actor_mismatch")
                 return False, ""
             full = u["text"] + cont
+            public_full = map_in(full, rmap)
+            try:
+                added = self._record_narrated_items(public_full, proposed_items, rmap)
+            except ValueError:
+                log.info("continuation rejected | reason=item_conflict")
+                return False, ""
             raw = full.strip().rstrip("*").rstrip()
             self._unfinished = (dict(u, text=full)
                                 if not raw or raw[-1] not in _END_PUNCT or self._narrator_interrupted() else None)
             text = map_in(cont, rmap)
             self.game.ledger.add("narrator", "narration", text)
             self._recent_narrations = (self._recent_narrations + [text])[-5:]
-            self._save(narration_only=True)
+            self._save(narration_only=not added)
             if on_delta:
                 on_delta(text)
             return True, text
@@ -1489,7 +1526,9 @@ class V4Service:
         except Exception:
             log.exception("renarration unavailable")
             return False, ""
-        self._save(narration_only=True)
+        self._save(narration_only=not self._narration_items_added)
+        if on_delta and narration:
+            on_delta(narration)
         return bool(narration), narration
 
     def nudge(self) -> str:

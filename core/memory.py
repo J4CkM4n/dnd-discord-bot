@@ -11,7 +11,7 @@ MAX_CHARS = 3000
 # actions, unrevealed materializations, and arbitrary prose are deliberately absent.
 PUBLIC_KINDS = {"scene", "scene_fire", "item", "loot", "death", "combat",
                 "heal", "damage", "xp", "reveal", "beat", "rest", "theft", "item_transfer",
-                "possession_established", "condition", "condition_expired", "improvisation", "check"}
+                "possession_established", "narration_item", "condition", "condition_expired", "improvisation", "check"}
 
 
 def retired_demo_event(g, event) -> bool:
@@ -63,6 +63,10 @@ def build_memory(g, query: str = "", *, audience: str = "narrator",
              "facts": n.get("knows", []) if audience == "director"
                       else n.get("disclosed", []) if not npc_name or n["name"] == npc_name
                       else []} for n in g.scene_npcs()]
+    from .narrated_items import public_narrated_items
+    narrated_items = public_narrated_items(g)
+    for npc in npcs:
+        npc["items"] = narrated_items.get(npc["name"], [])
     current = {"scene": s.name, "description": s.description, "exits": s.exits,
                "fire": s.fire, "ground_items": s.ground_items, "npcs": npcs,
                "inventory": g.inventory,
@@ -70,6 +74,7 @@ def build_memory(g, query: str = "", *, audience: str = "narrator",
                            for n, f in g.scene_enemies().items()},
                "party": {n: {k: e.get(k) for k in ("hp_now", "hp_max", "conds")}
                          for n, e in g.party.items()}}
+    current["narrated_items"] = narrated_items
     from .creative_effects import active_conditions
     current["conditions"] = active_conditions(g)
     if audience == "director":
