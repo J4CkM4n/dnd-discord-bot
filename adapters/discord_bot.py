@@ -617,66 +617,8 @@ class DiscordBot(discord.Client):
                 await interaction.response.send_message(
                     "❓ 請指定角色（用 character 參數挑選）。")
                 return
-            e = g.party[char]
-            lines = [f"🎒 **{char}** — {e.get('occupation', '?')} "
-                     f"Lv{e.get('level', 1)} "
-                     f"HP {e['hp_now']}/{e['hp_max']}", ""]
-            # inventory
-            inv = g.inventory.get(char, [])
-            if inv:
-                lines.append("**物品 / Items**")
-                for name, qty in inv:
-                    lines.append(f"  🎒 {name}" + (f" ×{qty}" if qty > 1 else ""))
-            else:
-                lines.append("**物品 / Items**：（空）")
-            # spell slots
-            slots = e.get("slots") or {}
-            if slots:
-                lines.append("")
-                lines.append("**法術格 / Spell Slots**")
-                lines.append("  " + " · ".join(
-                    f"L{k} {v}" for k, v in slots.items()))
-            # skills: the 18 SRD skills, proficiency starred
-            from engine.charlib import (CORE_SKILLS, SKILL_ABILITY,
-                                        SKILL_LABEL)
-            prof = set(CORE_SKILLS.get(e.get("occupation", ""), []))
-            lines.append("")
-            lines.append(f"**技能 / Skills**（★＝熟練，共 {len(prof)} 項）")
-            by_ab = {}
-            for sk, ab in SKILL_ABILITY.items():
-                by_ab.setdefault(ab, []).append(sk)
-            for ab in ("STR", "DEX", "INT", "WIS", "CHA"):
-                row = " · ".join(
-                    ("★" if s in prof else "") + SKILL_LABEL[s]
-                    for s in by_ab.get(ab, []))
-                lines.append(f"  {ab}：{row}")
-            lines.append("　　（用 `/explore` 描述動作，或 `/skill`）")
-            # moves
-            from engine.moves import (compute_attack_moves,
-                                      move_spell_level)
-            inv_tuples = [("item", n, q) for n, q in inv]
-            mx = g.max_slot(char)
-            moves = compute_attack_moves(
-                e.get("occupation", ""), int(e.get("level", 1)),
-                inv_tuples, mx)
-            all_moves = compute_attack_moves(
-                e.get("occupation", ""), int(e.get("level", 1)),
-                inv_tuples, 99)
-            lines.append("")
-            lines.append("**招式 / Moves**")
-            for m in all_moves:
-                req = move_spell_level.get(m["name"], 0)
-                aoe = "（範圍）" if m["aoe"] else ""
-                if m in moves:
-                    cost = f"（耗 {req} 環法術格）" if req else ""
-                    src = "（裝備）" if m.get("improvised") else ""
-                    lines.append(f"  ⚔️ {m['name']} {m['ability']} "
-                                 f"{m['dmg']}{aoe}{cost}{src}")
-                else:
-                    lines.append(f"  🔒 {m['name']} {m['ability']} "
-                                 f"{m['dmg']}{aoe} — 需 {req} 環（未解鎖）")
-            await interaction.response.send_message(
-                "\n".join(lines)[:1900])
+            from core.objects import inventory_text
+            await interaction.response.send_message(inventory_text(g, char))
 
         # ---- /roll ----
 
@@ -714,77 +656,7 @@ class DiscordBot(discord.Client):
 
         # ---- /rules (SRD retrieval, zero LLM) ----
 
-        def _rules_db_path() -> str:
-            data_dir = os.environ.get("DATA_DIR", "data")
-            return os.environ.get(
-                "RULES_DB", os.path.join(data_dir, "rules.db"))
-
-        # the SRD is English-titled; map common zh queries to it
-        _SRD_ZH = {
-            "哥布林": "Goblin", "地精": "Goblin", "狗頭人": "Kobold",
-            "龍": "Dragon", "幼龍": "Dragon", "獸人": "Orc",
-            "骷髏": "Skeleton", "殭屍": "Zombie", "蜘蛛": "Spider",
-            "魚人": "Merfolk", "史萊姆": "Slime", "巨魔": "Troll",
-            "巨人": "Giant", "精靈": "Elf", "矮人": "Dwarf",
-            "半身人": "Halfling", "法師": "Wizard", "牧師": "Cleric",
-            "戰士": "Fighter", "盜賊": "Rogue", "遊俠": "Ranger",
-            "術士": "Warlock", "野蠻人": "Barbarian", "吟遊詩人": "Bard",
-            "德魯伊": "Druid", "聖武士": "Paladin",
-            "火球": "Fireball", "火球術": "Fireball",
-            "治療": "Healing", "治療藥水": "Potion of Healing",
-            "藥水": "Potion", "魔法飛彈": "Magic Missile",
-            "閃電": "Lightning", "隕石": "Meteor",
-            "先攻": "Initiative", "豁免": "Saving Throw",
-            "擅長": "Proficiency", "休息": "Rest",
-            "死亡豁免": "Death Saving Throw",
-            "掩蔽": "Cover", "擒抱": "Grapple", "衝刺": "Dash",
-            "閃避": "Dodge", "協助": "Help", "撤退": "Disengage",
-        }
-
-        def _srd_query_terms(q: str) -> list:
-            terms = [q]
-            for zh, en in _SRD_ZH.items():
-                if zh in q:
-                    terms.append(en)
-            return list(dict.fromkeys(terms))
-
-        def rules_text(query: str) -> str:
-            """Top SRD matches by title, then body — deterministic,
-            no embeddings, no LLM. zh queries map to English titles."""
-            import sqlite3
-            q = (query or "").strip()
-            if not q:
-                return "❓ 查詢什麼？例：`/rules 火球術`、`/rules 哥布林`"
-            try:
-                conn = sqlite3.connect(
-                    f"file:{_rules_db_path()}?mode=ro", uri=True,
-                    timeout=2.0)
-                try:
-                    rows = []
-                    for term in _srd_query_terms(q):
-                        rows = conn.execute(
-                            "SELECT title, kind, text FROM chunks "
-                            "WHERE title LIKE ? "
-                            "ORDER BY length(title) LIMIT 3",
-                            (f"%{term}%",)).fetchall()
-                        if rows:
-                            break
-                    if not rows:
-                        rows = conn.execute(
-                            "SELECT title, kind, text FROM chunks "
-                            "WHERE text LIKE ? LIMIT 3",
-                            (f"%{q}%",)).fetchall()
-                finally:
-                    conn.close()
-            except sqlite3.Error as e:
-                return f"⚠️ 規則庫不可用（{e}）"
-            if not rows:
-                return f"🔍 SRD 裡沒有「{query}」的條目（試英文名？）"
-            out = [f"📚 **SRD 查詢：{query}**"]
-            for title, kind, text in rows:
-                body = " ".join((text or "").split())[:280]
-                out.append(f"\n**{title}**（{kind}）\n{body}…")
-            return "\n".join(out)[:1900]
+        from core.rules_reference import rules_text
 
         @self.tree.command(name="rules",
                            description="查 SRD 規則（法術/怪物/物品，即時無 LLM）/ SRD lookup")

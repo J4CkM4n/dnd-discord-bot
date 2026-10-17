@@ -270,6 +270,15 @@ def validate(g: Game, it: Intent, *, allow_unplanned_move: bool = False) -> str 
         return f"{actor} 已倒地（HP 0），無法行動"
     if getattr(g, "_pending_check", None) and it.action not in ("inspect", "meta", "chat"):
         return "尚有待定檢定；請先用 `/roll d20`，或由原玩家用 `/plan cancel` 取消。"
+    if it.action == "skill":
+        _, skill = normalize_skill(it.skill or it.spell or it.utterance)
+        if it.target and skill in (*_SOCIAL, "medicine", "insight", "animal handling"):
+            _, char = resolve_target(g, it.target)
+            npc = _find_npc(g, it.target)
+            if not (char if skill == "medicine" else npc or (char if skill in _SOCIAL else None)):
+                return f"找不到可使用此技能的對象「{it.target}」；請重新指定目標。"
+    if it.action == "talk" and it.target and not _find_npc(g, it.target) and not resolve_target(g, it.target)[1]:
+        return f"這裡沒有交談對象「{it.target}」；請重新指定目標。"
     if it.action in ("use", "give", "inspect"):
         from .objects import inventory_request, visible_item, carried, ObjectError
         try:
@@ -341,9 +350,13 @@ def validate(g: Game, it: Intent, *, allow_unplanned_move: bool = False) -> str 
         if reason := _defeated_target(foe):
             return reason
     if it.action == "attack":
-        item = it.args.get("thrown_item")
-        if item and not any(n == item and q > 0 for n, q in g.inventory.get(actor, [])):
-            return f"沒有可投擲的「{item}」；不會改用普通攻擊。"
+        item = it.args.get("thrown_item") or it.args.get("weapon_item")
+        if item:
+            from .objects import carried, ObjectError
+            try:
+                carried(g, actor, item)
+            except ObjectError as exc:
+                return f"{exc} 不會改用普通攻擊。"
         foe, tgt_char = resolve_target(g, it.target)
         if reason := _defeated_target(foe):
             return reason
@@ -391,7 +404,7 @@ def ability_check(g: Game, actor: str, ability: str, dc: int,
         line = (f"✅ {actor} {ability}{sk_zh}：駕輕就熟"
                 f"（被動 {10 + mod} ≥ DC {dc}）——無需擲骰")
         g.ledger.add(actor, "check", line, mod=mod, total=10 + mod,
-                     dc=dc, ok=True)
+                     dc=dc, ok=True, skill=skill, effect_kind=(effect or {}).get("kind", ""))
         out = [line]
         _apply_check_effect(g, actor, effect, True, out)
         return True, "\n".join(out)
@@ -408,7 +421,8 @@ def ability_check(g: Game, actor: str, ability: str, dc: int,
                 + ("　🤝有人幫忙：你的骰與系統加骰取高" if helped else "")
                 + f"\n👉 用 `/roll d20` 擲骰（修正值 {mod:+d} 自動套用）")
         event = g.ledger.add(actor, "check_pending", f"{actor} 正等待檢定擲骰",
-                             ability=ability, skill=skill, dc=dc, scene=g.world.current)
+                             ability=ability, skill=skill, dc=dc, scene=g.world.current,
+                             effect_kind=(effect or {}).get("kind", ""))
         g._pending_check["event_id"] = event.event_id
         return None, line
     # v5 seed 3: inspiration also covers engine-rolled checks
@@ -425,7 +439,7 @@ def ability_check(g: Game, actor: str, ability: str, dc: int,
     if helped:
         line += "（🤝援助優勢）"
     g.ledger.add(actor, "check", line, d20=d, mod=mod, total=total,
-                 dc=dc, ok=ok, skill=skill)
+                 dc=dc, ok=ok, skill=skill, effect_kind=(effect or {}).get("kind", ""))
     out = [line]
     _apply_check_effect(g, actor, effect, ok, out)
     return ok, "\n".join(out)
@@ -450,7 +464,8 @@ def resolve_pending_check(g: Game, die: int) -> tuple[bool, str]:
     if helped:
         line += "（🤝援助優勢）"
     g.ledger.add(p["actor"], "check", line, d20=die, mod=mod,
-                 total=total, dc=dc, ok=ok, skill=p.get("skill", ""))
+                 total=total, dc=dc, ok=ok, skill=p.get("skill", ""),
+                 effect_kind=(p.get("effect") or {}).get("kind", ""))
     out = [line]
     _apply_check_effect(g, p["actor"], p.get("effect"), ok, out)
     return ok, "\n".join(out)
@@ -471,7 +486,7 @@ def _on_foe_death(g: Game, foe, lines: list):
     grant_xp(g, foe, lines)
 
 
-def _attack(g: Game, actor: str, target: str, move: str = "") -> ResolveResult:
+def _attack(g: Game, actor: str, target: str, move: str = "", weapon_item: str = "") -> ResolveResult:
     lines = []
     moves = compute_attack_moves(g.party[actor].get("occupation", ""),
                                  int(g.party[actor].get("level", 1)),
@@ -485,7 +500,13 @@ def _attack(g: Game, actor: str, target: str, move: str = "") -> ResolveResult:
             target = target[: -len(m["name"])].strip(" ：:,，,")
             move = m["name"]
             break
-    mv = next((m for m in moves if m["name"] == move), None) if move else None
+    mv = next((m for m in moves if m["name"] == move), None) if move else next(iter(moves), None)
+    if not move and mv and not weapon_item:
+        move = mv["name"]
+    if weapon_item:
+        mv = next((m for m in moves if m["name"] == weapon_item + " 打擊"), None)
+        mv = mv or {"ability": "STR", "dmg": "1d4"}
+        move = weapon_item
     ability = mv["ability"] if mv else "STR"
     dmg_expr = mv["dmg"] if mv else "1d4"
     # Validate before spending slots, dice or one-shot advantages.
@@ -762,6 +783,9 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
         # v3 lesson: never ignore the player silently — the narrator
         # must answer what the player said even when the engine denies it
         return ResolveResult([f"🚫 {reason}"], accepted=False)
+    if it.action == "meta" and it.args.get("inventory"):
+        from .objects import inventory_text
+        return ResolveResult([inventory_text(g, it.actor)])
     if it.action == "inspect":
         from .objects import carried, visible_item
         name = (carried if it.args.get("take_out") else visible_item)(g, it.actor, it.item or it.target)
@@ -857,10 +881,13 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
                     foe, tgt_char = resolve_target(g, it.target)
                     break
         if it.args.get("thrown_item"):
-            item = it.args["thrown_item"]
+            from .objects import carried
+            item = carried(g, actor, it.args["thrown_item"])
             r = _throw(g, actor, Intent("creative", target=it.target, item=item), f"投擲 {item}")
         else:
-            r = _attack(g, actor, it.target, it.args.get("move", ""))
+            from .objects import carried
+            item = carried(g, actor, it.args["weapon_item"]) if it.args.get("weapon_item") else ""
+            r = _attack(g, actor, it.target, it.args.get("move", ""), item)
         # only an EXECUTED attack burns the turn: a denied one (no
         # spell slot for the chosen move) must NOT advance rotation —
         # the player hasn't acted yet, they were told to pick another
@@ -1073,7 +1100,7 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
         npc = None
         if it.target:
             npc = _find_npc(g, it.target)
-        if npc is None:
+        if npc is None and not it.target:
             # deterministic path puts everything in the utterance —
             # 「講 船長幫幫手啦」: scan it for a scene NPC's name
             npc = _find_npc_in_text(g, it.utterance)
@@ -1136,7 +1163,7 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
         elif sk == "medicine":
             dc = 10
             foe, tgt_char = resolve_target(g, target)
-            if tgt_char is None or g.alive(tgt_char):
+            if not target:
                 # no downed target named: pick the most wounded ally
                 hurt = [n for n in g.party if not g.alive(n)] or [
                     n for n, e in g.party.items()
@@ -1201,15 +1228,19 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
             effect = {"kind": "animal", "target": npc["name"]}
         elif sk in _SOCIAL:
             # standalone social ploy without a talk utterance
-            npc = _find_npc(g, target) or (
-                g.world.here.npcs[0] if g.world.here.npcs else None)
-            if npc is None:
+            _, char = resolve_target(g, target)
+            npc = _find_npc(g, target) if target else (
+                g.world.here.npcs[0] if len(g.world.here.npcs) == 1 else None)
+            if char:
+                target = char  # a PC check grants no NPC information or forced response
+            elif npc is None:
                 return ResolveResult(
-                    ["❓ 這裡沒有可以交涉的對象。"], accepted=False)
-            target = npc["name"]
-            effect = {"kind": "social", "target": npc["name"], "skill": sk}
-            dc = 13 if npc.get("disposition", "neutral") in \
-                ("hostile", "suspicious") else 11
+                    ["❓ 請指定交涉對象：" + ("、".join(n["name"] for n in g.world.here.npcs) or "這裡沒有 NPC")], accepted=False)
+            else:
+                target = npc["name"]
+                effect = {"kind": "social", "target": npc["name"], "skill": sk}
+                dc = 13 if npc.get("disposition", "neutral") in \
+                    ("hostile", "suspicious") else 11
         # knowledge (arcana/history/nature/religion) and physical
         # (athletics/acrobatics/sleight of hand/survival): a plain check —
         # success is a fact the narrator dramatizes, failure adds nothing

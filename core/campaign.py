@@ -1,9 +1,23 @@
 """Authored starter milestones, public objectives and idempotent save recovery."""
 from collections import deque
+import re
 
 from .world import Scene, Enemy
 
 NECKLACE = "海妖女王的項鍊"
+QUEEN_REQUEST = "巴鐸偷走了我的項鍊。找回它，帶回碼頭，我便能解開祭壇的封印，釋放族人並指明生命泉水。"
+QUEEN_COMPLETED = "項鍊已交回，我已解開祭壇封印、釋放族人並指明生命泉水；我們的約定已完成。"
+
+
+def equipment_guidance(g, text):
+    """Answer the starter's equipment questions without inventing a shop/trade."""
+    if not is_starter(g) or g.world.current != "dock":
+        return ""
+    if not re.fullmatch(r"(?:買|购买|購買)\s*(?:刀|劍|剑|武器)|(?:找|尋找|搵)(?:武器店|武器屋)|武器屋を探す", text.strip(" 。.!！?？")):
+        return ""
+    return ("這裡是霧錨鎮碼頭，目前沒有武器商店。"
+            "可以先用 `/inventory` 查看裝備與職業招式；已有的職業招式可直接用 `/attack` 選擇。"
+            "也可以用 `/explore 和老船長交談` 打聽鎮上的情況。")
 
 
 def is_starter(g):
@@ -72,8 +86,18 @@ def sync_starter(g):
             f.name == "海妖女王" for foes in g.encounters.values() for f in foes)
         if not known_queen and not defeated(g, "海妖女王"):
             dock.npcs.append({"name": "海妖女王", "desc": "隔著潮水顯現的身影", "disposition": "friendly",
-                "knows": ["巴鐸偷走了我的項鍊。找回它，帶回碼頭，我便能解開祭壇的封印，釋放族人並指明生命泉水。"]})
+                "knows": [QUEEN_REQUEST]})
         progress["queen_seeded"] = True
+    if progress.get("completed"):
+        for scene in g.world.scenes.values():
+            for npc in scene.npcs:
+                if npc["name"] == "海妖女王":
+                    npc["knows"] = [QUEEN_COMPLETED] + [fact for fact in npc.get("knows", [])
+                                                         if fact not in (QUEEN_REQUEST, QUEEN_COMPLETED)]
+                    # Current dialogue must not revive an obsolete request;
+                    # historical disclosures remain in the event ledger.
+                    if "disclosed" in npc:
+                        npc["disclosed"] = [fact for fact in npc["disclosed"] if fact != QUEEN_REQUEST]
     if defeated(g, "巴鐸的護衛"):
         if not progress.get("guard"):
             progress["guard"] = True

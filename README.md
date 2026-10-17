@@ -127,6 +127,19 @@ docker compose up -d
 ```
 
 This also imports an existing `rules.db` for `/rules` and legacy JSON saves.
+`/rules` reads a separate SRD SQLite index, not `gamerules.json` or `plot.json`.
+Without that index it provides a small reference for the implemented game rules.
+To load the full reference from your local SRD Markdown directory without a model
+server, run `python tools/ingest_srd.py <srd-directory> data/rules.db --no-embeddings`.
+For an existing Compose volume, build it inside the volume instead:
+
+```bash
+docker compose run --rm --no-deps --volume "<absolute-srd-directory>:/srd:ro" bot \
+  python tools/ingest_srd.py /srd /app/data/rules.db --no-embeddings
+```
+
+`RULES_DB` can override the database path; the file must be readable inside the
+container. The title/text lookup requires no embeddings or LLM calls.
 Keep one running bot per campaign database. `docker compose down` preserves
 the volume; `docker compose down -v` deletes its campaign data.
 

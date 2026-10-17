@@ -375,6 +375,10 @@ class V4Service:
         reason = self._authorize(probe, user_id, admin_actor)
         if reason:
             return self._deny(probe.actor, reason)
+        from .campaign import equipment_guidance
+        from .intent import _action_text
+        if guidance := equipment_guidance(g, _action_text(t, list(g.party))[1]):
+            return [guidance], ""
         if self.agent_config.routing.enabled:
             self._attempt = {"before": progress_key(g, self.plot_state),
                              "eligible": not g.combat.active, "wants_help": bool(_HELP_RE.search(t))}
@@ -683,7 +687,7 @@ class V4Service:
         # Director facts belong to the same turn as the action they support.
         for e in g.ledger.entries[idx0:]:
             e.turn = g.ledger.turn
-        if r.accepted and r.lines and self._context_noteworthy(idx0):
+        if r.accepted and r.lines and not reading and self._context_noteworthy(idx0):
             from .templates import render_turn_context
             r.lines += ["", render_turn_context(g, it.actor)]
         rotation_only = any(e.kind == "deny" and ("輪到" in str(e.data.get("reason", ""))
@@ -696,7 +700,7 @@ class V4Service:
         narrate = bool(r.accepted and it.action != "inspect" and r.lines and self.pending is None and not rotation_only
                        and not speech_only
                        and len(g.ledger.entries) > idx0)
-        if r.lines and it.action != "inspect":
+        if r.lines and it.action != "inspect" and not (it.action == "meta" and it.args.get("inventory")):
             self._unfinished = self._narration_job(idx0, player_input, it.wants_help) if narrate else None
             if self._unfinished and it.narrative:
                 self._unfinished["narrative"] = it.narrative
@@ -989,6 +993,10 @@ class V4Service:
             "ac": ac, "slots": slots, "hd_used": 0,
         }
         g.inventory.setdefault(name, [])
+        from engine.moves import STARTER_EQUIPMENT
+        equipment = STARTER_EQUIPMENT.get(occ, ())
+        for item in equipment:
+            g.give_item(name, item)
         g.ledger.add(name, "meta",
                      f"{uname} 建立了角色 {name}（{occ}）")
         self._save()
@@ -1002,7 +1010,8 @@ class V4Service:
             f"(玩家：{uname})\n"
             f"🛡 AC {ac} · ❤️ {hp}/{hp}{slot_txt}\n"
             f"📊 {stat_txt}\n"
-            f"🎲 屬性由系統擲骰（4d6 取高 3）")
+            f"🎲 屬性由系統擲骰（4d6 取高 3）\n"
+            f"🎒 起始裝備：{'、'.join(equipment) or '無'}。用 `/inventory` 查看裝備與招式。")
 
     @serialized("text")
     async def remove_character(self, name: str, user_id: str, confirmation: str) -> str:
@@ -1245,6 +1254,11 @@ class V4Service:
         if narration and (is_dialogue_echo(narration, statements) or is_repetition(map_in(narration, rmap), self._recent_narrations)):
             log.info("narration rejected | trace=%s reason=dialogue_echo", turn.trace_id if turn else "-")
             narration = ""
+        from .guards import narration_identity_valid
+        if narration and not narration_identity_valid(map_in(narration, rmap), events, list(g.party),
+                                                       [n["name"] for n in g.world.here.npcs]):
+            log.info("narration rejected | trace=%s reason=actor_mismatch", turn.trace_id if turn else "-")
+            narration = "\n".join(safe_hints)
         # /continue bookkeeping on the SAFE (placeholder) text the LLM
         # actually produced: empty = it never spoke; no terminal
         # punctuation = the prose was cut mid-sentence (max_tokens /
@@ -1368,6 +1382,15 @@ class V4Service:
                 n for stacks in self.game.inventory.values() for n, _ in stacks]
             cont, _ = validate_narration_items(cont, known)
             if not cont or not is_chinese(cont):
+                return False, ""
+            from .guards import narration_identity_valid
+            events = [e for e in self.game.ledger.entries
+                      if u["start_event_id"] <= e.event_id <= u["end_event_id"]
+                      and e.kind not in ("table", "narration", "guard")
+                      and e.data.get("visibility") != "private"]
+            if not narration_identity_valid(map_in(u["text"] + cont, rmap), events, list(self.game.party),
+                                             [n["name"] for n in self.game.world.here.npcs]):
+                log.info("continuation rejected | reason=actor_mismatch")
                 return False, ""
             full = u["text"] + cont
             raw = full.strip().rstrip("*").rstrip()

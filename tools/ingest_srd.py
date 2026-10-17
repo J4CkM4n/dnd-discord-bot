@@ -13,9 +13,11 @@ Chunks by markdown headings (fallback: filename), embeds with the local
 embedding server, stores float32 vector BLOBs.
 
 Usage: python tools/ingest_srd.py <srd_dir> <out_db> <embed_url> [model]
+       python tools/ingest_srd.py <srd_dir> <out_db> --no-embeddings
 """
 
 import os
+import argparse
 import re
 import sqlite3
 import sys
@@ -133,13 +135,24 @@ def embed_batch(client: httpx.Client, url: str, texts: list[str],
 
 
 def main():
-    srd_dir, out_db, embed_url = sys.argv[1], sys.argv[2], sys.argv[3]
-    model = sys.argv[4] if len(sys.argv) > 4 else ""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("srd_dir")
+    parser.add_argument("out_db")
+    parser.add_argument("embed_url", nargs="?")
+    parser.add_argument("model", nargs="?", default="")
+    parser.add_argument("--no-embeddings", action="store_true", help="Build the /rules title/text index offline")
+    args = parser.parse_args()
+    srd_dir, out_db, embed_url, model = args.srd_dir, args.out_db, args.embed_url, args.model
+    if not args.no_embeddings and not embed_url:
+        parser.error("provide embed_url or --no-embeddings")
     docs = collect_md_files(srd_dir)
+    if not docs:
+        parser.error("no SRD Markdown files found; existing database was left unchanged")
     print(f"loaded {len(docs)} markdown files")
 
     if os.path.exists(out_db):
         os.remove(out_db)
+    os.makedirs(os.path.dirname(os.path.abspath(out_db)), exist_ok=True)
     db = sqlite3.connect(out_db)
     db.executescript(SCHEMA)
 
@@ -156,8 +169,8 @@ def main():
             batch = chunks[i : i + BATCH]
             # embed title + body: many entries (spells, monsters, items) carry
             # their name only in the heading — body-only vectors miss "Fireball"
-            vecs = embed_batch(client, embed_url,
-                               [f"{c[0]}\n{c[4]}" for c in batch], model)
+            vecs = ([np.array([], dtype=np.float32) for _ in batch] if args.no_embeddings else
+                    embed_batch(client, embed_url, [f"{c[0]}\n{c[4]}" for c in batch], model))
             db.executemany(
                 "INSERT INTO chunks (title, path, kind, src, text, vec) "
                 "VALUES (?,?,?,?,?,?)",

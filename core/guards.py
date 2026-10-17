@@ -175,3 +175,36 @@ def validate_narration_items(text: str, known_items: list) -> tuple[str, list]:
 
     clean = _BOLD_ITEM_RE.sub(check, text)
     return clean, valid
+
+
+def narration_identity_valid(text: str, events: list, party_names: list, npc_names: list) -> bool:
+    """Reject swapped participants and NPCs performing a PC's resolved action.
+
+    This is a conservative delivery guard, not a semantic verdict: a rejected
+    draft falls back to the engine's prose skeletons without replaying mechanics.
+    """
+    verbs = {
+        "search": r"搜索|搜尋|搜遍|搜查|翻找|尋找|搜到",
+        "observe": r"觀察|盯著|尋找破綻",
+        "insight": r"看穿|洞察|讀出",
+    }
+    actions = [(e.actor, e.data.get("effect_kind", "") if e.kind in ("check", "check_pending") else e.kind)
+               for e in events if e.actor in party_names]
+    actions = [(actor, kind) for actor, kind in actions if kind in verbs]
+    actors_by_action = {kind: {actor for actor, action in actions if action == kind} for kind in verbs}
+    entities = sorted(set(party_names + npc_names), key=len, reverse=True)
+    if not actions or not entities:
+        return True
+    names = re.compile("|".join(re.escape(n) for n in entities))
+    for sentence in re.split(r"[。！？!?\n]", text):
+        mentions = list(names.finditer(sentence))
+        for i, mention in enumerate(mentions):
+            tail = sentence[mention.end():mentions[i + 1].start() if i + 1 < len(mentions) else len(sentence)]
+            # Possessives/objects are not the acting subject.
+            if tail.startswith(("的", "之")) or (mention.start() and sentence[mention.start() - 1] in "向對看與和給讓被"):
+                continue
+            for kind, pattern in verbs.items():
+                actors = actors_by_action[kind]
+                if actors and mention[0] not in actors and re.search(pattern, tail[:45]):
+                    return False
+    return True

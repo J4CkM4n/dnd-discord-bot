@@ -41,6 +41,14 @@ move_spell_level = {"月光束（範圍）": 2, "地獄斥喝": 1, "灼熱之手
 
 _WEAPON_GLYPHS = "劍斧弓矛叉棍杖匕鏢錘刀槍鞭"
 
+# Physical starting equipment is recorded once, when /pc creates the character.
+STARTER_EQUIPMENT = {
+    "Barbarian": ("手斧", "巨斧"), "Bard": ("細劍",), "Cleric": ("戰錘", "盾牌"),
+    "Druid": ("木杖",), "Fighter": ("長劍", "盾牌"), "Monk": ("飛鏢",),
+    "Paladin": ("長劍", "盾牌"), "Ranger": ("短弓", "匕首"), "Rogue": ("短劍", "匕首"),
+    "Sorcerer": ("匕首",), "Warlock": ("匕首",), "Wizard": ("木杖",),
+}
+
 
 def compute_attack_moves(occupation: str, level: int, inventory: list,
                          max_slot_level: int = 99) -> list[dict]:

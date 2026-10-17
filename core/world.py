@@ -6,6 +6,13 @@ they enter this model only through engine/admin gates, never directly.
 """
 
 from dataclasses import dataclass, field
+import unicodedata
+
+
+def scene_key(name: str) -> str:
+    """Ignore typography, not words, when comparing place identities."""
+    return "".join(c for c in unicodedata.normalize("NFKC", name).casefold()
+                   if not c.isspace() and not unicodedata.category(c).startswith("P"))
 
 
 @dataclass
@@ -60,13 +67,21 @@ class World:
         return self.scenes[self.current]
 
     def find_exit(self, destination: str) -> str | None:
-        """Fuzzy destination match against exit labels/ids. None = invalid."""
+        """Prefer exact identities; accept only unambiguous normalized aliases."""
         d = (destination or "").strip()
         if not d:
             return None
-        for sid, label in self.here.exits.items():
-            if d == sid or d == label or d in label or label in d:
-                return sid
+        aliases = {sid: (label, self.scenes[sid].name) for sid, label in self.here.exits.items()
+                   if sid in self.scenes}
+        if d in aliases:
+            return d
+        for match in (lambda name: d == name,
+                      lambda name: scene_key(d) == scene_key(name),
+                      lambda name: bool(scene_key(d)) and (scene_key(d) in scene_key(name)
+                                                          or scene_key(name) in scene_key(d))):
+            found = [sid for sid, names in aliases.items() if any(match(n) for n in names)]
+            if found:
+                return found[0] if len(found) == 1 else None
         return None
 
     def describe(self) -> str:

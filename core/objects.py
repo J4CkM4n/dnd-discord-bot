@@ -6,6 +6,16 @@ from .intent import Intent, _action_text
 _COMPLEX = re.compile(r"[?？;；]|如果|假如|不要|唔|別|别|不想|然後|然后|之後|之后|再去|並且|切開|切开|點燃|点燃|放火|混合|攻擊|攻击|演|威嚇|恐嚇|掟|投擲|包紮|救返|救醒|\b(?:if|not|then|and|except|but|attack|mix|burn)\b", re.I)
 _OBJECT = re.compile(r"^(?P<verb>拿出|取出|攞出|take\s+out\b|檢查|检查|查看|端詳|inspect\b|examine\b|使用|用|use\b|給|给|交給|give\b)\s*(?P<tail>.*)$", re.I)
 _QUANTITY = re.compile(r"^(.*?)\s*(?:[×x*]\s*|\s+)(-?\d+|null|None)\s*$", re.I)
+_INVENTORY = re.compile(
+    r"(?:查看|檢查|看看|看下|睇下)?\s*(?:持有物|背包|物品欄|身上物品|inventory)|"
+    r"(?:我)?(?:身上|背包[裡裏入]?)有(?:咩|啲咩|什麼|甚麼|什么|乜嘢)[?？]*", re.I)
+_ITEM_ATTACK = re.compile(
+    r"(?:使用|用)\s*(?P<item>.+?)\s*(?P<method>掟向|掟|投擲向?|投掷向?|拋向|拋|抛向|丟向|丟|扔向|扔|敲一下|敲|砸向|砸|攻擊|攻击)"
+    r"\s*(?P<target>.+)")
+_QUALIFIED = re.compile(
+    r"[?？;；,，]|不|沒|没|唔|別|别|拒絕|拒绝|如果|假如|是否|然後|然后|之後|之后|並且|"
+    r"練習|练习|切磋|模擬|模拟|友誼|友谊|非致命|點到為止|点到为止|"
+    r"\b(?:if|not|then|and|except|but)\b", re.I)
 
 
 class ObjectError(ValueError):
@@ -69,6 +79,16 @@ def parse_object_command(text, party_names=()):
     """No prefix execution: qualified, compound requests stay with the operator."""
     actor, action = _action_text(text, party_names)
     action = action.rstrip("。.!！")
+    if _INVENTORY.fullmatch(action):
+        return Intent("meta", actor=actor, raw=text, args={"inventory": True})
+    attack = _ITEM_ATTACK.fullmatch(action) if not _QUALIFIED.search(action) else None
+    if attack:
+        thrown = re.search(r"掟|擲|掷|拋|抛|丟|扔", attack["method"])
+        return Intent("attack", actor=actor, target=attack["target"].strip(), raw=text,
+                      args={"thrown_item" if thrown else "weapon_item": attack["item"].strip()})
+    # An open-ended method must not fall through to 'use <item + verb>'.
+    if re.search(r"拋|抛|敲|砸|扔|丟", action):
+        return None
     if _COMPLEX.search(action):
         return None
     # 「把石頭給依思」 and 「給依思石頭」 are transfers, never item use.
@@ -118,6 +138,12 @@ def object_intent(g, text):
     # Observing a carried/visible object is a read, not a room search or tactic.
     from .intent import parse_command
     parsed = parse_command(text, list(g.party))
+    _, action = _action_text(text, list(g.party))
+    if (parsed and parsed.action == "skill" and re.match(r"(?:技能|skill\b|使出)", action, re.I)
+            and not _QUALIFIED.search(action)):
+        from engine.charlib import normalize_skill
+        if normalize_skill(parsed.skill)[1]:
+            return parsed
     if parsed and parsed.action == "observe" and not _COMPLEX.search(parsed.target):
         try:
             visible_item(g, parsed.actor, parsed.target)
@@ -128,3 +154,29 @@ def object_intent(g, text):
                 return None
         return Intent("inspect", actor=parsed.actor, item=parsed.target, raw=text)
     return None
+
+
+def inventory_text(g, char):
+    """The same engine-owned inventory and moves for slash and natural requests."""
+    from engine.charlib import CORE_SKILLS, SKILL_ABILITY, SKILL_LABEL
+    from engine.moves import compute_attack_moves, move_spell_level
+    e = g.party[char]
+    inv = g.inventory.get(char, [])
+    lines = [f"🎒 **{char}** — {e.get('occupation', '?')} Lv{e.get('level', 1)} "
+             f"HP {e['hp_now']}/{e['hp_max']}", "", "**物品 / Items**"]
+    lines += [f"  🎒 {n}" + (f" ×{q}" if q > 1 else "") for n, q in inv] or ["（空）"]
+    if slots := e.get("slots"):
+        lines += ["", "**法術格 / Spell Slots**", "  " + " · ".join(f"L{k} {v}" for k, v in slots.items())]
+    prof = set(CORE_SKILLS.get(e.get("occupation", ""), []))
+    lines += ["", f"**技能 / Skills**（★＝熟練，共 {len(prof)} 項）"]
+    for ab in ("STR", "DEX", "INT", "WIS", "CHA"):
+        lines.append(f"  {ab}：" + " · ".join(("★" if sk in prof else "") + SKILL_LABEL[sk]
+                     for sk, ability in SKILL_ABILITY.items() if ability == ab))
+    lines += ["　　（用 `/explore` 描述動作，或 `/skill`）", "", "**招式 / Moves**"]
+    for m in compute_attack_moves(e.get("occupation", ""), int(e.get("level", 1)),
+                                  [("item", n, q) for n, q in inv], 99):
+        req = move_spell_level.get(m["name"], 0)
+        locked = req > g.max_slot(char)
+        suffix = f" — 需 {req} 環（未解鎖）" if locked else (f"（耗 {req} 環法術格）" if req else "")
+        lines.append(f"  {'🔒' if locked else '⚔️'} {m['name']} {m['ability']} {m['dmg']}" + suffix)
+    return "\n".join(lines)[:1900]

@@ -190,7 +190,8 @@ def verify_proposal(g, proposal: DirectorProposal) -> str | None:
             return "invalid_shape"
         if getattr(g, "director_scene_count", 0) >= MAX_DIRECTOR_SCENES:
             return "scene_limit"
-        if any(name == s.name for s in g.world.scenes.values()):
+        from .world import scene_key
+        if any(scene_key(name) == scene_key(s.name) for s in g.world.scenes.values()):
             return "duplicate_scene"
         npc = d.get("npc", "").strip()
         if npc and (npc in g.party or any(npc == n["name"] for s in g.world.scenes.values()
