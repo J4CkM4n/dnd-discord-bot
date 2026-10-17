@@ -46,8 +46,12 @@ def evaluate(traces, labels=()):
         rendered = json.dumps(end["result"], ensure_ascii=False)
         label = annotated.get(trace_id, {})
         metadata = [r["payload"]["metadata"] for r in rows if r["kind"] == "model_response"]
+        reviews = [{k: r["payload"][k] for k in ("operator", "purpose", "backend", "outcomes",
+                    "fallback_reason", "latency_ms", "call_count")}
+                   for r in rows if r["kind"] == "system_one_review"]
         results.append({"trace_id": trace_id, "category": category, "calls": end["calls"],
             "model_ms": sum(r.get("latency_ms", 0) for r in metadata),
+            "reviews": reviews,
             "clarification": "❓" in rendered, "hint": "💡" in rendered,
             "routing_correct": category == label["category"] if "category" in label else None,
             "unnecessary_clarification": "❓" in rendered and not label["clarification"]

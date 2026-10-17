@@ -24,6 +24,21 @@ Use `AI_DEBUG_CAPTURE=off` and restart to stop capture. Files remain until norma
 retention cleanup or explicit removal. Full capture is separate from the
 always-on structured operator audit in SQLite.
 
+Native operator checks emit `system_one_review` records with `operator`, `purpose`
+(`intent_review`, `proposal_review`, `guidance_review`), per-question `outcomes`
+and `answers`, `backend`, `latency_ms`, cumulative `call_count`, source revision,
+and `fallback_reason`. Native model-call records use the requesting operator's
+role and carry the same purpose. Skips consume no call. Reasons distinguish
+disabled/LLM backends, missing credentials, exhausted fallback budget, oversized
+context, stale revisions, uncertain answers, and transport/response failures.
+A native outage skips subsequent native checks for the same turn.
+
+`evaluate` includes a `reviews` list per turn for comparing review purpose,
+backend, latency, call count and fallback reason. Replay consumes captured native
+review answers through its offline transport as well as routing and LLM answers.
+Approving a director proposal replaces two LLM reviews with one native call in
+the regression fixtures; compare real traces to establish latency changes.
+
 ```bash
 # Export all retained turns; add --trace-id ID to select one.
 python -m core.trace_eval export data/debug --output session.jsonl

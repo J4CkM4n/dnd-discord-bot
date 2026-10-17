@@ -6,21 +6,21 @@ from dataclasses import replace
 import httpx
 import pytest
 
-from core.agent_config import ConfigError, parse_config
+from core.agent_config import ConfigError, load_agent_config, parse_config
 from core.decisions import RouteDecision, routing_questions, validate_answers
 from core.debug_capture import DebugCapture
 from core.model_gateway import ModelError
 from core.service import V4Service, load_gamerules
 from core.state import encode_game
 from test_campaign import run, decisions
-from test_operators import Endpoint, supervised, roles, audits
+from test_operators import EXECUTE_ACTION, Endpoint, supervised, roles, audits
 
 
 def answer(questions, **selections):
     defaults = {"category": "search", "target": "none", "destination": "none"}
     result = {}
     for key, question in questions.items():
-        selected = selections.get(key, defaults.get(key, "no"))
+        selected = selections.get(key, defaults.get(key, "approved" if "approved" in question["criteria"] else "no"))
         result[key] = {"type": "choice", "choice": selected,
                        "probabilities": {option: float(option == selected) for option in question["criteria"]},
                        "confidence": 1.0}
@@ -54,6 +54,44 @@ def routed(tmp_path, endpoint, *, native=False, selection=None, native_error=Non
     s.gateway.transport = httpx.MockTransport(handler)
     s.debug_capture = DebugCapture(tmp_path, cfg, enabled=False)
     return s, native_requests
+
+
+@pytest.mark.parametrize("routing_enabled,switch,expected", [
+    (True, None, True), (True, "true", True), (True, "false", False),
+    (True, "OFF", False), (True, " 0 ", False), (False, "true", False),
+])
+def test_system_one_env_gate_at_startup(tmp_path, routing_enabled, switch, expected):
+    path = tmp_path / "agents.toml"
+    path.write_text(f"[routing]\nenabled = {str(routing_enabled).lower()}\n")
+    env = {} if switch is None else {"V4_SYSTEM_ONE_ENABLED": switch}
+    cfg = load_agent_config(str(path), env)
+    assert cfg.routing.enabled is expected
+    assert cfg.enabled  # Other model roles remain available.
+
+
+@pytest.mark.parametrize("routing_enabled", [True, False])
+def test_invalid_system_one_env_switch_is_rejected(routing_enabled):
+    with pytest.raises(ConfigError, match="V4_SYSTEM_ONE_ENABLED"):
+        parse_config({"routing": {"enabled": routing_enabled}},
+                     {"V4_SYSTEM_ONE_ENABLED": "invalid"})
+
+
+@pytest.mark.parametrize("native", [True, False])
+def test_system_one_disabled_skips_all_routing_and_executes_action(tmp_path, native):
+    endpoint = Endpoint(main=[{"consult": ["action"]}, EXECUTE_ACTION],
+                        action=[{"action": "search"}])
+    s, requests = routed(tmp_path, endpoint, native=native)
+    cfg = parse_config({"roles": {r: {"model": r} for r in s.agent_config.roles},
+                        "routing": {"enabled": True}},
+                       {"V4_SYSTEM_ONE_ENABLED": "false",
+                        "TYPESAFE_API_KEY": "native-private" if native else ""})
+    s.agent_config = s.gateway.config = cfg
+    s.game.world.here.hidden_items = [("破紙", 1)]
+    lines, prose = run(s.handle("搜索", user_id="u1"))
+    assert lines and prose and s.game.ledger.entries
+    assert not requests and not endpoint.unexpected
+    assert roles(endpoint) == ["main", "action", "main", "narrator"]
+    assert not any(r["role"] == "router" for r in audits(s))
 
 
 def test_native_fast_path_excludes_secrets_and_uses_one_decision_call(tmp_path):
@@ -192,11 +230,14 @@ def test_new_configuration_is_validated_without_exposing_credentials(data):
 def test_native_uncertain_decision_delegates_to_action_specialist(tmp_path, confidence):
     endpoint = Endpoint(action=[{"action": "search"}])
     def uncertain(raw):
-        raw["answers"]["category"]["confidence"] = confidence
-    s, _ = routed(tmp_path, endpoint, native=True, native_transform=uncertain)
+        if "category" in raw["answers"]:
+            raw["answers"]["category"]["confidence"] = confidence
+    s, requests = routed(tmp_path, endpoint, native=True, native_transform=uncertain)
     s.game.world.here.hidden_items = [("破紙", 1)]
     run(s.handle("搜索", user_id="u1"))
     assert roles(endpoint)[:1] == ["action"]
+    assert len(requests) == 2 and "intent_fidelity" in requests[-1]["questions"]
+    assert s.game.ledger.turn > 0 and "main" not in roles(endpoint)
 
 
 @pytest.mark.parametrize("text, executes", [("搜索", True), ("搜索，然後攻擊船長", False)])

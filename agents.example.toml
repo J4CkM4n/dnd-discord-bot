@@ -56,15 +56,18 @@ provider = "local"
 # model = "qwen3.5:35b"
 max_tokens = 400
 
-# Jev makes bounded decisions; the existing LLM router is used without a key
-# or when Jev fails. No external Jev call occurs until TYPESAFE_API_KEY is set.
+# Jev routes and verifies operator candidates; generation stays with specialist models.
+# Routing falls back to roles.router; reviews fall back directly to main/evaluator.
+# No external Jev call occurs until TYPESAFE_API_KEY is set.
 [routing]
+# V4_SYSTEM_ONE_ENABLED=false in .env skips routing and all native operator checks.
 enabled = true
-backend = "auto"  # auto / jev / llm; native failures fall back to roles.router
+backend = "auto"  # auto / jev / llm; llm also disables native operator checks
 model = "jev-latest"
 base_url = "https://api.typesafe.ai/v1"
 api_key_env = "TYPESAFE_API_KEY"
 timeout = 5
+# Shared by direct routing and operator verification; both thresholds must pass.
 probability = 0.85
 confidence = 0.8
 creative_max_calls = 8

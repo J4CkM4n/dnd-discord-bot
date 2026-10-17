@@ -379,7 +379,7 @@ Ollama thinking inherits `V4_DIGEST_THINK` / `V4_NARR_THINK`; optional evaluatio
 inherits `V4_DIRECTOR_EVALUATE`. Code defaults apply when these are absent.
 Discord token, channel IDs, and `DATA_DIR` remain environment settings.
 
-## System One routing and orchestration
+## System One routing and operator verification
 
 The `agents.example.toml` template enables `[routing]` with `backend="auto"`. Configure
 `TYPESAFE_API_KEY` to use native **TypeSafe Jev** at
@@ -387,10 +387,16 @@ The `agents.example.toml` template enables `[routing]` with `backend="auto"`. Co
 existing LLM. One failed native request makes one LLM fallback call.
 `backend="llm"` forces the LLM; `backend="jev"` also retains fallback.
 
-Native Jev receives bounded player action text (1,500 characters), public scene
+Set `V4_SYSTEM_ONE_ENABLED=false` in `.env` to skip the System One layer globally,
+including native routing, operator checks and the LLM router, and use the existing main/action
+workflow. This overrides `[routing].enabled=true` in `agents.toml`. The default
+is `true`, which preserves `[routing].enabled`. Restart after changing the process
+environment; for Compose, run `docker compose up -d --force-recreate bot`.
+
+Native routing receives bounded player action text (1,500 characters), public scene
 description (500), visible target names, exits, and a recent public NPC exchange
 (500). API secrets, account IDs, inventory, hidden items, private knowledge, and
-unpublished plot are excluded from its body. The API key authenticates via header.
+unpublished plot are excluded from its routing body. The API key authenticates via header.
 
 Batched typed choices cover category, target, destination, ambiguity, creative
 detail, improvisation, help, and compound actions. Clear supported actions go
@@ -398,6 +404,39 @@ directly to the engine; uncertain/open-ended actions use the action specialist.
 Default direct thresholds are probability 0.85 and confidence 0.8; absent native
 confidence requires interpretation. LLM self-reported confidence is uncalibrated,
 so its direct path additionally requires a complete deterministic parse.
+
+With routing enabled and native Jev configured (`auto` or `jev` plus a key),
+specialist-generated action interpretations receive one intent check against the
+original request, including target, method, negation and constraints. Director
+proposals batch that check with fact/canon consistency and bounded effects after
+all scene, item, improvisation or linked-plan data exists. A confident approval
+replaces evaluator and final main approval; a confident rejection stops the
+proposal. Uncertain, malformed, timed-out or unavailable checks use the existing
+reviewers once, reusing the generated candidate. Standalone action fallback uses
+the main agent's final review without repeating delegation or interpretation.
+Deterministic commands and direct routing keep their existing paths. Without
+native Jev, existing reviews remain in use; operator checks never call the LLM router.
+
+Progress stays with the specialist model, followed by deterministic evidence validation.
+One native batch checks each proposed guidance option; only approved options
+remain, in report order, up to three. Any uncertain/unavailable answer sends the
+complete report to the existing main review. Checks cannot add options or evidence.
+
+Both native uses share `[routing]` credentials, endpoint, timeout and thresholds:
+selected probability **≥0.85** and confidence **≥0.8** by default. Operator checks
+may receive selected private campaign facts, canon, inventory and hidden items
+when needed to review a proposal. Account metadata and known credentials are
+removed. The review state is limited to **16,000 serialized characters**; essential
+context is never silently truncated. Oversized reviews use the existing reviewer.
+
+The native wire body is `{ "model": "jev-latest", "state": {...}, "questions": {...} }`.
+Each question has `type="choice"`, `instructions`, and `criteria` mapping option
+IDs to descriptions. Review criteria are `approved`, `rejected`, `uncertain`;
+responses supply `answers[question_id]` with `choice`, a probability for every
+criterion (summing to one), and `confidence`. Missing confidence means uncertainty.
+Missing/extra questions, unknown choices and invalid distributions fail validation.
+Routing retains its existing action/target/yes-no criteria. Purpose and requesting
+operator are recorded locally with each call and review outcome.
 
 Player words and details are stored as a narrative brief, separate from facts,
 and survive pending rolls and narration restarts. Style changes the response,
@@ -412,6 +451,9 @@ Creative proposals and scene extensions can use **eight**
 Required reviews and prose reserve slots; there are no retries or delegation
 loops, and at most three main-model calls. Typed commands bypass routing and
 intent supervision; milestone progress and narration can still run.
+Native review is attempted only when its full fallback and required downstream
+calls still fit. Otherwise the existing reviewer runs directly. A native outage
+prevents further native attempts during that turn.
 
 ## Director proposals and improvisation
 
@@ -449,7 +491,8 @@ Independent goals, hypotheticals and unsupported chains require clarification.
 
 TypeSafe **Jev** is a System One model; director **Judge–Evaluate–Verify** is a
 separate review workflow. New routed scene/item proposals and improvised effects
-require evaluator review, main approval, and engine verification. Models propose
+require either confident native approval or evaluator review plus main approval,
+followed by engine verification. Models propose
 attempts; the engine owns checks, costs, results, and state mutation.
 
 A creative plan uses one canonical skill, an engine DC tier (10/14/18), up to two

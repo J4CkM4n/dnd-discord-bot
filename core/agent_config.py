@@ -37,7 +37,7 @@ class RoleConfig:
 
 @dataclass(frozen=True)
 class RoutingConfig:
-    enabled: bool = False  # old configurations retain their original workflow
+    enabled: bool = False  # shared gate for routing and native operator checks
     backend: str = "auto"
     model: str = "jev-latest"
     base_url: str = "https://api.typesafe.ai/v1"
@@ -185,8 +185,10 @@ def parse_config(data: dict, env=None) -> AgentConfig:
     key = env.get(key_env, "")
     if "\n" in key or "\r" in key:
         raise ConfigError("Invalid routing credential")
+    system_one_enabled = _env_bool(env, "V4_SYSTEM_ONE_ENABLED", True)
     routing = RoutingConfig(
-        _boolean(route.get("enabled", False), "routing.enabled"), backend, model.strip(),
+        _boolean(route.get("enabled", False), "routing.enabled") and system_one_enabled,
+        backend, model.strip(),
         url.rstrip("/"), key_env, key,
         _number(route.get("timeout", 5), "routing.timeout", 1, 30),
         _number(route.get("probability", .85), "routing.probability", .5, 1),
