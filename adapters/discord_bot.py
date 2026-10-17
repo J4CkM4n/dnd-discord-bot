@@ -107,6 +107,7 @@ HELP_TEXT = """🎲 **v6 引擎指令 / Commands**
 `/promote <member>` `/demote <member>` `/admins` — 此伺服器的管理員（私人回覆）
 `/script submit <file>` — 私人提交 UTF-8 .txt／.md 冒險（1 MiB／100,000 字元）
 `/script status` — 私人審閱進度、起始場景、大綱、內容、秘密及問題
+`/script suggest <draft> [prompt]` — 產生修法建議；可接受、拒絕或補充要求重新產生
 `/script approve <draft>` `/script discard <draft>` — 提交者批准／丟棄指定草稿
 `/script clear` — 取消此頻道下次冒險選擇；已批准冒險於開始／重設時啟用
 `/new_game` — 開始此頻道的新遊戲（已有遊戲時不覆蓋）
@@ -317,6 +318,8 @@ class DiscordBot(discord.Client):
                         filename="adventure-review.json")
                 for i, chunk in enumerate(_split(text)):
                     await self._private_reply(interaction, chunk, **(attachment if i == 0 else {}))
+                if draft:
+                    await self._send_script_solution(interaction, draft)
                 return
             if operation == "approve":
                 version = store.approve(guild_id, channel_id, draft_id.strip(), user_id)
@@ -335,6 +338,84 @@ class DiscordBot(discord.Client):
         except ScriptError as exc:
             text = str(exc)
         await self._private_reply(interaction, text)
+
+    async def _send_script_solution(self, interaction, draft):
+        from adapters.script_review import ScriptSolutionView
+        from core.script_solutions import solution_preview
+        if not self._is_admin(interaction):
+            return
+        editable = draft["status"] in ("blocked", "failed") and draft["submitted_by"] == str(interaction.user.id)
+        if not (editable or draft["solution"] or draft["conversion_guidance"]):
+            return
+        attachment = {}
+        if draft["solution"] or draft["conversion_guidance"]:
+            attachment["file"] = discord.File(io.BytesIO(json.dumps({
+                "draft_id": draft["draft_id"], "accepted_amendments": draft["conversion_guidance"],
+                "solution": draft["solution"],
+            }, ensure_ascii=False, indent=2).encode("utf-8")), filename="script-conversion-review.json")
+        chunks = _split(solution_preview(draft))
+        for i, chunk in enumerate(chunks):
+            kwargs = dict(attachment) if i == 0 else {}
+            if editable and i == len(chunks) - 1:
+                kwargs["view"] = ScriptSolutionView(self, draft)
+            await self._private_reply(interaction, chunk, **kwargs)
+
+    async def _suggest_script(self, interaction, draft_id, prompt="", solution_id=None):
+        from core.script_store import ScriptError
+        if not await self._require_admin(interaction):
+            return
+        try:
+            self.scripts.store.solution_draft(interaction.guild_id, interaction.channel_id, draft_id,
+                                              interaction.user.id, solution_id)
+            await interaction.response.defer(thinking=True, ephemeral=True)
+            if not await self._require_admin(interaction):
+                return
+            task = self.scripts.suggest(interaction.guild_id, interaction.channel_id, draft_id,
+                                        interaction.user.id, prompt, solution_id)
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if not task.cancelled():
+                    raise
+                await self._private_reply(interaction, "修法作業已中斷或被新操作取代；請用 /script status 查看。")
+                return
+            if not await self._require_admin(interaction):
+                return
+            draft = self.scripts.store.draft(interaction.guild_id, interaction.channel_id)
+            if not draft or draft["draft_id"] != draft_id:
+                raise ScriptError("草稿已被替換或移除；請用 /script status 查看。")
+            await self._script_operation(interaction, "status")
+        except ScriptError as exc:
+            await self._private_reply(interaction, str(exc))
+
+    async def _prompt_script_solution(self, interaction, draft_id, solution_id):
+        from adapters.script_review import ScriptSolutionPrompt
+        from core.script_store import ScriptError
+        if not await self._require_admin(interaction):
+            return
+        try:
+            draft = self.scripts.store.solution_draft(interaction.guild_id, interaction.channel_id, draft_id,
+                                                     interaction.user.id, solution_id)
+            prompt = (draft["solution"] or {}).get("prompt", "")
+            await interaction.response.send_modal(ScriptSolutionPrompt(self, draft_id, solution_id, prompt))
+        except ScriptError as exc:
+            await self._private_reply(interaction, str(exc))
+
+    async def _decide_script_solution(self, interaction, draft_id, solution_id, *, accept):
+        from core.script_store import ScriptError
+        if not await self._require_admin(interaction):
+            return
+        try:
+            new_id = self.scripts.decide_solution(interaction.guild_id, interaction.channel_id, draft_id,
+                                                  solution_id, interaction.user.id, accept=accept)
+            if accept:
+                await self._private_reply(interaction, "✅ 已接受建議，正在重新轉換及驗證。新草稿 ID：" + new_id +
+                                          "\n請用 /script status 審閱結果；準備完成後仍須另外用 /script approve 批准。")
+            else:
+                await self._private_reply(interaction, "已拒絕這份建議，保留原草稿。可補充要求重新產生。")
+                await self._script_operation(interaction, "status")
+        except ScriptError as exc:
+            await self._private_reply(interaction, str(exc))
 
     async def on_ready(self):
         log.info("logged in as %s (guilds=%d)", self.user, len(self.guilds))
@@ -410,6 +491,12 @@ class DiscordBot(discord.Client):
         @script.command(name="status", description="私下查看準備進度、內容及轉換問題")
         async def script_status_cmd(interaction: discord.Interaction):
             await svc._script_operation(interaction, "status")
+
+        @script.command(name="suggest", description="提交者產生修法建議，審閱後接受、拒絕或補充要求")
+        @app_commands.describe(draft="草稿 ID", prompt="希望保留的規則、可接受的改編或其他要求（最多 2000 字元）")
+        async def suggest_script_cmd(interaction: discord.Interaction, draft: str,
+                                     prompt: app_commands.Range[str, 0, 2000] = ""):
+            await svc._suggest_script(interaction, draft.strip(), prompt)
 
         @script.command(name="approve", description="提交者批准已審閱的草稿並選為下次冒險")
         @app_commands.describe(draft="從私人 status 審閱取得的草稿 ID")

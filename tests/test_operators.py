@@ -332,7 +332,7 @@ def test_v1_migration_preserves_events_and_separates_operator_state(tmp_path):
     assert after["operator_state"] == {}
     migrated = CampaignRepository(s.repository.path)  # migration is idempotent
     with migrated.connect() as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
         assert conn.execute("SELECT COUNT(*) FROM operator_reports").fetchone()[0] == 0
 
 

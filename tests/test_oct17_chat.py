@@ -12,7 +12,7 @@ from core.objects import parse_object_command, inventory_text
 from core.rules_core import resolve, ability_check
 from core.rules_reference import rules_text
 from core.state import encode_game
-from core.world import Scene
+from core.world import Scene, World
 from test_campaign import service, restart, run
 
 
@@ -91,6 +91,18 @@ def test_exit_matching_uses_exact_label_before_partial_and_rejects_ambiguity(tmp
     assert w.find_exit("酒館") == "tavern"
     w.here.exits["tavern"] = "酒館大廳"
     assert w.find_exit("酒館") is None
+
+
+def test_merged_exit_labels_remain_independent_aliases_and_reject_ambiguity():
+    w = World({"start": Scene("start", "起點", exits={"tower": "前往高塔\n沿階梯上樓"}),
+               "tower": Scene("tower", "高塔"), "garden": Scene("garden", "花園")}, "start")
+    assert w.find_exit("前往高塔") == w.find_exit("沿階梯上樓") == "tower"
+    w.here.exits["garden"] = "前往高塔"
+    assert w.find_exit("前往高塔") is None
+    assert w.find_exit("沿階梯上樓") == "tower"
+    assert w.find_exit("tower") == "tower"
+    w.here.exits["tower"] = "前往高塔\n\n沿階梯上樓"
+    assert w.find_exit("不存在的出口") is None
 
 
 def test_social_skill_keeps_teammate_and_never_reveals_captain_information(tmp_path):

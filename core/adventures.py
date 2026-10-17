@@ -53,8 +53,9 @@ def empty_definition():
 
 
 class _Validator:
-    def __init__(self):
+    def __init__(self, *, allow_unresolved=False):
         self.issues = []
+        self.allow_unresolved = allow_unresolved
 
     def fail(self, path, reason):
         # Paths are schema labels/indices, never supplied values or source text.
@@ -89,7 +90,7 @@ class _Validator:
             self.fail(path, f"expected integer from {lo} to {hi}")
 
     def ref(self, value, choices, path):
-        if not isinstance(value, str) or value not in choices:
+        if not isinstance(value, str) or (not self.allow_unresolved and value not in choices):
             self.fail(path, "unresolved reference")
 
     def texts(self, value, path):
@@ -148,18 +149,22 @@ def _contains_text(value, text):
     return False
 
 
-def validate_definition(data):
-    """Return private, value-free diagnostics. Fail closed on unknown mechanics."""
-    v = _Validator()
+def validate_definition(data, *, partial=False):
+    """Validate types before merging; partial chunks may defer global references.
+
+    Only complete definitions pass the default approval checks. Diagnostics
+    contain schema paths and reasons, never supplied values or private text.
+    """
+    v = _Validator(allow_unresolved=partial)
     root = empty_definition()
     d = v.obj(data, root, "definition", root)
     if not d:
         return v.issues
     if type(d.get("schema_version")) is not int or d["schema_version"] != SCHEMA_VERSION:
         v.fail("schema_version", "unsupported definition version")
-    if d.get("complete") is not True:
+    if type(d.get("complete")) is not bool or (not partial and d["complete"] is not True):
         v.fail("complete", "conversion is incomplete")
-    v.text(d.get("title"), "title", limit=200)
+    v.text(d.get("title"), "title", blank=partial, limit=200)
     setting_fields = ("tone", "premise", "facts")
     setting = v.obj(d.get("public_setting"), setting_fields, "public_setting", setting_fields)
     for key in ("tone", "premise"):
@@ -167,12 +172,12 @@ def validate_definition(data):
     v.texts(setting.get("facts"), "public_setting.facts")
     v.texts(d.get("private_author_notes"), "private_author_notes")
     v.texts(d.get("conversion_issues"), "conversion_issues")
-    if d.get("conversion_issues"):
+    if not partial and d.get("conversion_issues"):
         v.fail("conversion_issues", "resolve all reported conversion issues before approval")
     scenes, npcs, npc_ids, enemies, items = set(), set(), set(), set(), set()
     public = [setting, d.get("title")]
     scene_list = v.seq(d.get("scenes"), "scenes", 300)
-    if not scene_list:
+    if not partial and not scene_list:
         v.fail("scenes", "at least one scene is required")
     scene_fields = ("id", "name", "description", "exits", "npcs", "ground_items", "hidden_items", "search_dc")
     for i, raw in enumerate(scene_list):
@@ -306,7 +311,7 @@ def validate_definition(data):
         v.condition(t.get("when"), p + ".when", scenes, enemies, npcs, items)
     fired_by = [c.get("on_expire") for c in clock_list if isinstance(c, dict)]
     fired_by += [t.get("beat") for t in trigger_list if isinstance(t, dict)]
-    if any(b not in fired_by for b in beats):
+    if not partial and any(b not in fired_by for b in beats):
         v.fail("plot.beats", "some beats have no supported trigger or clock")
     secret_ids = set()
     for i, secret in enumerate(v.seq(d.get("secrets"), "secrets")):

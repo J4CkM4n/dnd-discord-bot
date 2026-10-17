@@ -74,6 +74,28 @@ def test_wrong_schema_types_fail_closed(value):
         assert validate_definition(d)
 
 
+def test_partial_validation_allows_later_chunk_content_and_references():
+    from core.adventures import empty_definition
+
+    assert not validate_definition(empty_definition(), partial=True)
+    d = definition()
+    d.update(title="", starting_scene="later_scene", complete=False, conversion_issues=["pending content"])
+    d["scenes"][0]["exits"] = {"later_scene": "下一段的地點"}
+    d["plot"]["beats"] = {"later_beat": {"text": "稍後發生。", "effects": []}}
+    d["secrets"][0]["reveal"] = {"npc": "later_npc"}
+    assert not validate_definition(d, partial=True)
+    assert validate_definition(d)
+
+
+@pytest.mark.parametrize("npcs", [None, ["keeper"], {"keeper": {}}, [None], [{"id": []}]])
+def test_partial_validation_rejects_malformed_nested_npcs(npcs):
+    d = definition()
+    d["scenes"][0]["npcs"] = npcs
+    issues = validate_definition(d, partial=True)
+    assert issues and any("scenes[0].npcs" in issue for issue in issues)
+    assert all(marker not in str(issues) for marker in (SECRET, NOTE, SOURCE))
+
+
 @pytest.mark.parametrize("private_text", ['quoted "secret"', "two\nsecret lines", r"back\slash"])
 def test_public_private_separation_compares_decoded_text(private_text):
     d = definition()
@@ -293,11 +315,16 @@ def test_custom_routing_requests_receive_public_context_without_source_notes_or_
     assert all(marker not in prompt for prompt in routing for marker in (SOURCE, NOTE, SECRET))
 
 
-def test_private_preparation_and_custom_narration_never_capture_or_log_source_notes_or_secrets(tmp_path, caplog):
+@pytest.mark.parametrize("repair", [False, True])
+def test_private_preparation_and_custom_narration_never_capture_or_log_source_notes_or_secrets(tmp_path, caplog, repair):
     requests = []
     cfg = parse_config({"roles": {r: {"model": r} for r in ("director", "narrator")},
                         "supervision": {"enabled": False}}, {})
     responses = [definition(), LINKED]
+    if repair:
+        malformed = definition()
+        malformed["scenes"][0]["npcs"] = [SECRET]
+        responses.insert(0, malformed)
 
     def transport(request):
         body = json.loads(request.content)

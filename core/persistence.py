@@ -26,7 +26,7 @@ class CampaignRepository:
             with self.connect() as conn:
                 conn.execute("PRAGMA journal_mode=WAL")
                 version = conn.execute("PRAGMA user_version").fetchone()[0]
-                if version not in (0, 1, 2, 3):
+                if version not in (0, 1, 2, 3, 4):
                     raise StorageError(f"Unsupported database version: {version}")
                 conn.executescript("""
                     BEGIN IMMEDIATE;
@@ -86,6 +86,7 @@ class CampaignRepository:
                         source_text TEXT NOT NULL, status TEXT NOT NULL,
                         completed INTEGER NOT NULL DEFAULT 0, total INTEGER NOT NULL,
                         definition TEXT, issues TEXT NOT NULL DEFAULT '[]',
+                        conversion_guidance TEXT NOT NULL DEFAULT '[]', solution TEXT,
                         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                         PRIMARY KEY(guild_id, channel_id)
                     );
@@ -93,7 +94,7 @@ class CampaignRepository:
                         version_id TEXT PRIMARY KEY, draft_id TEXT NOT NULL UNIQUE,
                         guild_id TEXT NOT NULL, channel_id TEXT NOT NULL,
                         submitted_by TEXT NOT NULL, source_text TEXT NOT NULL,
-                        definition TEXT NOT NULL,
+                        definition TEXT NOT NULL, conversion_guidance TEXT NOT NULL DEFAULT '[]',
                         approved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                     );
                     CREATE TRIGGER IF NOT EXISTS adventure_versions_immutable
@@ -107,9 +108,19 @@ class CampaignRepository:
                         version_id TEXT NOT NULL REFERENCES adventure_versions(version_id),
                         PRIMARY KEY(guild_id, channel_id)
                     );
-                    PRAGMA user_version=3;
-                    COMMIT;
                 """)
+                # Additive migration: keep private sources, selected versions and
+                # immutable approved definitions intact, including older databases.
+                additions = {
+                    "script_drafts": {"conversion_guidance": "TEXT NOT NULL DEFAULT '[]'", "solution": "TEXT"},
+                    "adventure_versions": {"conversion_guidance": "TEXT NOT NULL DEFAULT '[]'"},
+                }
+                for table, columns in additions.items():
+                    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+                    for column, declaration in columns.items():
+                        if column not in existing:
+                            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+                conn.execute("PRAGMA user_version=4")
         except (OSError, sqlite3.Error) as exc:
             raise StorageError(f"Cannot open campaign database: {exc}") from exc
 

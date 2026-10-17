@@ -23,6 +23,7 @@ belong to the user who proposed them. DMs cannot use admin commands.
 | `/admins` | Privately list the protected initial admin and promotions, and explain Manage Server access |
 | `/script submit file` | Read a slash-command attachment immediately into private bot storage and prepare a draft |
 | `/script status` | Privately preview progress, the starting scene, setting, outline, NPCs, items, encounters, objectives, clocks, events, secrets, notes, and issues |
+| `/script suggest draft:<ID> [prompt:<preferences>]` | The submitting admin requests a private conversion proposal with concrete changes and their consequences |
 | `/script approve draft:<ID>` | The submitting admin approves that exact reviewed draft and selects its immutable version |
 | `/script discard draft:<ID>` | The submitting admin deletes that unapproved draft |
 | `/script clear` | Any current admin cancels this channel's next-game selection |
@@ -46,7 +47,8 @@ all extracted content, and the separation between public facts, secrets, and aut
 notes. Conversion is model-assisted, so review factual fidelity as well as the
 engine validation results. `ready` means the engine schema passed; `blocked` or
 `failed` drafts cannot be approved. Correct the source or model configuration and
-submit again to resolve issues.
+submit again to resolve issues, or request a reviewed conversion proposal as described
+below.
 
 Copy the draft ID from the private response into `/script approve`. Approval and
 discard require both that ID and the submitting admin's current authorization.
@@ -64,6 +66,49 @@ With no selection, the original starter adventure is used. Uploads, approvals,
 clears, and restarts cannot change a running campaign's pinned definition. Starter
 repairs never modify custom adventures, even when their scene names match.
 
+## Suggested conversion fixes
+
+For a `blocked` or `failed` draft, the submitting admin sees **產生修法建議**
+(Generate fixes) and **補充要求／重新建議** (Add preferences / regenerate) in
+`/script status`. `/script suggest draft:<ID>` also generates a proposal; the optional
+`prompt` accepts up to 2,000 characters describing rules to preserve or adaptations
+the author would consider. Generation acknowledges privately and returns the review
+when finished. If interrupted, use `/script status`; unfinished generation resumes
+after a bot restart.
+
+The configured director proposes a summary and, for each change, the specific
+problem, proposed amendment and consequences. The preview is bounded; the complete
+proposal, input preferences and previously accepted amendments are attached privately
+as `script-conversion-review.json`. Engine limitations remain in force. A proposal
+may explain why faithful conversion needs engine development; accepting it cannot
+add that support or guarantee that the next conversion passes.
+
+The review offers three actions:
+
+- **接受並重新轉換** (Accept and reconvert) records that exact proposal as an
+  approved amendment, assigns a new draft ID, and runs conversion and strict
+  validation again using the original source plus all accepted amendments. This
+  does not approve or select the adventure. Review the new draft with `/script status`
+  and explicitly `/script approve` when it is `ready`.
+- **拒絕建議** (Deny) retains the original draft and records the rejection. It does
+  not run conversion, delete the draft, or change the selected adventure.
+- **補充要求／重新建議** opens a private text input. Submit revised preferences
+  (or leave it empty) to generate a new proposal using the current issues and
+  previous proposal. Review the new proposal before accepting it.
+
+Only the submitting admin, while still authorized in the same server, can generate,
+accept, deny or revise proposals. Other current admins may inspect them. Decisions
+and text-input submissions check the exact draft and proposal IDs again; replaced
+or already decided controls cannot apply older changes. After buttons expire or the
+bot restarts, `/script status` recreates them from private storage.
+
+The original upload remains intact. Accepted amendments survive retries and restarts
+and are retained with the immutable approved version. Later accepted amendments
+override earlier ones only where explicitly stated. Replacing the upload starts a
+fresh draft without earlier proposals or amendments. Running campaigns and the
+previously selected approved version remain unchanged until the existing explicit
+approval and start/reset flow is used.
+
 ## Model processing and supported definitions
 
 The source is processed by the existing model gateway using the configured
@@ -72,6 +117,14 @@ without losing characters. Each chunk extracts structured content; later chunks
 receive an entity registry. A final linking pass resolves references across the
 whole adventure, and deterministic validation checks the merged definition.
 Preparation has its own bounded call budget, separate from gameplay turns.
+Each extracted chunk is validated before merging. A malformed chunk receives one
+format-repair attempt using the original source and registry; persistent errors
+report schema field paths in the private review. NPCs must be full objects nested
+in each scene's `npcs` list. Partial chunks may reference content in later chunks;
+approval still requires a complete, fully validated adventure.
+The registry keeps NPC initial locations to avoid cloning a person into multiple
+scenes. Different public labels for the same exit destination are preserved
+together; conflicting mechanics still prevent approval.
 
 Choose a director model capable of structured JSON. Complex scripts may require
 a larger `roles.director.max_tokens` and `timeout` in `agents.toml` (for example
@@ -120,3 +173,8 @@ command receipts, application logs, and debug captures. Diagnostic payloads and
 captures are suppressed for preparation and custom campaigns. Narration receives
 public engine facts and disclosures already authorized by the engine. Default
 starter gameplay retains its existing opt-in capture behavior.
+Proposal generation and revision use the same private director context. Proposal
+text, user preferences and accepted amendments are excluded from application logs,
+debug captures and gameplay prompts; conversion receives accepted amendments only.
+Database schema version 4 adds private proposal and amendment storage through an
+additive migration, retaining existing drafts, sources and immutable versions.

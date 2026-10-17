@@ -78,7 +78,8 @@ class World:
         d = (destination or "").strip()
         if not d:
             return None
-        aliases = {sid: (label, self.scenes[sid].name) for sid, label in self.here.exits.items()
+        aliases = {sid: (*(part for part in label.splitlines() if part.strip()), self.scenes[sid].name)
+                   for sid, label in self.here.exits.items()
                    if sid in self.scenes}
         if d in aliases:
             return d

@@ -15,7 +15,7 @@ from core.adventures import MAX_BYTES, MAX_CHARS, chunks, decode_upload, empty_d
 from core.agent_config import ConfigError, legacy_config
 from core.persistence import CampaignRepository
 from core.script_store import ScriptError, ScriptStore
-from core.scripts import ScriptService, private_preview
+from core.scripts import ScriptService, merge_fragments, private_preview, resolve_references
 from test_campaign import run
 from test_campaign_integration import interaction
 
@@ -158,9 +158,10 @@ def test_unauthorized_and_dm_commands_and_callbacks_do_not_load_games(dm):
             run(command.callback(it, **kwargs))
             assert command.default_permissions is None and command.guild_only
     for command in bot.tree.get_command("script").commands:
-        args = ("old-id",) if command.name in ("approve", "discard") else \
-            (SimpleNamespace(size=0),) if command.name == "submit" else ()
-        run(command.callback(it, *args))
+        kwargs = {name: SimpleNamespace(size=0) if name == "file" else "old-id"
+                  for name, p in inspect.signature(command.callback).parameters.items()
+                  if name != "interaction" and p.default is inspect.Parameter.empty}
+        run(command.callback(it, **kwargs))
     run(bot._v4_admin_run(it, "hero", "search"))
     run(bot._v4_settle(it, "d20", admin=True))
     assert not bot._v4_games
@@ -317,3 +318,141 @@ def test_model_failures_are_persisted_privately_and_never_approvable(tmp_path, c
             store.approve(42, 123, draft_id, 1)
     run(scenario())
     assert SOURCE not in caplog.text and SECRET not in caplog.text
+
+
+def test_malformed_fragment_logs_safe_failure_location(tmp_path, caplog):
+    async def scenario():
+        malformed = definition()
+        malformed["scenes"] = None
+        store = ScriptStore(CampaignRepository(str(tmp_path / "campaigns.db")))
+        service = ScriptService(store, Gateway([malformed, malformed]))
+        draft_id = service.submit(42, 123, 1, "a.txt", SOURCE.encode())
+        await asyncio.gather(*service.tasks.values())
+        assert store.draft(42, 123)["status"] == "failed"
+        assert f"error=ScriptError draft={draft_id} stage=extraction completed=0" in caplog.text
+        assert "_extract_fragment:" in caplog.text
+        assert "scenes: expected a bounded list" in str(store.draft(42, 123)["issues"])
+    run(scenario())
+    assert all(value not in caplog.text for value in (SOURCE, SECRET, NOTE))
+
+
+@pytest.mark.parametrize("npcs", [None, ["keeper"], {"keeper": SECRET}, [None], [{"id": "keeper"}]])
+def test_malformed_npcs_are_repaired_before_merge(tmp_path, caplog, npcs):
+    async def scenario():
+        malformed = definition()
+        malformed["scenes"][0]["npcs"] = npcs
+        gateway = Gateway([malformed, definition(), LINKED])
+        store = ScriptStore(CampaignRepository(str(tmp_path / "campaigns.db")))
+        service = ScriptService(store, gateway)
+        service.submit(42, 123, 1, "a.txt", SOURCE.encode())
+        await asyncio.gather(*service.tasks.values())
+        draft = store.draft(42, 123)
+        assert draft["status"] == "ready" and draft["completed"] == draft["total"] == 2
+        assert draft["definition"]["scenes"][0]["npcs"] == definition()["scenes"][0]["npcs"]
+        assert len(gateway.calls) == 3 and all(role == "director" for role, _ in gateway.calls)
+        assert "scenes[0].npcs" in gateway.calls[1][1] and SOURCE in gateway.calls[1][1]
+    run(scenario())
+    assert all(value not in caplog.text for value in (SOURCE, SECRET, NOTE))
+
+
+def test_repeated_malformed_npcs_fail_with_field_diagnostics_and_no_approval(tmp_path, caplog):
+    async def scenario():
+        malformed = definition()
+        malformed["scenes"][0]["npcs"] = [SECRET]
+        gateway = Gateway([malformed, malformed])
+        store = ScriptStore(CampaignRepository(str(tmp_path / "campaigns.db")))
+        service = ScriptService(store, gateway)
+        draft_id = service.submit(42, 123, 1, "a.txt", SOURCE.encode())
+        await asyncio.gather(*service.tasks.values())
+        draft = store.draft(42, 123)
+        assert draft["status"] == "failed" and draft["completed"] == 0
+        assert "scenes[0].npcs[0]" in str(draft["issues"])
+        assert len(gateway.calls) == 2
+        with pytest.raises(ScriptError):
+            store.approve(42, 123, draft_id, 1)
+        assert all(value not in str(draft["issues"]) for value in (SOURCE, SECRET, NOTE))
+    run(scenario())
+    assert all(value not in caplog.text for value in (SOURCE, SECRET, NOTE))
+
+
+def test_duplicate_npc_placement_is_repaired_without_cloning_identity(tmp_path):
+    async def scenario():
+        malformed = definition()
+        later = deepcopy(malformed["scenes"][0])
+        later.update(id="tower", name="高塔")
+        malformed["scenes"].append(later)
+        corrected = deepcopy(malformed)
+        corrected["scenes"][1]["npcs"] = []
+        gateway = Gateway([malformed, corrected, empty_definition(), LINKED])
+        store = ScriptStore(CampaignRepository(str(tmp_path / "campaigns.db")))
+        service = ScriptService(store, gateway)
+        service.submit(42, 123, 1, "a.txt", ("a" * 3001).encode())
+        await asyncio.gather(*service.tasks.values())
+        draft = store.draft(42, 123)
+        assert draft["status"] == "ready"
+        assert sum(len(s["npcs"]) for s in draft["definition"]["scenes"]) == 1
+        assert "duplicate NPC identity" in gateway.calls[1][1]
+        assert '"scene": "arrival"' in gateway.calls[2][1]
+    run(scenario())
+
+
+def test_fragment_repair_has_its_own_call_budget(tmp_path):
+    from core.model_gateway import current_turn
+
+    class BudgetGateway(Gateway):
+        async def object(self, role, prompt):
+            turn = current_turn()
+            assert turn.remaining > 0
+            turn.calls += 1
+            return await super().object(role, prompt)
+
+    async def scenario():
+        malformed = {"wrong": SECRET}
+        gateway = BudgetGateway([malformed, definition(), malformed, empty_definition(), LINKED])
+        store = ScriptStore(CampaignRepository(str(tmp_path / "campaigns.db")))
+        service = ScriptService(store, gateway)
+        service.submit(42, 123, 1, "a.txt", ("a" * 3001).encode())
+        await asyncio.gather(*service.tasks.values())
+        assert store.draft(42, 123)["status"] == "ready"
+        assert len(gateway.calls) == 5
+    run(scenario())
+
+
+def test_exit_labels_merge_without_changing_destinations_or_accepting_mechanical_conflicts():
+    first = definition()
+    first["scenes"][0]["exits"] = {"tower": "前往高塔"}
+    second = deepcopy(first)
+    second["scenes"][0]["exits"] = {"tower": "沿階梯上樓", "garden": "花園"}
+    merged = merge_fragments([first, second, second])
+    assert merged["scenes"][0]["exits"] == {"tower": "前往高塔\n沿階梯上樓", "garden": "花園"}
+    third = deepcopy(second)
+    third["scenes"][0]["exits"].update(tower="前往高塔\n沿階梯上樓", cellar="酒窖")
+    assert merge_fragments([first, second, third])["scenes"][0]["exits"]["tower"] == "前往高塔\n沿階梯上樓"
+    second["scenes"][0]["search_dc"] += 1
+    with pytest.raises(ScriptError, match="互相衝突"):
+        merge_fragments([first, second])
+
+
+def test_exit_aliases_preserve_both_labels_on_one_engine_edge():
+    d = definition()
+    tower = deepcopy(d["scenes"][0])
+    tower.update(id="tower", name="高塔", npcs=[], exits={})
+    d["scenes"].append(tower)
+    d["scenes"][0]["exits"] = {"tower": "前往高塔", "高塔": "沿階梯上樓"}
+    assert resolve_references(d)["scenes"][0]["exits"] == {"tower": "前往高塔\n沿階梯上樓"}
+
+
+@pytest.mark.parametrize("field,value", [("complete", "yes"), ("scenes", {"alias": []}),
+                                        ("npcs", {"alias": {}}), ("conversion_issues", [None])])
+def test_malformed_linking_is_rejected_without_reference_type_errors(tmp_path, field, value):
+    async def scenario():
+        linking = deepcopy(LINKED)
+        linking[field] = value
+        store = ScriptStore(CampaignRepository(str(tmp_path / "campaigns.db")))
+        service = ScriptService(store, Gateway([definition(), linking]))
+        service.submit(42, 123, 1, "a.txt", SOURCE.encode())
+        await asyncio.gather(*service.tasks.values())
+        draft = store.draft(42, 123)
+        assert draft["status"] == "failed" and draft["completed"] == 1
+        assert "跨段參照檢查格式無效" in str(draft["issues"])
+    run(scenario())
