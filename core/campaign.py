@@ -21,6 +21,8 @@ def equipment_guidance(g, text):
 
 
 def is_starter(g):
+    if getattr(g, "campaign_version", ""):
+        return False
     return all(sid in g.world.scenes and g.world.scenes[sid].name == name
                for sid, name in (("dock", "霧錨鎮碼頭"), ("tavern", "破舊酒館")))
 

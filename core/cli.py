@@ -33,6 +33,8 @@ DEMO_PARTY = {
 
 def seed_starter_knowledge(g: Game) -> bool:
     """Repair missing starter data; preserve authored lists and disclosures."""
+    if getattr(g, "campaign_version", ""):
+        return False
     dock = g.world.scenes.get("dock")
     if dock is None or dock.name != "霧錨鎮碼頭":
         return False

@@ -5,6 +5,8 @@
 """
 
 import asyncio
+import io
+import json
 import logging
 import os
 import re
@@ -102,6 +104,11 @@ HELP_TEXT = """🎲 **v6 引擎指令 / Commands**
 `/help` — 本說明
 
 **管理員 / Admin**
+`/promote <member>` `/demote <member>` `/admins` — 此伺服器的管理員（私人回覆）
+`/script submit <file>` — 私人提交 UTF-8 .txt／.md 冒險（1 MiB／100,000 字元）
+`/script status` — 私人審閱進度、起始場景、大綱、內容、秘密及問題
+`/script approve <draft>` `/script discard <draft>` — 提交者批准／丟棄指定草稿
+`/script clear` — 取消此頻道下次冒險選擇；已批准冒險於開始／重設時啟用
 `/new_game` — 開始此頻道的新遊戲（已有遊戲時不覆蓋）
 `/reset_game [confirmation]` — 封存舊遊戲並重新開始；填 `reset confirm` 確認
 `/explore-admin <text> <char>` — 以任意角色探索
@@ -189,6 +196,13 @@ class DiscordBot(discord.Client):
         self.agent_config = agent_config or (gateway.config if gateway else load_agent_config())
         self.model_gateway = gateway or ModelGateway(self.agent_config)
         self.model_gateway.log_configuration()
+        from core.admins import AdminPolicy
+        from core.persistence import CampaignRepository
+        from core.script_store import ScriptStore
+        from core.scripts import ScriptService
+        self.repository = CampaignRepository(os.path.join(os.environ.get("DATA_DIR", "data"), "campaigns.db"))
+        self.admins = AdminPolicy(self.repository)
+        self.scripts = ScriptService(ScriptStore(self.repository), self.model_gateway)
         intents = discord.Intents.default()
         intents.message_content = message_content
         super().__init__(intents=intents)
@@ -199,14 +213,14 @@ class DiscordBot(discord.Client):
         async def on_app_command_error(interaction, error):
             # a crashed command must never leave the interaction hanging
             # (「該申請未受回應」) — players always get an answer
-            log.exception("command failed", exc_info=error)
             cause = getattr(error, "__cause__", None) or error
-            msg = _clip(f"⚠️ 指令出錯：{cause}")
+            log.error("command failed | error=%s", type(cause).__name__)
+            msg = "⚠️ 指令未能完成，請稍後重試。"
             try:
                 if interaction.response.is_done():
-                    await interaction.followup.send(msg)
+                    await interaction.followup.send(msg, ephemeral=True)
                 else:
-                    await interaction.response.send_message(msg)
+                    await interaction.response.send_message(msg, ephemeral=True)
             except discord.HTTPException:
                 pass
 
@@ -214,6 +228,113 @@ class DiscordBot(discord.Client):
 
     async def setup_hook(self):
         self.add_view(CombatPanel(self))   # persistent combat buttons
+        self.scripts.resume()
+
+    async def close(self):
+        await self.scripts.close()
+        await super().close()
+
+    def _is_admin(self, interaction):
+        guild = getattr(interaction, "guild", None)
+        guild_id = getattr(interaction, "guild_id", None)
+        user = interaction.user
+        if guild is None or not guild_id or str(guild.id) != str(guild_id):
+            return False
+        member_guild = getattr(user, "guild", guild)
+        return self.admins.authorized(
+            guild_id, user.id, member=member_guild is not None and str(member_guild.id) == str(guild_id),
+            bot=getattr(user, "bot", False),
+            manage_server=bool(getattr(getattr(user, "guild_permissions", None), "manage_guild", False)))
+
+    async def _private_reply(self, interaction, text, **kwargs):
+        sender = interaction.followup.send if getattr(interaction.response, "is_done", lambda: False)() \
+            else interaction.response.send_message
+        await sender(text, ephemeral=True, allowed_mentions=discord.AllowedMentions.none(), **kwargs)
+
+    async def _require_admin(self, interaction):
+        if self._is_admin(interaction):
+            return True
+        await self._private_reply(interaction, "🚫 只限此伺服器的 bot 管理員或具有管理伺服器權限的成員。")
+        return False
+
+    async def _change_admin(self, interaction, member, *, promote):
+        if not await self._require_admin(interaction):
+            return
+        if getattr(member, "bot", False) or str(getattr(getattr(member, "guild", None), "id", "")) != str(interaction.guild_id):
+            await self._private_reply(interaction, "🚫 只能管理此伺服器內的非 bot 成員。")
+            return
+        if not promote and str(member.id) == self.admins.initial_id:
+            await self._private_reply(interaction, "🚫 ADMIN_ID 指定的初始管理員受保護，不能透過指令移除或變更。")
+            return
+        changed = self.admins.change(interaction.guild_id, member.id, interaction.user.id, promote=promote)
+        text = ("✅ 已授予此伺服器的 bot 管理員權限。" if changed else "✅ 此成員已獲授權。") if promote \
+            else ("✅ 已移除此伺服器的明確晉升。" if changed else "✅ 此成員沒有明確晉升。")
+        if not promote and member.guild_permissions.manage_guild:
+            text += " 此成員仍有 Discord「管理伺服器」權限，因此仍可使用管理指令。"
+        await self._private_reply(interaction, text)
+
+    async def _submit_script(self, interaction, file):
+        from core.adventures import MAX_BYTES
+        from core.script_store import ScriptError
+        if not await self._require_admin(interaction):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        try:
+            if file.size > MAX_BYTES:
+                raise ScriptError("附件超過 1 MiB，未有截斷或處理。")
+            if not file.filename.lower().endswith((".txt", ".md")):
+                raise ScriptError("只接受 UTF-8 .txt 或 .md 附件。")
+            data = await file.read()
+            if not await self._require_admin(interaction):
+                return
+            draft_id = self.scripts.submit(interaction.guild_id, interaction.channel_id,
+                                           interaction.user.id, file.filename, data)
+            text = "🔒 附件已存入私人儲存，正在準備。草稿 ID：" + draft_id + \
+                "\n用 /script status 私下審閱；準備完成後才可批准。新的草稿會取代同頻道舊草稿。"
+        except ScriptError as exc:
+            text = str(exc)
+        except Exception as exc:
+            log.warning("private upload failed | error=%s", type(exc).__name__)
+            text = "⚠️ 未能讀取或儲存附件，請稍後重新提交。"
+        await interaction.followup.send(text, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+    async def _script_operation(self, interaction, operation, draft_id=""):
+        from core.scripts import private_preview
+        from core.script_store import ScriptError
+        if not await self._require_admin(interaction):
+            return
+        guild_id, channel_id, user_id = interaction.guild_id, interaction.channel_id, interaction.user.id
+        store = self.scripts.store
+        try:
+            if operation == "status":
+                draft = store.draft(guild_id, channel_id)
+                selected = store.selected(guild_id, channel_id)
+                text = private_preview(draft, selected)
+                attachment = {}
+                if draft and draft["definition"]:
+                    attachment["file"] = discord.File(io.BytesIO(json.dumps(
+                        draft["definition"], ensure_ascii=False, indent=2).encode("utf-8")),
+                        filename="adventure-review.json")
+                for i, chunk in enumerate(_split(text)):
+                    await self._private_reply(interaction, chunk, **(attachment if i == 0 else {}))
+                return
+            if operation == "approve":
+                version = store.approve(guild_id, channel_id, draft_id.strip(), user_id)
+                text = "✅ 已批准，並選為此頻道下次開始／重設的冒險。版本：" + version
+            elif operation == "discard":
+                store.discard(guild_id, channel_id, draft_id.strip(), user_id)
+                task = self.scripts.tasks.pop((str(guild_id), str(channel_id)), None)
+                if task is not None:
+                    task.cancel()
+                text = "✅ 已丟棄草稿。"
+            elif operation == "clear":
+                store.clear(guild_id, channel_id)
+                text = "✅ 已取消此頻道下次遊戲的冒險選擇；下次開始／重設會使用預設冒險。"
+            else:
+                raise ScriptError("未知的劇本操作。")
+        except ScriptError as exc:
+            text = str(exc)
+        await self._private_reply(interaction, text)
 
     async def on_ready(self):
         log.info("logged in as %s (guilds=%d)", self.user, len(self.guilds))
@@ -231,14 +352,16 @@ class DiscordBot(discord.Client):
                or "").strip()
         return {c.strip() for c in raw.split(",") if c.strip()}
 
-    def _v4_service(self, channel_id: str = ""):
+    def _v4_service(self, channel_id: str = "", *, guild_id=""):
         """Per-channel V4Service — each table gets its own game state."""
         cid = str(channel_id) if channel_id else "default"
         if cid not in self._v4_games:
             from core.service import V4Service
             data_dir = os.environ.get("DATA_DIR", "data")
             self._v4_games[cid] = V4Service(
-                data_dir, channel_id=cid, agent_config=self.agent_config, gateway=self.model_gateway)
+                data_dir, channel_id=cid, agent_config=self.agent_config, gateway=self.model_gateway, guild_id=guild_id)
+        if guild_id:
+            self._v4_games[cid].guild_id = str(guild_id)
         return self._v4_games[cid]
 
     def _in_v4(self, interaction_or_channel) -> bool:
@@ -253,30 +376,77 @@ class DiscordBot(discord.Client):
     def _register_commands(self):
         svc = self  # closure alias
 
+        @self.tree.command(name="promote", description="授予此伺服器的 bot 管理員權限")
+        @app_commands.guild_only()
+        async def promote_cmd(interaction: discord.Interaction, member: discord.Member):
+            await svc._change_admin(interaction, member, promote=True)
+
+        @self.tree.command(name="demote", description="移除此伺服器的 bot 管理員晉升")
+        @app_commands.guild_only()
+        async def demote_cmd(interaction: discord.Interaction, member: discord.Member):
+            await svc._change_admin(interaction, member, promote=False)
+
+        @self.tree.command(name="admins", description="私下列出此伺服器的 bot 管理員")
+        @app_commands.guild_only()
+        async def admins_cmd(interaction: discord.Interaction):
+            if not await svc._require_admin(interaction):
+                return
+            lines = ["🔒 此伺服器的 bot 管理員"]
+            lines.append("受保護的初始管理員：" + (f"<@{svc.admins.initial_id}>（僅在其加入的伺服器有效）"
+                         if svc.admins.initial_id else "未設定 ADMIN_ID"))
+            promoted = svc.admins.list(interaction.guild_id)
+            lines += [f"<@{a['user_id']}> · 由 <@{a['promoted_by']}> 晉升 · {a['promoted_at']}" for a in promoted]
+            lines.append("具有 Discord「管理伺服器」權限的成員也有管理員存取權；demote 只移除明確晉升。")
+            for chunk in _split("\n".join(lines)):
+                await svc._private_reply(interaction, chunk)
+
+        script = app_commands.Group(name="script", description="私人冒險劇本提交及審閱", guild_only=True)
+        self.tree.add_command(script)
+
+        @script.command(name="submit", description="私下提交 UTF-8 .txt 或 .md 冒險劇本")
+        async def submit_script_cmd(interaction: discord.Interaction, file: discord.Attachment):
+            await svc._submit_script(interaction, file)
+
+        @script.command(name="status", description="私下查看準備進度、內容及轉換問題")
+        async def script_status_cmd(interaction: discord.Interaction):
+            await svc._script_operation(interaction, "status")
+
+        @script.command(name="approve", description="提交者批准已審閱的草稿並選為下次冒險")
+        @app_commands.describe(draft="從私人 status 審閱取得的草稿 ID")
+        async def approve_script_cmd(interaction: discord.Interaction, draft: str):
+            await svc._script_operation(interaction, "approve", draft)
+
+        @script.command(name="discard", description="提交者丟棄草稿")
+        @app_commands.describe(draft="要丟棄的草稿 ID")
+        async def discard_script_cmd(interaction: discord.Interaction, draft: str):
+            await svc._script_operation(interaction, "discard", draft)
+
+        @script.command(name="clear", description="取消此頻道下次冒險的選擇")
+        async def clear_script_cmd(interaction: discord.Interaction):
+            await svc._script_operation(interaction, "clear")
+
         @self.tree.command(name="new_game", description="開始新遊戲 / start a new game")
         @app_commands.guild_only()
-        @app_commands.default_permissions(manage_guild=True)
         async def new_game_cmd(interaction: discord.Interaction):
-            if not interaction.user.guild_permissions.manage_guild:
-                await interaction.response.send_message("🚫 需要管理伺服器權限。", ephemeral=True)
+            if not await svc._require_admin(interaction):
                 return
             await interaction.response.defer(thinking=True)
-            out = await svc._v4_service(str(interaction.channel_id)).new_game(
-                str(interaction.user.id), admin=True)
+            out = await svc._v4_service(str(interaction.channel_id), guild_id=interaction.guild_id).new_game(
+                str(interaction.user.id), admin=svc._is_admin(interaction),
+                permission_check=lambda: svc._is_admin(interaction))
             for chunk in _split(out):
                 await interaction.followup.send(chunk)
 
         @self.tree.command(name="reset_game", description="封存並重設遊戲 / archive and reset game")
         @app_commands.guild_only()
-        @app_commands.default_permissions(manage_guild=True)
         @app_commands.describe(confirmation="填 reset confirm 確認清除目前角色及進度")
         async def reset_game_cmd(interaction: discord.Interaction, confirmation: str = ""):
-            if not interaction.user.guild_permissions.manage_guild:
-                await interaction.response.send_message("🚫 需要管理伺服器權限。", ephemeral=True)
+            if not await svc._require_admin(interaction):
                 return
             await interaction.response.defer(thinking=True)
-            out = await svc._v4_service(str(interaction.channel_id)).reset_game(
-                str(interaction.user.id), confirmation, admin=True)
+            out = await svc._v4_service(str(interaction.channel_id), guild_id=interaction.guild_id).reset_game(
+                str(interaction.user.id), confirmation, admin=svc._is_admin(interaction),
+                permission_check=lambda: svc._is_admin(interaction))
             for chunk in _split(out):
                 await interaction.followup.send(chunk)
 
@@ -755,33 +925,36 @@ class DiscordBot(discord.Client):
         #  admin commands
         # =============================================================
 
+        def admin_ac(callback):
+            async def authorized_autocomplete(interaction, current: str):
+                if not svc._is_admin(interaction):
+                    return []
+                return await callback(interaction, current)
+            return authorized_autocomplete
+
         @self.tree.command(name="explore-admin",
                            description="(Admin) 以任意角色行動 / act as any character")
         @app_commands.describe(text="行動內容", character="角色")
-        @app_commands.autocomplete(character=any_char_ac)
+        @app_commands.autocomplete(character=admin_ac(any_char_ac))
         async def say_admin_cmd(interaction: discord.Interaction,
                                 text: str, character: str):
-            if not interaction.user.guild_permissions.manage_guild:
-                await interaction.response.send_message("🚫 僅管理員。")
+            if not await svc._require_admin(interaction):
                 return
             await self._v4_admin(interaction, character, text)
 
         # admin combat family — mirrors the player commands, acting as
         # any character (same typed autocompletes, character-aware)
 
-        def _admin_only(interaction) -> bool:
-            return bool(interaction.user.guild_permissions.manage_guild)
 
         @self.tree.command(name="attack-admin",
                            description="(Admin) 以任意角色攻擊")
         @app_commands.describe(character="角色", target="目標", move="招式")
-        @app_commands.autocomplete(character=any_char_ac, target=attack_target_ac,
-                                   move=combat_move_ac)
+        @app_commands.autocomplete(character=admin_ac(any_char_ac), target=admin_ac(attack_target_ac),
+                                   move=admin_ac(combat_move_ac))
         async def attack_admin_cmd(interaction: discord.Interaction,
                                    character: str, target: str,
                                    move: str = ""):
-            if not _admin_only(interaction):
-                await interaction.response.send_message("🚫 僅管理員。")
+            if not await svc._require_admin(interaction):
                 return
             text = f"{character} 攻擊 {target}" + (f" {move}" if move else "")
             await self._v4_admin(interaction, character, text, structured=True)
@@ -790,12 +963,11 @@ class DiscordBot(discord.Client):
                            description="(Admin) 以任意角色使用物品／餵隊友")
         @app_commands.describe(character="角色", item="物品",
                                on="給誰用（可餵倒地隊友）")
-        @app_commands.autocomplete(character=any_char_ac, item=own_item_ac,
-                                   on=ally_ac)
+        @app_commands.autocomplete(character=admin_ac(any_char_ac), item=admin_ac(own_item_ac),
+                                   on=admin_ac(ally_ac))
         async def use_admin_cmd(interaction: discord.Interaction,
                                 character: str, item: str, on: str = ""):
-            if not _admin_only(interaction):
-                await interaction.response.send_message("🚫 僅管理員。")
+            if not await svc._require_admin(interaction):
                 return
             text = f"{character} 使用 {item}" + (f" {on}" if on else "")
             await self._v4_admin(interaction, character, text, structured=True)
@@ -803,13 +975,12 @@ class DiscordBot(discord.Client):
         @self.tree.command(name="skill-admin",
                            description="(Admin) 以任意角色使用技能")
         @app_commands.describe(character="角色", skill="技能", on="對象")
-        @app_commands.autocomplete(character=any_char_ac, skill=skill_ac,
-                                   on=skill_on_ac)
+        @app_commands.autocomplete(character=admin_ac(any_char_ac), skill=admin_ac(skill_ac),
+                                   on=admin_ac(skill_on_ac))
         async def skill_admin_cmd(interaction: discord.Interaction,
                                   character: str, skill: str,
                                   on: str = ""):
-            if not _admin_only(interaction):
-                await interaction.response.send_message("🚫 僅管理員。")
+            if not await svc._require_admin(interaction):
                 return
             text = f"{character} 技能 {skill}" + (f" {on}" if on else "")
             await self._v4_admin(interaction, character, text, structured=True)
@@ -817,11 +988,10 @@ class DiscordBot(discord.Client):
         @self.tree.command(name="defend-admin",
                            description="(Admin) 以任意角色防禦")
         @app_commands.describe(character="角色")
-        @app_commands.autocomplete(character=any_char_ac)
+        @app_commands.autocomplete(character=admin_ac(any_char_ac))
         async def defend_admin_cmd(interaction: discord.Interaction,
                                    character: str):
-            if not _admin_only(interaction):
-                await interaction.response.send_message("🚫 僅管理員。")
+            if not await svc._require_admin(interaction):
                 return
             await self._v4_admin(interaction, character, f"{character} 防禦",
                             structured=True)
@@ -829,11 +999,10 @@ class DiscordBot(discord.Client):
         @self.tree.command(name="flee-admin",
                            description="(Admin) 以任意角色撤退")
         @app_commands.describe(character="角色")
-        @app_commands.autocomplete(character=any_char_ac)
+        @app_commands.autocomplete(character=admin_ac(any_char_ac))
         async def flee_admin_cmd(interaction: discord.Interaction,
                                  character: str):
-            if not _admin_only(interaction):
-                await interaction.response.send_message("🚫 僅管理員。")
+            if not await svc._require_admin(interaction):
                 return
             await self._v4_admin(interaction, character, f"{character} 撤退",
                             structured=True)
@@ -841,11 +1010,10 @@ class DiscordBot(discord.Client):
         @self.tree.command(name="observe-admin",
                            description="(Admin) 以任意角色觀察敵人")
         @app_commands.describe(character="角色", target="觀察哪個敵人")
-        @app_commands.autocomplete(character=any_char_ac, target=enemy_ac)
+        @app_commands.autocomplete(character=admin_ac(any_char_ac), target=admin_ac(enemy_ac))
         async def observe_admin_cmd(interaction: discord.Interaction,
                                     character: str, target: str = ""):
-            if not _admin_only(interaction):
-                await interaction.response.send_message("🚫 僅管理員。")
+            if not await svc._require_admin(interaction):
                 return
             text = f"{character} 觀察" + (f" {target}" if target else "")
             await self._v4_admin(interaction, character, text, structured=True)
@@ -853,37 +1021,36 @@ class DiscordBot(discord.Client):
         @self.tree.command(name="inspire-admin",
                            description="(Admin) 給角色靈感（一次性攻擊/檢定優勢）/ grant inspiration")
         @app_commands.describe(character="角色（留空＝全隊）")
-        @app_commands.autocomplete(character=any_char_ac)
+        @app_commands.autocomplete(character=admin_ac(any_char_ac))
         async def inspire_admin_cmd(interaction: discord.Interaction,
                                     character: str = ""):
-            if not _admin_only(interaction):
-                await interaction.response.send_message("🚫 僅管理員。")
+            if not await svc._require_admin(interaction):
                 return
             await interaction.response.defer(thinking=True)
-            text = await svc._v4_service(str(interaction.channel_id)).admin_inspire(character)
+            text = await svc._v4_service(str(interaction.channel_id)).admin_inspire(
+                character, permission_check=lambda: svc._is_admin(interaction))
             await interaction.followup.send(_clip(text))
 
         @self.tree.command(name="xp-admin",
                            description="(Admin) 給 XP（自動升級）/ grant XP with level-ups")
         @app_commands.describe(amount="XP 量（可負數）", character="角色（留空＝全隊）")
-        @app_commands.autocomplete(character=any_char_ac)
+        @app_commands.autocomplete(character=admin_ac(any_char_ac))
         async def xp_admin_cmd(interaction: discord.Interaction,
                                amount: int, character: str = ""):
-            if not _admin_only(interaction):
-                await interaction.response.send_message("🚫 僅管理員。")
+            if not await svc._require_admin(interaction):
                 return
             await interaction.response.defer(thinking=True)
-            text = await svc._v4_service(str(interaction.channel_id)).admin_xp(amount, character)
+            text = await svc._v4_service(str(interaction.channel_id)).admin_xp(
+                amount, character, permission_check=lambda: svc._is_admin(interaction))
             await interaction.followup.send(_clip(text))
 
         @self.tree.command(name="roll-admin",
                            description="(Admin) 代擲 / roll for any character")
         @app_commands.describe(expr="骰式", character="角色")
-        @app_commands.autocomplete(character=any_char_ac)
+        @app_commands.autocomplete(character=admin_ac(any_char_ac))
         async def roll_admin_cmd(interaction: discord.Interaction,
                                  expr: str = "d20", character: str = ""):
-            if not interaction.user.guild_permissions.manage_guild:
-                await interaction.response.send_message("🚫 僅管理員。")
+            if not await svc._require_admin(interaction):
                 return
             expr = (expr or "d20").strip() or "d20"
             # an admin d20 settles a pending check and auto-continues too
@@ -901,15 +1068,19 @@ class DiscordBot(discord.Client):
         @self.tree.command(name="give-admin",
                            description="(Admin) 給物品 / give item")
         @app_commands.describe(character="角色", item="物品", qty="數量")
-        @app_commands.autocomplete(character=any_char_ac, item=item_ac)
+        @app_commands.autocomplete(character=admin_ac(any_char_ac), item=admin_ac(item_ac))
         async def give_admin_cmd(interaction: discord.Interaction,
                                  character: str, item: str, qty: int = 1):
-            if not interaction.user.guild_permissions.manage_guild:
-                await interaction.response.send_message("🚫 僅管理員。")
+            if not await svc._require_admin(interaction):
                 return
             await interaction.response.defer(thinking=True)
-            out = await svc._v4_service(str(interaction.channel_id)).admin_give(character, item, qty)
+            out = await svc._v4_service(str(interaction.channel_id)).admin_give(
+                character, item, qty, permission_check=lambda: svc._is_admin(interaction))
             await interaction.followup.send(_clip(out))
+
+        for command in self.tree.get_commands():
+            if command.name.endswith("-admin"):
+                command.guild_only = True
 
     # ------------------------------------------------------------------
     #  message handling: table talk only (no DM reply, no emoji)
@@ -955,11 +1126,13 @@ class DiscordBot(discord.Client):
                 if plan_action:
                     lines, narration = await service.action_plan(
                         plan_action, str(interaction.user.id), on_delta=stream, on_resolved=on_resolved,
-                        admin=interaction.user.guild_permissions.manage_guild, request_id=str(interaction.id))
+                        admin=self._is_admin(interaction), admin_check=lambda: self._is_admin(interaction),
+                        request_id=str(interaction.id))
                 elif confirmation:
                     lines, narration = await service.confirm(
                         str(interaction.user.id), on_delta=stream, on_resolved=on_resolved,
-                        admin=interaction.user.guild_permissions.manage_guild, request_id=str(interaction.id))
+                        admin=self._is_admin(interaction), admin_check=lambda: self._is_admin(interaction),
+                        request_id=str(interaction.id))
                 else:
                     lines, narration = await service.handle(
                         text, interaction.user.display_name,
@@ -1001,6 +1174,8 @@ class DiscordBot(discord.Client):
         story: die echo → engine verdict (instant) → narration streams
         word-by-word into its own message and stays.
         Returns True when it was a valid settle (command consumed)."""
+        if admin and not await self._require_admin(interaction):
+            return True
         v4svc = self._v4_service(str(interaction.channel_id))
         pend = getattr(v4svc.game, "_pending_check", None)
         if not pend or expr.lower() not in ("d20", "1d20"):
@@ -1027,7 +1202,8 @@ class DiscordBot(discord.Client):
             async with stream:
                 lines, narration = await v4svc.settle_roll(
                     on_delta=stream, on_resolved=on_resolved,
-                    user_id=str(interaction.user.id), admin=admin, actor=actor,
+                    user_id=str(interaction.user.id), admin=admin and self._is_admin(interaction), actor=actor,
+                    admin_check=lambda: admin and self._is_admin(interaction),
                     expected_event_id=expected_event_id, request_id=str(interaction.id))
         except Exception as e:
             log.exception("v4 roll settle failed")
@@ -1049,6 +1225,8 @@ class DiscordBot(discord.Client):
         """Admin v4 turn for any character — SAME streaming UX as
         player turns (the old admin path bypassed handle(): no
         guards, no word-by-word, narration as one blob)."""
+        if not await self._require_admin(interaction):
+            return
         await interaction.response.defer(thinking=True)
         # echo as the followup — resolves 「正在思考…」
         await interaction.followup.send(
@@ -1070,11 +1248,14 @@ class DiscordBot(discord.Client):
 
         try:
             async with stream:
+                if not await self._require_admin(interaction):
+                    return
                 lines, narration = await self._v4_service(
                     str(interaction.channel_id)).handle(
                     text, f"{interaction.user.display_name} (admin)",
                     structured=structured, admin_actor=character,
                     user_id=str(interaction.user.id),
+                    permission_check=lambda: self._is_admin(interaction),
                     on_delta=stream, on_resolved=on_resolved, request_id=str(interaction.id))
         except Exception as e:
             log.exception("v4 admin turn failed")
@@ -1110,9 +1291,12 @@ class DiscordBot(discord.Client):
     async def _v4_admin_run(self, interaction, character, text):
         """Deprecated shim — admin turns now go through handle() with
         admin_actor (guards + streaming). Kept only for external callers."""
+        if not await self._require_admin(interaction):
+            return []
         svc = self._v4_service(str(interaction.channel_id))
         lines, _ = await svc.handle(
-            text, "admin", admin_actor=character, user_id=str(interaction.user.id))
+            text, "admin", admin_actor=character, user_id=str(interaction.user.id),
+            permission_check=lambda: self._is_admin(interaction))
         return lines
 
 

@@ -26,7 +26,7 @@ class CampaignRepository:
             with self.connect() as conn:
                 conn.execute("PRAGMA journal_mode=WAL")
                 version = conn.execute("PRAGMA user_version").fetchone()[0]
-                if version not in (0, 1, 2):
+                if version not in (0, 1, 2, 3):
                     raise StorageError(f"Unsupported database version: {version}")
                 conn.executescript("""
                     BEGIN IMMEDIATE;
@@ -68,7 +68,46 @@ class CampaignRepository:
                         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                         payload TEXT NOT NULL
                     );
-                    PRAGMA user_version=2;
+                    CREATE TABLE IF NOT EXISTS bot_admins (
+                        guild_id TEXT NOT NULL, user_id TEXT NOT NULL,
+                        promoted_by TEXT NOT NULL,
+                        promoted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY(guild_id, user_id)
+                    );
+                    CREATE TABLE IF NOT EXISTS admin_audit (
+                        id INTEGER PRIMARY KEY, guild_id TEXT NOT NULL,
+                        user_id TEXT NOT NULL, actor_id TEXT NOT NULL,
+                        action TEXT NOT NULL, changed INTEGER NOT NULL,
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    CREATE TABLE IF NOT EXISTS script_drafts (
+                        guild_id TEXT NOT NULL, channel_id TEXT NOT NULL,
+                        draft_id TEXT NOT NULL UNIQUE, submitted_by TEXT NOT NULL,
+                        source_text TEXT NOT NULL, status TEXT NOT NULL,
+                        completed INTEGER NOT NULL DEFAULT 0, total INTEGER NOT NULL,
+                        definition TEXT, issues TEXT NOT NULL DEFAULT '[]',
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY(guild_id, channel_id)
+                    );
+                    CREATE TABLE IF NOT EXISTS adventure_versions (
+                        version_id TEXT PRIMARY KEY, draft_id TEXT NOT NULL UNIQUE,
+                        guild_id TEXT NOT NULL, channel_id TEXT NOT NULL,
+                        submitted_by TEXT NOT NULL, source_text TEXT NOT NULL,
+                        definition TEXT NOT NULL,
+                        approved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    CREATE TRIGGER IF NOT EXISTS adventure_versions_immutable
+                        BEFORE UPDATE ON adventure_versions
+                        BEGIN SELECT RAISE(ABORT, 'Approved adventures are immutable'); END;
+                    CREATE TRIGGER IF NOT EXISTS adventure_versions_retained
+                        BEFORE DELETE ON adventure_versions
+                        BEGIN SELECT RAISE(ABORT, 'Approved adventures are immutable'); END;
+                    CREATE TABLE IF NOT EXISTS script_selections (
+                        guild_id TEXT NOT NULL, channel_id TEXT NOT NULL,
+                        version_id TEXT NOT NULL REFERENCES adventure_versions(version_id),
+                        PRIMARY KEY(guild_id, channel_id)
+                    );
+                    PRAGMA user_version=3;
                     COMMIT;
                 """)
         except (OSError, sqlite3.Error) as exc:

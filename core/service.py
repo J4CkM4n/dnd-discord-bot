@@ -82,6 +82,9 @@ from .model_gateway import ModelGateway, current_turn, turn_context
 from .operators import MainAgent, ActionDecision
 from .debug_capture import DebugCapture, capture_context, capture, replay_config
 from .hints import progress_key, track_attempt
+from .privacy import private_context
+from .script_store import ScriptStore
+from .adventures import build_adventure
 
 # a narration that ends WITHOUT one of these was cut mid-sentence
 # (max_tokens cutoff / stream drop) -> /continue must finish it
@@ -94,9 +97,16 @@ def serialized(result="turn"):
         @wraps(fn)
         async def call(self, *args, **kwargs):
             request_id = str(kwargs.pop("request_id", "") or "")
+            permission_check = kwargs.pop("permission_check", None)
+            admin_check = kwargs.pop("admin_check", None)
             arguments = inspect.signature(fn).bind(self, *args, **kwargs).arguments
             request_key = f"{fn.__name__}:{arguments.get('user_id', '')}:{request_id}" if request_id else ""
             async with self._lock:
+                if permission_check is not None and not permission_check():
+                    msg = "🚫 管理員權限已變更，請重新執行指令。"
+                    return msg if result == "text" else ([msg], "")
+                if admin_check is not None:
+                    kwargs["admin"] = bool(admin_check())
                 previous = self._operator_state.get("requests", {}).get(request_key) if request_key else None
                 if previous is not None:
                     if previous.get("result") is not None:
@@ -106,6 +116,9 @@ def serialized(result="turn"):
                 stage = copy(self)
                 stage._owner = self
                 stage.game = clone_game(self.game)
+                stage.rules = deepcopy(self.rules)
+                stage.plot = deepcopy(self.plot)
+                stage.active_campaign = deepcopy(self.active_campaign)
                 stage.plot_state = deepcopy(self.plot_state)
                 stage.pending = deepcopy(self.pending)
                 stage._unfinished = deepcopy(self._unfinished)
@@ -127,7 +140,8 @@ def serialized(result="turn"):
                 stage._latest_hint = ""
                 try:
                     with turn_context(self.agent_config.max_calls, self._revision) as turn, \
-                            capture_context(self.debug_capture, turn.trace_id):
+                            capture_context(self.debug_capture, turn.trace_id), \
+                            private_context(bool(self.active_campaign) or fn.__name__ in ("new_game", "reset_game")):
                         bound = inspect.signature(fn).bind(stage, *args, **kwargs)
                         if self.debug_capture.enabled:
                             arguments = bound.arguments
@@ -185,12 +199,14 @@ class V4Service:
                  channel_id: str = "",
                  narr_think: bool | None = False,
                  digest_think: bool | None = None,
-                 director_evaluate: bool = False, *, agent_config=None, gateway=None):
+                 director_evaluate: bool = False, *, agent_config=None, gateway=None, guild_id=""):
         fname = f"v4_state_{channel_id}.json" if channel_id else "v4_state.json"
         self.path = os.path.join(data_dir, fname)  # read-only legacy import source
         self.channel_id = channel_id
+        self.guild_id = str(guild_id)
         self._lock = asyncio.Lock()
         self.repository = CampaignRepository(os.path.join(data_dir, "campaigns.db"))
+        self.script_store = ScriptStore(self.repository)
         self._revision = self._saved_count = 0
         self._decisions = []
         self._audit_cursor = 0
@@ -209,6 +225,7 @@ class V4Service:
         self.pending_user_id = ""
         self.pending_admin = False
         self._recent_narrations = []
+        self.active_campaign = None
         self.rules = load_gamerules(channel_id, data_dir)
         self.plot = load_plot()
         self.plot_state = new_state(self.plot)
@@ -228,6 +245,7 @@ class V4Service:
         # choosing the same name must never lose their character on restart.
         demos = [name for name, template in DEMO_PARTY.items()
                  if (entry := self.game.party.get(name))
+                 and not self.active_campaign
                  and not entry.get("owner_id") and not entry.get("owner")
                  and entry.get("occupation") == template["occupation"]
                  and entry.get("stats") == template["stats"]]
@@ -244,6 +262,7 @@ class V4Service:
     def _snapshot(self) -> dict:
         blob = encode_game(self.game)
         blob.update(plot=self.plot_state,
+                    active_campaign=self.active_campaign,
                     pending=asdict(self.pending) if self.pending else None,
                     pending_user_id=self.pending_user_id,
                     pending_admin=self.pending_admin)
@@ -263,6 +282,8 @@ class V4Service:
         published_pending = deepcopy(self.pending)
         published_unfinished = deepcopy(self._unfinished)
         published_operators = deepcopy(self._operator_state)
+        published_rules, published_plot_config = deepcopy(self.rules), deepcopy(self.plot)
+        published_campaign = deepcopy(self.active_campaign)
         turn = current_turn()
         audits = turn.records[self._audit_cursor:] if turn else []
         revision = self.repository.commit(
@@ -278,13 +299,15 @@ class V4Service:
             self._audit_cursor = len(turn.records)
             turn.revision = revision
         self._committed = True
-        if self.debug_capture.enabled:
+        if self.debug_capture.enabled and not self.active_campaign:
             capture("commit", revision=revision, snapshot=self._snapshot(),
                     events=[asdict(e) for e in self.game.ledger.entries],
                     unfinished=self._unfinished, operator_state=self._operator_state)
         owner = getattr(self, "_owner", self)
         owner.game = published_game
         owner.plot_state = published_plot
+        owner.rules, owner.plot = published_rules, published_plot_config
+        owner.active_campaign = published_campaign
         owner.pending = published_pending
         owner.pending_user_id = self.pending_user_id
         owner.pending_admin = self.pending_admin
@@ -310,6 +333,13 @@ class V4Service:
                 unfinished = record["unfinished"]
                 self._operator_state.update(record.get("operator_state", {}))
             g = decode_game(blob, entries)
+            self.active_campaign = blob.get("active_campaign")
+            if self.active_campaign:
+                _, self.rules, self.plot = build_adventure(self.active_campaign)
+                if getattr(g, "campaign_version", "") != self.active_campaign["version_id"]:
+                    raise ValueError("Campaign version does not match pinned definition")
+            elif getattr(g, "campaign_version", ""):
+                raise ValueError("Missing pinned campaign definition")
             self.plot_state = blob.get("plot") or new_state(self.plot)
             self.pending = Intent(**blob["pending"]) if blob.get("pending") else None
             self.pending_user_id = str(blob.get("pending_user_id", ""))
@@ -903,6 +933,18 @@ class V4Service:
 
     # ---------- non-turn mutations: same lock and transaction boundary ----------
 
+    def _initialize_selected(self):
+        selected = self.script_store.selected(self.guild_id, self.channel_id)
+        if selected:
+            self.game, self.rules, self.plot = build_adventure(selected)
+            self.active_campaign = selected
+        else:
+            self.game = build_starter_game()
+            self.active_campaign = None
+            self.rules = load_gamerules(self.channel_id, os.path.dirname(self.path))
+            self.plot = load_plot()
+        self.plot_state = new_state(self.plot)
+
     def _drop_characters(self, names):
         """Remove current references without rewriting the historical ledger."""
         g = self.game
@@ -926,10 +968,11 @@ class V4Service:
     @serialized("text")
     async def new_game(self, user_id: str, *, admin: bool = False) -> str:
         if not admin:
-            return "🚫 需要管理伺服器權限。"
+            return "🚫 需要 bot 管理員或管理伺服器權限。"
         if self.game.party or self.game.ledger.entries or self.game.ledger.turn \
                 or self.pending or self._unfinished or self.game.combat.active:
             return "⚠️ 此頻道已有遊戲，請用 `/scene` 查看；重新開始請用 `/reset_game`。"
+        self._initialize_selected()
         self.game.ledger.add("engine", "meta", "新遊戲已開始", user_id=str(user_id))
         self._save()
         return "🎲 新遊戲已開始！請每位玩家用 `/pc` 建立角色。\n" + self.scene()
@@ -937,12 +980,11 @@ class V4Service:
     @serialized("text")
     async def reset_game(self, user_id: str, confirmation: str = "", *, admin: bool = False) -> str:
         if not admin:
-            return "🚫 需要管理伺服器權限。"
+            return "🚫 需要 bot 管理員或管理伺服器權限。"
         if confirmation.strip().lower() != "reset confirm":
             return ("⚠️ 將重新開始此頻道的遊戲，清除目前角色、物品、場景進度及待定行動。"
                     "舊遊戲會封存。確認請用 `/reset_game confirmation:reset confirm`。")
-        self.game = build_starter_game()
-        self.plot_state = new_state(self.plot)
+        self._initialize_selected()
         self.pending, self.pending_user_id, self.pending_admin = None, "", False
         self._unfinished = None
         self._recent_narrations = []

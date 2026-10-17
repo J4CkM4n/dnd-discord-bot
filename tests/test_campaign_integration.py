@@ -96,10 +96,12 @@ def test_health_reader_still_handles_unimported_json(tmp_path):
 
 
 def interaction():
+    guild = SimpleNamespace(id=42)
     return SimpleNamespace(
         id=123456789,
+        guild=guild, guild_id=guild.id,
         channel_id=123,
-        user=SimpleNamespace(id=1, display_name="player",
+        user=SimpleNamespace(id=1, display_name="player", bot=False, guild=guild,
                              guild_permissions=SimpleNamespace(manage_guild=False)),
         response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
         followup=SimpleNamespace(send=AsyncMock()),
@@ -144,6 +146,8 @@ def test_discord_final_output_waits_for_delayed_stream_edit(path, outcome):
             return (bool(text), text) if path == "continue" else ([], text)
 
         bot = DiscordBot()
+        if path == "admin":
+            bot.admins.change(42, 1, 99, promote=True)
         svc = SimpleNamespace(
             game=SimpleNamespace(_pending_check={"event_id": 17},
                                  combat=SimpleNamespace(active=False)),

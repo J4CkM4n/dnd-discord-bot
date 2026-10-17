@@ -184,15 +184,15 @@ verdict messages carry one-tap buttons (🛡 defend · 👁 observe ·
 
 **Plain text** = table talk (silently ignored, no reaction, no reply)
 
-To start, a member with **Manage Server** permission runs `/new_game` in the
+To start, a bot admin or member with **Manage Server** permission runs `/new_game` in the
 game channel. Each player then creates a character with `/pc`, checks `/scene`,
 and describes an action with `/explore`. `/new_game` refuses to overwrite a game
 that already has characters or activity. `/scene` reads engine state without
 advancing a turn, calling a model, or revealing hidden items or NPC knowledge.
 
 To restart, run `/reset_game`, then enter `reset confirm` in its `confirmation`
-option. This requires Manage Server permission. It archives the old campaign and
-starts at the dock with an empty party. Characters, inventories, generated scenes,
+option. This requires bot admin access. It archives the old campaign and
+starts the selected, privately reviewed adventure (or the default dock) with an empty party. Characters, inventories, generated scenes,
 combat, plot progress, pending actions/checks, narration, and operator guidance
 start fresh. Other channels and configuration files are unaffected. The previous
 snapshot, event history, narration, director decisions, and operator records are
@@ -200,6 +200,26 @@ retained as JSON rows in `campaign_archives` in `data/campaigns.db`; archives ar
 excluded from active campaign memory. Reset and archival commit atomically, and
 the channel revision continues increasing to reject stale writers. There is no
 Discord archive restore command.
+
+Set optional `ADMIN_ID` in `.env` to protect one initial bot admin. Use `/promote member`,
+`/demote member`, and `/admins` to manage additional admins independently in each server.
+All three reply privately. Admin promotions survive restarts and campaign resets;
+Manage Server remains another access path. Promoted admins can invoke every admin
+command without Discord management permissions.
+
+Use `/script submit file` to upload a UTF-8 `.txt` or `.md` adventure privately
+(up to 1 MiB and 100,000 characters). `/script status` shows preparation progress,
+the starting scene, outline, extracted content, secrets, and conversion issues,
+with the complete converted definition in a private JSON attachment. The submitting
+admin uses `/script approve draft:<ID>` after review, or `/script discard draft:<ID>`.
+Any current admin can use `/script clear` to cancel the next-game selection.
+Scripts and selections are per channel; approval affects only the next `/new_game`
+or confirmed `/reset_game`. Running campaigns pin their approved versions.
+
+Preparation sends the script to the provider configured for `roles.director` in
+`agents.toml`. It does not use routing or narration roles. See
+[private adventures and admin setup](docs/private-adventures.md) for the workflow,
+supported mechanics, persistence, and privacy boundaries.
 
 Normal campaigns start without demo characters. On loading an older save, the
 bot removes recognizable, unowned demo entries for 依思 and 大力蕉, along with

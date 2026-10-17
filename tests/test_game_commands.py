@@ -232,7 +232,7 @@ def test_discord_lifecycle_checks_permissions_before_loading_campaign(tmp_path):
     it = interaction()
     for name in ("new_game", "reset_game"):
         command = bot.tree.get_command(name)
-        assert command.default_permissions.manage_guild and command.guild_only
+        assert command.default_permissions is None and command.guild_only
         run(command.callback(it))
     assert not bot._v4_games
     assert it.response.send_message.await_count == 2

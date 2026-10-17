@@ -74,7 +74,7 @@ class DebugCapture:
 
 @contextmanager
 def capture_context(sink, trace_id):
-    token = _active.set([sink, trace_id, 0])
+    token = _active.set([sink, trace_id, 0] if sink is not None else None)
     try:
         yield
     except BaseException as exc:

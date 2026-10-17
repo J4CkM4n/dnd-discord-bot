@@ -101,6 +101,9 @@ class ModelGateway:
 
     def diagnostic(self, value, limit=600):
         """Redact known credentials before encoding bounded single-line diagnostics."""
+        from .privacy import private_data
+        if private_data():
+            return "[private campaign data]"
         def clean(item):
             if isinstance(item, str):
                 return self._redact(item)
