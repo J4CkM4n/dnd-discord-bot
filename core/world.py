@@ -30,6 +30,8 @@ class Enemy:
     loot_fixed: bool = False  # an emptied authored inventory stays empty
     npc: dict = field(default_factory=dict)  # identity retained after hostility
     spawned: bool = False  # encounter scaling runs once, never on return
+    absent_items: list = field(default_factory=list)
+    possessions_complete: bool = False
 
     @classmethod
     def make(cls, name: str, hp: int, ac: int, attack_bonus: int = 3,
@@ -50,6 +52,8 @@ class Scene:
     search_dc: int = 12
     hidden_items: list = field(default_factory=list)  # revealed by search
     fire: bool = False        # v5 A1: the scene is burning (engine state)
+    absent_items: list = field(default_factory=list)
+    possessions_complete: bool = False
 
 
 @dataclass

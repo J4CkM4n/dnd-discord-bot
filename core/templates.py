@@ -31,7 +31,8 @@ def render_hint(entry, game=None) -> str:
         return f"情況已經改變，{actor} 原先的花招沒有生效。"
     if kind == "check_pending":
         return f"{actor} 準備嘗試，結果仍待擲骰決定。"
-    if kind in ("theft", "theft_attempt"):
+    if kind in ("theft", "theft_attempt", "creative_attempt", "item_transfer", "possession_established",
+                "condition", "condition_expired"):
         return entry.text
     if kind == "tactic":
         return f"{actor} 的機智為接下來的交鋒創造了機會。"

@@ -40,6 +40,17 @@ move_spell_level = {"月光束（範圍）": 2, "地獄斥喝": 1, "灼熱之手
                         "燃燒之手（範圍）": 1, "神聖痛擊": 1}
 
 _WEAPON_GLYPHS = "劍斧弓矛叉棍杖匕鏢錘刀槍鞭"
+_WEAPON_NAMES = re.compile(
+    r"剑|锤|剣|銃|ナイフ|ダガー|ソード|"
+    r"\b(?:swords?|longswords?|shortswords?|greatswords?|rapiers?|scimitars?|"
+    r"daggers?|knives|knife|axes?|greataxes?|handaxes?|bows?|shortbows?|longbows?|"
+    r"crossbows?|spears?|javelins?|tridents?|maces?|hammers?|warhammers?|clubs?|"
+    r"quarterstaffs?|staff|staves|darts?|slings?|whips?|guns?|rifles?|blades?)\b", re.I)
+
+
+def is_weapon(name: str) -> bool:
+    """Recognize named weapons; throwable props and category labels are not weapons."""
+    return any(g in name for g in _WEAPON_GLYPHS) or bool(_WEAPON_NAMES.search(name))
 
 # Physical starting equipment is recorded once, when /pc creates the character.
 STARTER_EQUIPMENT = {
@@ -65,8 +76,7 @@ def compute_attack_moves(occupation: str, level: int, inventory: list,
     for kind, name, _qty in inventory or []:
         # only weapons become moves: equipment-kind or a weapon glyph in the
         # name — rope and potions are not attack moves
-        weaponish = (kind == "equipment"
-                     or any(g in name for g in _WEAPON_GLYPHS))
+        weaponish = kind == "equipment" or is_weapon(name)
         if weaponish and name not in known and "[" not in name:
             # finesse weapons (匕首/飛鏢) strike with DEX
             ab = "DEX" if ("匕" in name or "鏢" in name) else "STR"

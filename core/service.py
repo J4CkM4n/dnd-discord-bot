@@ -384,13 +384,15 @@ class V4Service:
                              "eligible": not g.combat.active, "wants_help": bool(_HELP_RE.search(t))}
         if object_action:
             object_action.actor = probe.actor
-            return await self._execute(object_action, user_id, admin_actor, text, on_delta, on_resolved)
+            if structured or not self.agent_config.enabled or not validate(g, object_action):
+                return await self._execute(object_action, user_id, admin_actor, text, on_delta, on_resolved)
         from .theft import parse_theft
         from .npc_actions import observation_plan, return_to_npc
         if exact := parse_theft(t, g.party):
             if "盗む" in t:
                 exact.actor = probe.actor
-                return await self._execute(exact, user_id, admin_actor, text, on_delta, on_resolved)
+                if structured or not self.agent_config.enabled or not validate(g, exact):
+                    return await self._execute(exact, user_id, admin_actor, text, on_delta, on_resolved)
         if raw_plan := observation_plan(g, t):
             from .action_plans import parse_plan, PlanError
             try:
@@ -584,6 +586,9 @@ class V4Service:
         if action != "cancel":
             return ["請選擇 status、resume 或 cancel。"], ""
         if pend and pend.get("actor") == probe.actor:
+            plan_effect = (pend.get("effect") or {}).get("plan") or {}
+            if plan_effect.get("version") == 2 and (pend.get("effect") or {}).get("kind") == "improvisation":
+                self.game._creative_attempts[plan_effect["id"]] = "cancelled"
             self.game._pending_check = None
             self._unfinished = None
             self.game.ledger.add(probe.actor, "check_cancel", "玩家取消待定檢定；沒有結算效果，已付出的行動或材料不退還。")
@@ -1227,7 +1232,8 @@ class V4Service:
         # Deliver prose only after all guards. Streaming unguarded drafts
         # previously exposed rejected content before the authoritative edit.
         stream_delta = (lambda text: None) if on_delta else None
-        if any(e.kind in ("theft", "theft_attempt") for e in events):
+        if any(e.kind in ("theft", "theft_attempt", "creative_attempt", "item_transfer", "possession_established", "condition")
+               or (e.kind in ("improvisation", "improvisation_cancelled") and e.data.get("plan_id")) for e in events):
             # Ownership and injuries must be exact. These bounded outcomes use
             # engine prose, including pending/failure, without a model draft.
             narration = "\n".join(safe_hints)
@@ -1413,7 +1419,8 @@ class V4Service:
                       if u["start_event_id"] <= e.event_id <= u["end_event_id"]
                       and e.kind not in ("table", "narration", "guard")
                       and e.data.get("visibility") != "private"]
-            if any(e.kind in ("theft", "theft_attempt") for e in events):
+            if any(e.kind in ("theft", "theft_attempt", "creative_attempt", "item_transfer", "possession_established", "condition")
+                   or (e.kind in ("improvisation", "improvisation_cancelled") and e.data.get("plan_id")) for e in events):
                 # Theft prose is complete and engine-owned, including after
                 # restoring an older unfinished narration job.
                 return False, ""

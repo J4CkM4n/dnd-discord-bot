@@ -10,7 +10,8 @@ MAX_CHARS = 3000
 # These entries describe resolved, public outcomes. Player utterances, attempted
 # actions, unrevealed materializations, and arbitrary prose are deliberately absent.
 PUBLIC_KINDS = {"scene", "scene_fire", "item", "loot", "death", "combat",
-                "heal", "damage", "xp", "reveal", "beat", "rest", "theft"}
+                "heal", "damage", "xp", "reveal", "beat", "rest", "theft", "item_transfer",
+                "possession_established", "condition", "condition_expired", "improvisation", "check"}
 
 
 def retired_demo_event(g, event) -> bool:
@@ -69,9 +70,21 @@ def build_memory(g, query: str = "", *, audience: str = "narrator",
                            for n, f in g.scene_enemies().items()},
                "party": {n: {k: e.get(k) for k in ("hp_now", "hp_max", "conds")}
                          for n, e in g.party.items()}}
+    from .creative_effects import active_conditions
+    current["conditions"] = active_conditions(g)
     if audience == "director":
         current["hidden_items"] = s.hidden_items
         current["plot"] = plot_state or {}
+        current["possessions"] = {n["name"]: {k: n.get(k) for k in
+            ("loot", "absent_items", "possessions_complete", "description", "desc") if k in n}
+            for n in g.scene_npcs()}
+        current["encounter_possessions"] = {n: {"loot": f.loot, "dead": f.dead or f.hp <= 0,
+            "absent_items": f.absent_items, "possessions_complete": f.possessions_complete,
+            "description": f.npc.get("desc", "")} for n, f in g.scene_enemies().items()}
+        current["corpse_possessions"] = g._corpse_possessions.get(s.id, {})
+        current["possession_provenance"] = [r for r in g._creative_provenance if r["scene"] == s.id]
+        current["absent_items"] = s.absent_items
+        current["possessions_complete"] = s.possessions_complete
     names = list(g.party) + [n["name"] for n in g.scene_npcs()] + list(g.enemies)
     mentioned = [name for name in names if name in query or name == npc_name]
     ranked = []

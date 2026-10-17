@@ -277,7 +277,7 @@ gamerules.json          # single source of truth: world tone + canon +
                         # narrative constraints (injected into the
                         # narrator prompt; edit here to change the world)
 
-core/                   # engine and AI orchestration (snapshot v9)
+core/                   # engine and AI orchestration (snapshot v10)
 ├── intent.py           # Intent + narrative brief + deterministic parser
 ├── decisions.py        # native Jev / LLM routing with validated choices
 ├── improvisation.py    # bounded, engine-owned creative effects
@@ -457,6 +457,22 @@ prevents further native attempts during that turn.
 
 ## Director proposals and improvisation
 
+Creative attempts receive scene-based operator review even when their wording or
+mechanics are unfamiliar, or a recognized request lacks an inventory record.
+The operator returns an attempt, a concrete clarification, or a scene-based reason
+it is not plausible. Approval permits the attempt; the engine determines its result.
+Complete ordinary commands keep their direct path.
+
+Reviewed attempts can establish ordinary possessions with recorded provenance,
+transfer an actual item, or apply persistent `restrained`, `bound`, `distracted`
+and `cover` conditions. Explicit absence, removed possessions, canon, costs and
+player ownership remain authoritative. New possessions are committed only on
+success. Conditions affect later actions and rolls, and expire on the approved
+action, scene change, combat end, or an explicitly reviewed release. Pending rolls,
+cancellation, restart and replay use the same durable engine flow. See
+[the architecture](ARCHITECTURE.md#narration-and-individual-improvisations) for the
+bounded item and condition templates.
+
 Picking up ground loot is one collection action. These requests work through
 `/explore` without an attack or healing goal:
 
@@ -471,6 +487,11 @@ ambiguous item rejects the whole list without a partial pickup. Hidden items
 must first be revealed by searching. In combat, a standalone collection uses
 one action. `搜索哥布林屍體` reports loot already on the ground without new drops
 or XP; cutting a body open requires a blade in inventory.
+
+`拾起地上武器`, `pick up the weapon on the ground`, and `地面の武器を手に取る`
+pick up the actual weapon when only one weapon type is visible. If several
+weapons are present, specify a name. These references never create an item named
+「武器」 or replenish a weapon already picked up.
 
 Linked requests with one purpose can have up to three steps: one explicit
 pickup, optional preparation, then attack or item use. For example, picking up
@@ -575,8 +596,9 @@ corresponding state transaction. Approved guidance is saved with the narration
 job before streaming, and interrupted streams remain resumable. A restart uses
 that guidance without invoking action operators or resolving the action again.
 
-Snapshot v9 includes linked action plans and prepared items, pending checks,
-creative proposals, narrative briefs,
+Snapshot v10 includes persistent creative conditions, ordinary-possession provenance,
+settled attempt IDs and corpse possessions, alongside linked action plans,
+prepared items, pending checks, creative proposals, narrative briefs,
 party-shared reward allowances, player-bound confirmations, combat effects,
 plot progress, RNG state, and continuation references. `/confirm` and `/roll`
 enforce ownership. A failed write leaves committed state intact; a failed
@@ -584,7 +606,7 @@ callback or narrator leaves a resumable `/continue`. Commands serialize within
 each channel, including narration, while other channels can progress. Run one
 bot process per database; revision checks reject stale writers.
 
-The snapshot codec loads v4–v9. Disabling routing keeps saves compatible with
+The snapshot codec loads v4–v10. Disabling routing keeps saves compatible with
 this version; restoring an older binary requires its pre-upgrade backup.
 
 On first access to a channel, v4–v7 `v4_state_<channel>.json` saves (or

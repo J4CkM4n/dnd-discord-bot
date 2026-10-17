@@ -30,7 +30,7 @@ _BLOCKED = re.compile(
     r"|sword|blade|axe|bow|gun|rifle|spear|hammer|dagger"
     r"|armor|armour|shield|potion|wand|staff|rod"
     r"|coin|gold|gem|jewel|ring|amulet|necklace|scroll|key"
-    r"|artifact",
+    r"|artifact|武器|兵器|weapon|armament",
     re.I)
 
 # props nobody should be able to conjure by naming them

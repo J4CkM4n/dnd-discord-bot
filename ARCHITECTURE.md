@@ -1,4 +1,4 @@
-# D&D DM Bot — System One architecture (snapshot v9)
+# D&D DM Bot — System One architecture (snapshot v10)
 
 The world remains **黑暗海洋奇幻**: oppressive fog, ancient threats, real costs,
 and occasional dark wit. Player creativity shapes the attempted method and the
@@ -92,6 +92,14 @@ legacy single inert-prop director path remains available, excluding generic
 collection labels and game equipment. At most 20 item types can be collected
 per request; a standalone collection spends one action in combat.
 
+Weapon references such as `武器`, `the weapon`, and `その武器` resolve against
+visible ground stacks using the shared weapon-name classifier. One matching
+identity transfers its actual name and quantity; multiple matches require a
+specific choice, and no match leaves state unchanged. Neither ambiguity nor a
+missing reference invokes creative establishment to invent another weapon.
+Weapon category labels are also blocked by the prop materialization gate.
+Complete Cantonese, English and Japanese pickup commands share this path.
+
 Corpse searches inspect defeated encounter members in the current scene and
 report existing ground loot. They never reroll death drops or XP, reveal unrelated
 hidden items, or require the player to predict loot names. Cutting methods require
@@ -145,12 +153,62 @@ budget remains eight, including routing fallback and narration.
 
 ### Narration and individual improvisations
 
+Unfamiliar actions and recognized commands that fail because their objects or
+mechanics are unrecorded reach the general creative review before rejection.
+Complete ordinary commands retain their direct engine path. The director receives
+the exact request, authorized character, possessions, scene, established facts,
+recent outcomes and combat constraints. It returns `attempt`,
+`clarification_needed`, or `not_plausible`, with a concrete reason. The existing
+evaluator/main review (or confident native review) approves this decision. An
+outage or an unsupported engine effect is reported separately from implausibility.
+
+Version-two attempts explicitly select a check or automatic resolution, list
+prerequisites, ordinary possession setup, owned-item costs and bounded outcomes.
+Timing, movement within the scene and preparation serving one goal can form one
+attempt; they cannot authorize another player's actions, change scenes for free
+or add attacks. Existing linked plans continue to handle independently charged
+preparation and attack steps. Parsed companion-help requirements cannot be dropped
+by a proposal, and assistance must come from an actual other player's help event.
+
+Missing inventory records alone do not establish absence. Authored `absent_items`
+and `possessions_complete` fields, prior transfers, death drops and recorded
+provenance prevent contradictory setup or replenishment. Existing objects are
+reused first. New ordinary clothing, cloth, cord, debris, containers, inert props
+and a contextual ordinary dagger use engine item templates; rare or magical
+possessions cannot be established through them. Each owner/scene/template has a
+durable establishment slot. Provenance records the original owner/location,
+properties, basis, source revision and event. Established properties participate
+in inspection and item interactions in every supported language.
+
+All setup and consequences are validated before costs are paid. Proposed
+possessions remain pending until success; failure or cancellation grants no
+items. Transfers recheck exact custody and target life state at settlement, move
+one actual unit, and cannot debit another player's inventory. A corpse's old
+death loot is already on the ground; newly established clothing is separately
+tracked on that corpse. Attempt IDs prevent replaying an already settled or
+cancelled proposal. Pending checks, costs, effects and provenance use the same
+staged SQLite transaction and offline replay path as other actions.
+
+Persistent conditions record their subject, description, engine restrictions and
+modifiers, and removal/expiry criteria. The engine owns the `restrained`, `bound`,
+`distracted`, and `cover` templates and the `next_action`, `scene_exit`,
+`end_combat`, and `released` expiry vocabulary. They affect validation, normal
+and thrown attacks, NPC turns and checks. Conditions requiring release follow a
+player across scenes; an approved `clear_condition` effect removes them. Operators
+cannot supply executable rules, custom numeric modifiers or conditions controlling
+another player. Prose for version-two attempts uses committed engine facts,
+including pending, failed and cancelled results.
+
+Snapshots v4–v9 remain loadable. New condition, provenance, attempt and corpse
+possession collections default to empty; existing version-one improvisations and
+pending checks retain their original resolution contract.
+
 `NarrativeBrief` stores original words, attempted action, and creative details
 separately from canonical facts. It travels with the saved narration job and
 pending check, so `/roll` and `/continue` preserve the original idea. The narrator
 is told this describes an attempt; only engine facts establish success and costs.
 
-Ordinary actions retain ordinary engine resolution. Novel mechanics require a
+Ordinary actions retain ordinary engine resolution. Version-one improvisations require a
 director proposal, schema checks, evaluator approval, main approval, and engine
 verification against the current revision. Each improvisation uses one of the 18
 canonical skills and an engine-owned DC: easy 10, moderate 14, or hard 18. Models
@@ -211,16 +269,17 @@ leave durable continuations; restart or `/continue` resumes prose without
 rerouting or resolving the action. Audit reports are separate from canonical
 facts. Narration and rejected proposals do not become factual memory.
 
-Snapshot v9 adds per-character linked plans and registered prepared items;
-v8 introduced the party-shared improvisation reward allowance.
-The codec still loads v4–v8 snapshots, pending checks, and confirmations.
+Snapshot v10 adds creative conditions, possession provenance, settled attempt IDs
+and corpse possessions. Snapshot v9 added per-character linked plans and registered
+prepared items; v8 introduced the party-shared improvisation reward allowance.
+The codec still loads v4–v9 snapshots, pending checks, and confirmations.
 Database schema v2 is unchanged. `DATA_DIR/campaigns.db` remains authoritative;
 legacy JSON files remain read-only migration checkpoints.
 
 `[routing].enabled=false` restores the previous supervised workflow in this
 version. `[supervision].enabled=false` selects the legacy direct workflow.
 Configurations without a routing table retain their previous behavior. Disabling
-routing does not downgrade v9 saves for an older binary; preserve a database
+routing does not downgrade v10 saves for an older binary; preserve a database
 backup before deploying.
 
 `agents.example.toml` is the public configuration template. Copy it to the

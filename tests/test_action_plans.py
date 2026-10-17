@@ -124,6 +124,10 @@ def test_pending_preparation_survives_restart_and_never_attacks_on_roll(tmp_path
 @pytest.mark.parametrize("missing", ["毒藥", "治療藥水", "哥布林"])
 def test_missing_prerequisite_never_executes_partial_plan(tmp_path, missing):
     ep = endpoint()
+    # A missing record now reaches scene review before the final clarification.
+    ep.responses["director"].clear()
+    ep.responses["director"].append({"decision": "clarification_needed",
+        "reason": f"目前場景或背包中找不到 {missing}；請先確認目標或取得所需材料。", "proposal": None})
     s, _ = game_service(tmp_path, ep)
     if missing == "毒藥":
         s.game.inventory["BANANA"] = []
@@ -136,7 +140,9 @@ def test_missing_prerequisite_never_executes_partial_plan(tmp_path, missing):
     lines, prose = run(s.handle(TEXT, user_id="u1"))
     assert missing in "".join(lines) and not prose
     assert encode_game(s.game) == before
-    assert roles(ep) == ["router", "action"] and "秘密寶藏" not in json.dumps(ep.calls, ensure_ascii=False)
+    assert roles(ep) == ["router", "action", "director", "evaluator", "main"]
+    assert "秘密寶藏" not in "".join(lines)
+    assert "秘密寶藏" not in json.dumps(ep.calls[:2], ensure_ascii=False)
 
 
 @pytest.mark.parametrize("failure", ["evaluator", "main", "template", "director_outage"])

@@ -2,11 +2,18 @@
 from collections import Counter
 import re
 
+from engine.moves import is_weapon
+
 from .intent import Intent, _action_text
 
 MAX_ITEMS = 20
-_VERB = re.compile(r"^(?:撿起|捡起|拾起|執起|拿起|攞起|撿|捡|拾|執|攞|拿|pick\s+up\b|take\b)\s*(.*)$", re.I)
-_GROUND = re.compile(r"^(?:(?:地上面?|地下|地面上?|眼前)(?:的|嘅)?|(?:the\s+)?(?:items?\s+)?on\s+the\s+ground\s*)\s*", re.I)
+_VERB = re.compile(r"^(?:撿起|捡起|拾起|執起|拿起|攞起|撿|捡|拾|執|攞|拿|pick\s*up\b|take\b)\s*(.*)$", re.I)
+_JAPANESE_PICKUP = re.compile(r"^(.+?)を(?:手に取る|拾い上げる|拾う|取る)$")
+_GROUND = re.compile(r"^(?:(?:地面|地上)(?:の|にある)|(?:地上面?|地下|地面上?|眼前)(?:的|嘅)?|(?:the\s+)?(?:items?\s+)?on\s+the\s+ground\s*)\s*", re.I)
+_GROUND_SUFFIX = re.compile(r"\s+on\s+(?:the\s+)?ground$", re.I)
+_WEAPON_REFERENCE = re.compile(
+    r"(?:(?:這|这|嗰|那|一)?(?:把|柄|件)?|その|この|あの)(?:武器|兵器)|"
+    r"(?:(?:the|this|that|a|an)\s+)?(?:weapons?|armaments?)", re.I)
 _ALL = re.compile(r"(?:全部|所有|一切)(?:散落(?:的|嘅)?)?(?:物品|東西|东西|物資|物资|道具)?|everything|all(?:\s+(?:the\s+)?(?:scattered\s+)?(?:items?|loot|things?))?", re.I)
 _SEPARATOR = re.compile(r"\s*(?:[、，,]|以及|同埋|和|與|及|\band\b)\s*", re.I)
 # Full requests with another action, questions, alternatives or restrictions
@@ -15,6 +22,7 @@ _COMPLEX = re.compile(
     r"[?？。；;!！]|如果|假如|唔|不要|別|别|不|未|或|除了|除咗|除外|以外|但|"
     r"然後|然后|之後|之后|接著|接着|再|攻擊|攻击|搜索|搜尋|使用|喝|吃|"
     r"混合|加入|製作|制作|切開|切开|前往|放火|點燃|点燃|給|给|"
+    r"もし|なら|ない|拾って|取って|それから|その後|そして|てから|"
     r"\b(?:if|not|don't|except|but|or|then|attack|search|use|drink|mix|give|go)\b", re.I)
 
 
@@ -24,21 +32,30 @@ class PickupError(ValueError):
 
 def selection(value):
     """Return None for all, or normalized item names; never invent quantities."""
-    value = _GROUND.sub("", (value or "").strip()).strip()
+    value = _GROUND_SUFFIX.sub("", _GROUND.sub("", (value or "").strip())).strip()
     if _ALL.fullmatch(value):
         return None
     if not value or len(value) > 1500 or _COMPLEX.search(value):
         raise PickupError("請指定地上的物品，或說「拾起地上所有物品」；其他行動請分開提出。")
-    names = [_GROUND.sub("", n).strip(" 「」『』\"'") for n in _SEPARATOR.split(value)]
+    names = [_GROUND_SUFFIX.sub("", _GROUND.sub("", n)).strip(" 「」『』\"'") for n in _SEPARATOR.split(value)]
     if any(not n or len(n) > 100 or _ALL.fullmatch(n) for n in names) or len(names) > MAX_ITEMS:
         raise PickupError(f"一次最多拾取 {MAX_ITEMS} 種明確物品；請列出名稱或指定全部。")
     return list(dict.fromkeys(names))
 
 
+def has_weapon_reference(value):
+    """Category references need an existing ground identity or engine clarification."""
+    try:
+        return any(_WEAPON_REFERENCE.fullmatch(n) for n in selection(value) or [])
+    except PickupError:
+        return False
+
+
 def parse_pickup(text, party_names=()):
     """Recognize only an entire, unqualified collection request."""
     actor, action = _action_text(text, party_names)
-    match = _VERB.fullmatch(action.rstrip("。.!！"))
+    action = action.rstrip("。.!！")
+    match = _VERB.fullmatch(action) or _JAPANESE_PICKUP.fullmatch(action)
     if not match:
         return None
     if action.startswith(("拿出", "取出", "攞出")) or re.match(r"take\s+out\b", action, re.I):
@@ -117,7 +134,10 @@ def preflight(g, value):
         return list(ground.items()), ""
     actual = []
     for name in names:
-        matches = [name] if name in ground else [n for n in ground if name in n]
+        if _WEAPON_REFERENCE.fullmatch(name):
+            matches = [n for n in ground if is_weapon(n)]
+        else:
+            matches = [name] if name in ground else [n for n in ground if name in n]
         if len(matches) > 1:
             raise PickupError(f"「{name}」對應多件物品，請指定：{'、'.join(matches)}。")
         if not matches:

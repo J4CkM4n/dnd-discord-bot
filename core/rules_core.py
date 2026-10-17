@@ -275,6 +275,9 @@ def validate(g: Game, it: Intent, *, allow_unplanned_move: bool = False) -> str 
         return f"{actor} 已倒地（HP 0），無法行動"
     if getattr(g, "_pending_check", None) and it.action not in ("inspect", "meta", "chat"):
         return "尚有待定檢定；請先用 `/roll d20`，或由原玩家用 `/plan cancel` 取消。"
+    from .creative_effects import restriction
+    if reason := restriction(g, actor, it.action):
+        return reason
     if it.action == "steal":
         from .theft import preflight, TheftError
         try:
@@ -407,7 +410,9 @@ def ability_check(g: Game, actor: str, ability: str, dc: int,
     mod = total_mod(g.party[actor], ability, skill, "check")
     helped = bool(isinstance(getattr(g, "_help_check", None), dict)
                   and g._help_check.pop(actor, False))
-    if not auto and dc <= 12 and 10 + mod >= dc:
+    from .creative_effects import modifier
+    disadvantaged = modifier(g, actor, "check_disadvantage")
+    if not auto and not disadvantaged and dc <= 12 and 10 + mod >= dc:
         sk_zh = ""
         from engine.charlib import SKILL_LABEL
         if skill:
@@ -425,7 +430,7 @@ def ability_check(g: Game, actor: str, ability: str, dc: int,
         g._pending_check = {
             "actor": actor, "ability": ability, "skill": skill,
             "dc": dc, "mod": mod, "effect": effect or None,
-            "helped": helped}
+            "helped": helped, "disadvantaged": disadvantaged}
         line = (f"🎯 {actor} {ability}"
                 + (f"（{SKILL_LABEL.get(skill, skill)}）" if skill else "")
                 + f" 檢定 vs DC {dc}（需骰 ≥ {need}）"
@@ -439,9 +444,10 @@ def ability_check(g: Game, actor: str, ability: str, dc: int,
     # v5 seed 3: inspiration also covers engine-rolled checks
     inspired = g.drop_cond(actor, "inspired")
     d = g.d20()
-    if inspired or helped:
+    advantage = inspired or helped
+    if bool(advantage) != disadvantaged:
         d2 = g.d20()
-        d = max(d, d2)
+        d = max(d, d2) if advantage else min(d, d2)
     total = d + mod
     ok = d >= 20 or (d > 1 and total >= dc)
     line = _render_check(actor, ability, d, mod, total, dc, ok, skill)
@@ -449,6 +455,8 @@ def ability_check(g: Game, actor: str, ability: str, dc: int,
         line += "（✨靈感優勢已消耗）"
     if helped:
         line += "（🤝援助優勢）"
+    if disadvantaged:
+        line += "（狀態劣勢" + ("與優勢抵消）" if advantage else "）")
     g.ledger.add(actor, "check", line, d20=d, mod=mod, total=total,
                  dc=dc, ok=ok, skill=skill, effect_kind=(effect or {}).get("kind", ""))
     out = [line]
@@ -465,15 +473,18 @@ def resolve_pending_check(g: Game, die: int) -> tuple[bool, str]:
     mod = p["mod"]
     dc = p["dc"]
     helped = bool(p.get("helped"))
-    if helped:
+    disadvantaged = bool(p.get("disadvantaged"))
+    if helped != disadvantaged:
         # the player's own die + one engine die, take the high (5e Help)
-        die = max(die, g.d20())
+        die = max(die, g.d20()) if helped else min(die, g.d20())
     total = die + mod
     ok = die >= 20 or (die > 1 and total >= dc)
     line = _render_check(p["actor"], p["ability"], die, mod, total,
                          dc, ok, p.get("skill", ""))
     if helped:
         line += "（🤝援助優勢）"
+    if disadvantaged:
+        line += "（狀態劣勢" + ("與優勢抵消）" if helped else "）")
     g.ledger.add(p["actor"], "check", line, d20=die, mod=mod,
                  total=total, dc=dc, ok=ok, skill=p.get("skill", ""),
                  effect_kind=(p.get("effect") or {}).get("kind", ""))
@@ -545,22 +556,24 @@ def _attack(g: Game, actor: str, target: str, move: str = "", weapon_item: str =
     inspired = g.drop_cond(actor, "inspired")
     poisoned = g.has_cond(actor, "poisoned")
     d = g.d20()
-    rolls = [d]
     adv_note = ""
-    if stealthed or aided or inspired:
+    from .creative_effects import modifier
+    condition_adv = modifier(g, aid_tgt, "attacks_against_advantage")
+    condition_dis = modifier(g, actor, "attack_disadvantage") or modifier(g, aid_tgt, "attacks_against_disadvantage")
+    advantage = stealthed or aided or inspired or condition_adv
+    disadvantage = poisoned or condition_dis
+    if bool(advantage) != bool(disadvantage):
         d2 = g.d20()
-        rolls.append(d2)
-        labels = ([] + (["潛行"] if stealthed else [])
-                  + (["破綻"] if aided else [])
-                  + (["靈感"] if inspired else []))
-        adv_note = f"（{'＋'.join(labels)}優勢：{d}/{d2} 取高）"
-    if poisoned:
-        d3 = g.d20()
-        rolls.append(d3)
-        adv_note += f"（中毒劣勢：{min(rolls)}/{max(rolls)} 取低）"
-        d = min(rolls)
-    else:
-        d = max(rolls)
+        if advantage:
+            labels = (["潛行"] if stealthed else []) + (["破綻"] if aided else []) \
+                + (["靈感"] if inspired else []) + (["狀態"] if condition_adv else [])
+            adv_note = f"（{'＋'.join(labels)}優勢：{d}/{d2} 取高）"
+            d = max(d, d2)
+        else:
+            adv_note = f"（{'中毒' if poisoned else '狀態'}劣勢：{d}/{d2} 取低）"
+            d = min(d, d2)
+    elif advantage and disadvantage:
+        adv_note = "（優勢與劣勢抵消）"
     total = d + bonus
     crit = d >= 20
     hit = crit or (d > 1 and total >= ac)
@@ -604,18 +617,24 @@ def _attack(g: Game, actor: str, target: str, move: str = "", weapon_item: str =
 def _enemy_turn(g: Game, foe) -> list[str]:
     """Engine resolves an NPC strike — no LLM involved."""
     lines = [f"⚔️ {foe.name} 的回合："]
+    from .creative_effects import restriction, modifier
+    if reason := restriction(g, foe.name, "attack"):
+        return lines + [reason]
     targets = [n for n in g.party if g.alive(n)]
     if not targets:
         return lines
     tgt = g._random.choice(targets)  # spread damage, no deathless focus-fire
     dodging = bool(isinstance(getattr(g, "_dodge", None), dict)
                    and g._dodge.get(tgt))
+    disadvantaged = dodging or modifier(g, foe.name, "attack_disadvantage") \
+        or modifier(g, tgt, "attacks_against_disadvantage")
+    advantaged = modifier(g, tgt, "attacks_against_advantage")
     d = g.d20()
     dodge_note = ""
-    if dodging:
+    if disadvantaged != advantaged:
         d2 = g.d20()
-        dodge_note = f"（{tgt} 防禦中：{d}/{d2} 取低）"
-        d = min(d, d2)
+        dodge_note = f"（狀態{'優勢' if advantaged else '劣勢'}：{d}/{d2}）"
+        d = max(d, d2) if advantaged else min(d, d2)
     total = d + foe.attack_bonus
     ac = g.ac_of(tgt)
     hit = d >= 20 or (d > 1 and total >= ac)
@@ -670,6 +689,11 @@ def _throw(g: Game, actor: str, it: Intent, utter: str) -> ResolveResult | None:
         ac = foe.ac if foe else g.ac_of(tgt_char)
         bonus = total_mod(g.party[actor], "DEX", kind="check")
         d = g.d20()
+        from .creative_effects import modifier
+        advantage = modifier(g, tname, "attacks_against_advantage")
+        disadvantage = modifier(g, actor, "attack_disadvantage") or modifier(g, tname, "attacks_against_disadvantage")
+        if advantage != disadvantage:
+            d = max(d, g.d20()) if advantage else min(d, g.d20())
         total = d + bonus
         hit = d >= 20 or (d > 1 and total >= ac)
         lines = [f"🎲 {actor} 掟出 {name}（臨時武器 1d4）："
@@ -720,13 +744,13 @@ def _ignite(g: Game, actor: str, it: Intent, utter: str) -> ResolveResult | None
     """v5 A1: set the scene on fire. Needs a fire source (torch/light)
     or flammable tinder; burning scenes tick 1 damage on every enemy at
     round start while combat lasts."""
-    from engine.itemlib import affordances
+    from .creative_effects import item_properties
     carried = g.inventory.get(actor, [])
-    source = next((n for n, _ in carried if "light" in affordances(n)), "")
+    source = next((n for n, _ in carried if "light" in item_properties(g, n)), "")
     tinder = it.item or _find_carried(g, actor, utter)
-    if not source and tinder and "light" in affordances(tinder):
+    if not source and tinder and "light" in item_properties(g, tinder):
         source, tinder = tinder, ""
-    if tinder and "flammable" not in affordances(tinder):
+    if tinder and "flammable" not in item_properties(g, tinder):
         tinder = ""
     if not source and not tinder:
         return None  # nothing here can burn — falls back to a plain check
@@ -808,9 +832,9 @@ def _resolve_inner(g: Game, it: Intent) -> ResolveResult:
     if it.action == "inspect":
         from .objects import carried, visible_item
         name = (carried if it.args.get("take_out") else visible_item)(g, it.actor, it.item or it.target)
-        from engine.itemlib import affordances
+        from .creative_effects import item_properties
         labels = {"throwable": "可投擲", "flammable": "可燃", "light": "可照明", "liquid": "液體", "absorbent": "可吸水"}
-        detail = "、".join(labels[a] for a in sorted(affordances(name)) if a in labels)
+        detail = "、".join(labels[a] for a in sorted(item_properties(g, name)) if a in labels)
         text = f"{it.actor} {'拿出' if it.args.get('take_out') else '查看'} {name}。物品保留，數量不變。"
         if detail:
             text += f" 可用特性：{detail}。"
@@ -1453,6 +1477,8 @@ def _post_rotation(g: Game, actor: str = "") -> list[str]:
         for line in _enemy_turn(g, foe):
             out.append(line)
             g.ledger.add(foe.name, "auto", line)
+        from .creative_effects import expire_conditions
+        out += expire_conditions(g, acted=foe.name)
     if not any(g.alive(n) for n in g.party):
         out.append("🏴 **全隊倒地——戰鬥結束（敗北）**")
         g.ledger.add("engine", "combat", "全隊倒地——戰鬥結束（敗北）", outcome="defeat")
@@ -1508,7 +1534,13 @@ def resolve(g: Game, it: Intent) -> ResolveResult:
     A pending check remembers the player's originating words so the
     /roll settle narration can answer THEM, not just the die."""
     previous_pending = getattr(g, "_pending_check", None)
+    from .creative_effects import expire_conditions
+    previous_conditions = set(g._creative_conditions)
+    previous_scene = g.world.current
     r = _resolve_inner(g, it)
+    if r.accepted and r.confirm is None and it.action not in ("meta", "inspect", "chat"):
+        r.lines += expire_conditions(g, acted=it.actor, existing=previous_conditions,
+                                     left_scene=previous_scene if g.world.current != previous_scene else "")
     p = getattr(g, "_pending_check", None)
     if p is not None and p is not previous_pending and not p.get("origin"):
         p["origin"] = (it.utterance or it.raw or "")[:120]

@@ -173,12 +173,15 @@ def test_stolen_enemy_possession_cannot_drop_again_on_death_or_return(tmp_path, 
 
 
 def test_conditional_japanese_theft_waits_for_a_real_companions_help(tmp_path):
-    endpoint = Endpoint(router=[router_answer(compound="yes", linked="yes", ambiguous="yes")])
+    clarification = {"decision": "clarification_needed", "reason": "要先有同伴分散注意力；請同伴用 `/help` 協助，再重試。",
+                     "proposal": None}
+    endpoint = Endpoint(router=[router_answer(compound="yes", linked="yes", ambiguous="yes")] * 2,
+                        director=[clarification] * 2, evaluator=[{"approved": True}] * 2, main=[{"approved": True}] * 2)
     s, _ = routed(tmp_path, endpoint)
     before = deepcopy(encode_game(s.game))
     lines, _ = run(s.handle(DISTRACTION, user_id="u1"))
     assert "/help" in "".join(lines) and "假設" not in "".join(lines)
-    assert not endpoint.calls and encode_game(s.game) == before
+    assert roles(endpoint) == ["router", "director", "evaluator", "main"] and encode_game(s.game) == before
     # Self-help does not fulfil a request that depends on a companion.
     run(s.handle("依思 幫助 依思", user_id="u1", structured=True))
     lines, _ = run(s.handle(DISTRACTION, user_id="u1"))
@@ -190,7 +193,7 @@ def test_conditional_japanese_theft_waits_for_a_real_companions_help(tmp_path):
     assert s.game.ledger.turn == turn + 1
     assert sum(e.kind == "help" for e in s.game.ledger.entries) == 2
     assert roles(endpoint).count("narrator") == 2
-    assert set(roles(endpoint)) <= {"narrator", "progress"}
+    assert set(roles(endpoint)) <= {"router", "director", "evaluator", "main", "narrator", "progress"}
     run(s.settle_roll(20, user_id="u1"))
     assert ["匕首", 1] in s.game.inventory["依思"]
     assert "匕首" not in dict(s.game.inventory["大力蕉"])

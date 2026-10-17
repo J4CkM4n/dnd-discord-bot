@@ -80,6 +80,10 @@ class Game:
         self._random = random.Random()
         self.director_scene_count = 0
         self.retired_demo_names: list[str] = []
+        self._creative_provenance: list[dict] = []
+        self._creative_conditions: dict[str, dict] = {}
+        self._creative_attempts: dict[str, str] = {}
+        self._corpse_possessions: dict[str, dict] = {}
 
     # ---------- helpers ----------
 
@@ -219,6 +223,8 @@ class Game:
         return order
 
     def end_combat(self) -> None:
+        from .creative_effects import expire_conditions
+        expire_conditions(self, combat_ended=True)
         self.combat = Combat()
         self.enemies.clear()
 

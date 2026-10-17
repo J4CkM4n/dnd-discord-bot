@@ -81,8 +81,11 @@ def director_questions():
             "without bypassing combat, barriers or distance. Never disclose hidden knowledge."),
         "bounded_effects": approval_question(
             "Are all proposed effects bounded by the supplied engine templates, costs and "
-            "limits? These are conditional attempts, never guaranteed outcomes, ownership "
-            "transfers, free healing, invented rewards, extra attacks or completed objectives.")}
+            "limits? Approval permits an attempt; the engine determines its result. Ordinary "
+            "possessions with provenance, explicit item transfers and persistent conditions may "
+            "use the supplied templates. Missing records alone are not absence. Explicit absence, "
+            "prior removal and player ownership remain authoritative. No free healing, invented "
+            "rare rewards, extra attacks or automatic completion of objectives.")}
 
 
 def _review_state(value, secrets):
@@ -136,6 +139,7 @@ def routing_questions(g):
                     "is one conditional theft attempt; it does not authorize actions by those companions.",
         "linked": "Do preparation steps serve one explicit final goal, such as picking up ingredients, "
                   "mixing them, then attacking one target, or picking up a potion to heal an ally? "
+                  "Movement, timing and preparation serving one goal can be one creative attempt. "
                   "Independent goals, alternatives, hypotheticals and negated requests are not linked plans.",
     }.items():
         questions[key] = choice(instruction, {"yes": "Yes", "no": "No"})
